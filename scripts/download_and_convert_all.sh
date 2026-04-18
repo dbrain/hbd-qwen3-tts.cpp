@@ -28,7 +28,7 @@ TTS_MODELS=(
 TOKENIZER_MODEL="Qwen3-TTS-Tokenizer-12Hz"
 ALL_MODELS=("${TTS_MODELS[@]}" "$TOKENIZER_MODEL")
 
-TTS_QUANTS=("f16" "q8_0")
+TTS_QUANTS=("q8_0")
 TOKENIZER_QUANTS=("f16")
 
 # activate the project venv if it exists
@@ -121,7 +121,7 @@ for model in "${ALL_MODELS[@]}"; do
             fm++
             if (fm == 2) {
                 print ""
-                print "> **GGUF quantizations** for use with [qwen3-tts.cpp](https://github.com/predict-woo/qwen3-tts.cpp) (and forks)."
+                print "> **GGUF quantizations** for use with [qwen3-tts.cpp](https://github.com/khimaros/qwen3-tts.cpp) (fork of [predict-woo/qwen3-tts.cpp](https://github.com/predict-woo/qwen3-tts.cpp))."
                 print "> Converted from [Qwen/" model "](https://huggingface.co/Qwen/" model ") using `scripts/convert_tts_to_gguf.py`."
                 print "> Available quants: F16, Q8_0."
                 done=1

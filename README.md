@@ -13,9 +13,32 @@ This fork ([khimaros/qwen3-tts.cpp](https://github.com/khimaros/qwen3-tts.cpp)) 
 - **GPU-safe vocoder codebook normalization** (unbreaks Vulkan backend)
 - **ICL encoder parity fix**: correct conv-layer bias loading (a subtle `sscanf` partial-match bug silently dropped input-conv and resunit biases), raising encoder/Python cosine similarity from ~0.989 to ~0.99999 per stage and eliminating the ~350ms start-of-audio noise in cloned voices
 - **Performance optimizations**: flash attention for decode steps, static KV cache with `ggml_set_rows`, cached vocoder decoder graph
-- **OpenAI-compatible HTTP server** (`qwen3-tts-server`) with `/v1/audio/speech` and `/v1/audio/voices` endpoints, voice cloning via multipart upload, and `--hf-repo` for auto-downloading models from HuggingFace
+- **OpenAI-compatible HTTP server** (`qwen3-tts-server`) with `/v1/audio/speech` and `/v1/audio/voices` endpoints, voice cloning via multipart upload, and `--hf-repo` for auto-downloading GGUFs from the [Qwen3-TTS collection](https://huggingface.co/collections/khimaros/qwen3-tts)
 - **Multi-variant model support** (Base / CustomVoice / VoiceDesign) with speaker presets and language IDs stored in GGUF metadata
 - **Batch model conversion** script that downloads and converts all Qwen3-TTS variants in one shot
+
+### HuggingFace Models
+
+Pre-converted GGUF artifacts are published in the [Qwen3-TTS collection](https://huggingface.co/collections/khimaros/qwen3-tts):
+
+| Repo | Variant |
+|------|---------|
+| [`khimaros/Qwen3-TTS-12Hz-0.6B-Base-GGUF`](https://huggingface.co/khimaros/Qwen3-TTS-12Hz-0.6B-Base-GGUF) | 0.6B, ICL voice clone |
+| [`khimaros/Qwen3-TTS-12Hz-0.6B-CustomVoice-GGUF`](https://huggingface.co/khimaros/Qwen3-TTS-12Hz-0.6B-CustomVoice-GGUF) | 0.6B, speaker presets |
+| [`khimaros/Qwen3-TTS-12Hz-1.7B-Base-GGUF`](https://huggingface.co/khimaros/Qwen3-TTS-12Hz-1.7B-Base-GGUF) | 1.7B, ICL voice clone |
+| [`khimaros/Qwen3-TTS-12Hz-1.7B-CustomVoice-GGUF`](https://huggingface.co/khimaros/Qwen3-TTS-12Hz-1.7B-CustomVoice-GGUF) | 1.7B, speaker presets |
+| [`khimaros/Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF`](https://huggingface.co/khimaros/Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF) | 1.7B, `--instructions` steering |
+| [`khimaros/Qwen3-TTS-Tokenizer-12Hz-GGUF`](https://huggingface.co/khimaros/Qwen3-TTS-Tokenizer-12Hz-GGUF) | shared vocoder |
+
+Each repo ships F16 and Q8_0 quants. The server auto-downloads and caches them via `--hf-repo`:
+
+```bash
+./build/qwen3-tts-server \
+    --hf-repo khimaros/Qwen3-TTS-12Hz-1.7B-CustomVoice-GGUF:Q8_0 \
+    --hf-repo-v khimaros/Qwen3-TTS-Tokenizer-12Hz-GGUF:F16
+```
+
+`--hf-repo <repo>[:<quant>]` defaults to `Q8_0`; override the exact GGUF filename with `--hf-file`.
 
 The rest of this README is the original from upstream.
 
