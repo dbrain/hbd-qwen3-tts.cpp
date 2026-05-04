@@ -5,7 +5,10 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <numeric>
 
 #define QWEN3_TTS_DEC_MAX_NODES 32768
@@ -376,9 +379,53 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
         error_msg_ = "Failed to create backend scheduler";
         return false;
     }
-    
+
     state_.compute_meta.resize(ggml_tensor_overhead() * QWEN3_TTS_DEC_MAX_NODES + ggml_graph_overhead());
-    
+
+    // Optional: per-stage decoder profiling. Enable with QWEN3_TTS_DECODER_PROFILE=1.
+    // Uses ggml's eval-callback to break the graph at our named output markers
+    // (vq_output, pre_tfm_output, upsample_output, dec0..dec6_output) so we can
+    // measure wall time between sync points. Adds overhead — diagnostic only.
+    if (const char * env = std::getenv("QWEN3_TTS_DECODER_PROFILE"); env && *env != '0') {
+        ggml_backend_sched_set_eval_callback(state_.sched,
+            [](struct ggml_tensor * t, bool ask, void * /*ud*/) -> bool {
+                static const std::array<const char *, 27> markers = {
+                    "vq_output", "pre_conv_output", "pre_tfm_output",
+                    "upsample_output", "dec0_output",
+                    "dec1_output", "dec2_output", "dec3_output", "dec4_output",
+                    "dec5_output", "dec6_output",
+                    // sub-stage markers within each decoder block — only fire
+                    // when QWEN3_TTS_DECODER_PROFILE is set.
+                    "dec1_after_convt", "dec1_after_res0", "dec1_after_res1", "dec1_after_res2",
+                    "dec2_after_convt", "dec2_after_res0", "dec2_after_res1", "dec2_after_res2",
+                    "dec3_after_convt", "dec3_after_res0", "dec3_after_res1", "dec3_after_res2",
+                    "dec4_after_convt", "dec4_after_res0", "dec4_after_res1", "dec4_after_res2",
+                };
+                bool is_marker = false;
+                for (const char * m : markers) { if (t->name[0] && std::strcmp(t->name, m) == 0) { is_marker = true; break; } }
+                if (ask) return is_marker;
+
+                using clk = std::chrono::high_resolution_clock;
+                static clk::time_point t_last;
+                static bool first = true;
+                static int call_idx = 0;
+                if (first) { t_last = clk::now(); first = false; call_idx = 0; }
+                auto now = clk::now();
+                double ms = std::chrono::duration<double, std::milli>(now - t_last).count();
+                fprintf(stderr, "  [decoder-profile] %-22s %8.1f ms (shape: %lldx%lldx%lldx%lld)\n",
+                        t->name, ms,
+                        (long long)t->ne[0], (long long)t->ne[1],
+                        (long long)t->ne[2], (long long)t->ne[3]);
+                t_last = now;
+                if (++call_idx >= (int)markers.size()) {
+                    first = true;  // reset for next decode call
+                    fprintf(stderr, "  [decoder-profile] -- end of decode --\n");
+                }
+                return true;
+            }, nullptr);
+        fprintf(stderr, "QWEN3_TTS_DECODER_PROFILE enabled — per-stage decoder timing in stderr\n");
+    }
+
     return true;
 }
 
@@ -748,11 +795,23 @@ struct ggml_tensor * AudioTokenizerDecoder::apply_decoder_block(struct ggml_cont
      if (block.conv_t_b) {
          x = ggml_add(ctx, x, ggml_reshape_3d(ctx, block.conv_t_b, 1, out_channels, 1));
      }
-    
+
+    // Profiling markers for sub-stages within a decoder block. The eval-callback
+    // in load_model() splits the graph at any name in its marker set, giving us
+    // per-residual timing. Marker names match what the callback looks for.
+    {
+        char nm[64];
+        snprintf(nm, sizeof(nm), "dec%d_after_convt", block_idx);
+        ggml_set_name(x, nm);
+    }
+
     for (int i = 0; i < 3; ++i) {
         char tail_name[64];
         snprintf(tail_name, sizeof(tail_name), "tail_dec%d_res%d_conv1", block_idx, i);
         x = apply_residual_block(ctx, x, block.res[i], tail_name);
+        char nm[64];
+        snprintf(nm, sizeof(nm), "dec%d_after_res%d", block_idx, i);
+        ggml_set_name(x, nm);
     }
 
     return x;
