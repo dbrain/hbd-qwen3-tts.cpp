@@ -604,14 +604,44 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
         const int n_cb = transformer_.get_config().n_codebooks;
 
         // ICL warm-up: feed ref_codes through the streaming decoder and
-        // discard its PCM. mirrors the non-streaming prepend+trim path.
+        // discard its PCM. Identical for the same voice every synth, so
+        // cache the resulting vocoder state keyed by FNV-1a hash of the
+        // ref_codes byte stream and restore on subsequent hits — saves
+        // ~700-1200 ms TTFA on every cloned-voice synth.
         if (ref_codes && n_ref_frames > 0 && !params.ref_text.empty()) {
-            std::vector<float> warmup_pcm;
-            if (!audio_decoder_.stream_decode(ref_codes, n_ref_frames, warmup_pcm)) {
-                result.error_msg = "Failed to warm-up vocoder with ref codes: " + audio_decoder_.get_error();
-                return result;
+            const size_t n_bytes = (size_t) n_ref_frames * n_cb * sizeof(int32_t);
+            uint64_t hash = 1469598103934665603ull; // FNV-1a 64 offset basis
+            const uint8_t * p = reinterpret_cast<const uint8_t *>(ref_codes);
+            for (size_t i = 0; i < n_bytes; ++i) {
+                hash ^= p[i];
+                hash *= 1099511628211ull;
             }
-            // discard warmup_pcm — downstream only sees post-ref PCM
+
+            int64_t t_warmup_start = get_time_ms();
+            auto it = icl_cache_.find(hash);
+            if (it != icl_cache_.end()) {
+                audio_decoder_.restore_stream_state(it->second);
+                if (params.print_timing) {
+                    fprintf(stderr, "  ICL warmup: cache HIT (hash=%016llx, %d frames) — restored in %lld ms\n",
+                            (unsigned long long) hash, n_ref_frames,
+                            (long long)(get_time_ms() - t_warmup_start));
+                }
+            } else {
+                std::vector<float> warmup_pcm;
+                if (!audio_decoder_.stream_decode(ref_codes, n_ref_frames, warmup_pcm)) {
+                    result.error_msg = "Failed to warm-up vocoder with ref codes: " + audio_decoder_.get_error();
+                    return result;
+                }
+                AudioTokenizerDecoder::stream_state_snapshot snap;
+                audio_decoder_.capture_stream_state(snap);
+                icl_cache_.emplace(hash, std::move(snap));
+                if (params.print_timing) {
+                    fprintf(stderr, "  ICL warmup: cache MISS (hash=%016llx, %d frames) — decoded + cached in %lld ms\n",
+                            (unsigned long long) hash, n_ref_frames,
+                            (long long)(get_time_ms() - t_warmup_start));
+                }
+                // discard warmup_pcm — downstream only sees post-ref PCM
+            }
         }
 
         stream_buf.reserve((size_t) stream->batch_size * n_cb);
@@ -881,6 +911,10 @@ bool Qwen3TTS::get_speaker_embedding(const std::string & name, std::vector<float
         return false;
     }
     return true;
+}
+
+void Qwen3TTS::clear_icl_cache() {
+    icl_cache_.clear();
 }
 
 void Qwen3TTS::set_progress_callback(tts_progress_callback_t callback) {

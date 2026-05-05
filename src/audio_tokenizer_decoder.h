@@ -192,6 +192,36 @@ public:
     // Reset streaming state. Must be called before starting a new utterance.
     void stream_reset();
 
+    // Persistent host-side snapshot of streaming state. Used to skip ICL
+    // ref-codes warmup re-decode when the same reference has already been
+    // decoded once and the resulting vocoder state is cached at a higher
+    // layer (Qwen3TTS::icl_cache_, keyed by ref_codes hash).
+    //
+    // Only the persistent fields are captured: n_past_, host tail rings,
+    // conv_transpose overlap buffers, and the per-layer KV host caches.
+    // The transient stream_tails_/stream_conv_ts_/stream_kvs_ vectors are
+    // rebuilt by build_graph() on every stream_decode() call, so they
+    // need not be saved.
+    struct stream_state_snapshot {
+        int32_t n_past = 0;
+        std::map<std::string, std::vector<float>> tail_rings;
+        std::map<std::string, std::vector<float>> conv_t_overlap_hosts;
+        std::vector<std::vector<float>> past_k_hosts;
+        std::vector<std::vector<float>> past_v_hosts;
+    };
+
+    // Capture current streaming state (typically right after a stream_decode
+    // call that consumed the ref_codes warmup). Cheap — just copies host
+    // vectors. Caller should take this immediately after the warmup
+    // decode and *before* any further stream_decode() that would advance
+    // the state.
+    void capture_stream_state(stream_state_snapshot & out) const;
+
+    // Restore streaming state from a snapshot. Marks the decoder as in
+    // streaming mode so the next stream_decode() picks up where the
+    // captured state left off. Bypasses the ref-codes warmup entirely.
+    void restore_stream_state(const stream_state_snapshot & snap);
+
     const audio_decoder_config & get_config() const { return model_.config; }
 
     const std::string & get_error() const { return error_msg_; }

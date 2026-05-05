@@ -10,6 +10,7 @@
 #include <vector>
 #include <functional>
 #include <cstdint>
+#include <map>
 
 namespace qwen3_tts {
 
@@ -212,7 +213,11 @@ public:
 
     // Check if models are loaded
     bool is_loaded() const { return models_loaded_; }
-    
+
+    // Drop any cached ICL warmup vocoder states (host-side). Call after a
+    // change that would invalidate cached state (e.g. vocoder model swap).
+    void clear_icl_cache();
+
 private:
     tts_result synthesize_internal(const std::string & text,
                                    const float * speaker_embedding,
@@ -243,6 +248,14 @@ private:
     tts_progress_callback_t progress_callback_;
     ggml_abort_callback abort_cb_ = nullptr;
     void * abort_data_ = nullptr;
+
+    // ICL warmup vocoder-state cache. Keyed by FNV-1a hash of the ref_codes
+    // int32 byte stream. On a hit we restore the streaming decoder state
+    // captured after the first warmup pass and skip the (~700–1200 ms)
+    // re-decode of identical ref codes on every cloned-voice synth.
+    // Bounded growth: each entry is a few MB host RAM; in practice keyed
+    // by registered voices, so size == n_voices.
+    std::map<uint64_t, AudioTokenizerDecoder::stream_state_snapshot> icl_cache_;
 };
 
 // Utility: Load audio file (WAV format)

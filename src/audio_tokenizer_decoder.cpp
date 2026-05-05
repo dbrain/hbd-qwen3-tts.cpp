@@ -1193,6 +1193,27 @@ void AudioTokenizerDecoder::stream_reset() {
     stream_conv_ts_.clear();
 }
 
+void AudioTokenizerDecoder::capture_stream_state(stream_state_snapshot & out) const {
+    out.n_past = n_past_;
+    out.tail_rings = tail_rings_;
+    out.conv_t_overlap_hosts = conv_t_overlap_hosts_;
+    out.past_k_hosts = past_k_hosts_;
+    out.past_v_hosts = past_v_hosts_;
+}
+
+void AudioTokenizerDecoder::restore_stream_state(const stream_state_snapshot & snap) {
+    streaming_mode_ = true;
+    n_past_ = snap.n_past;
+    tail_rings_ = snap.tail_rings;
+    conv_t_overlap_hosts_ = snap.conv_t_overlap_hosts;
+    past_k_hosts_ = snap.past_k_hosts;
+    past_v_hosts_ = snap.past_v_hosts;
+    // transient per-graph metadata is rebuilt on the next stream_decode()
+    stream_tails_.clear();
+    stream_kvs_.clear();
+    stream_conv_ts_.clear();
+}
+
 bool AudioTokenizerDecoder::stream_decode(const int32_t * codes, int32_t n_frames,
                                            std::vector<float> & samples) {
     if (!model_.ctx) {
