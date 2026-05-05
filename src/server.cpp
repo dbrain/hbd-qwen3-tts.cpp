@@ -14,12 +14,15 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -570,6 +573,35 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "voice cache dir: %s\n", voice_cache_dir.c_str());
     }
 
+    // idle-unload watchdog: when QWEN3_TTS_IDLE_UNLOAD_SECONDS > 0, a
+    // background thread releases the model after that many seconds without
+    // any synth/register activity, freeing GPU VRAM for other workloads.
+    // Lazy reload happens on the next request that needs the model.
+    int idle_unload_seconds = 0;
+    if (const char * env = std::getenv("QWEN3_TTS_IDLE_UNLOAD_SECONDS")) {
+        idle_unload_seconds = std::atoi(env);
+        if (idle_unload_seconds < 0) idle_unload_seconds = 0;
+    }
+    auto now_ms = []() -> int64_t {
+        auto t = std::chrono::steady_clock::now().time_since_epoch();
+        return std::chrono::duration_cast<std::chrono::milliseconds>(t).count();
+    };
+    std::atomic<int64_t> last_activity_ms{ now_ms() };
+    auto note_activity = [&]() { last_activity_ms.store(now_ms()); };
+    // Caller must already hold synth_mutex. Reloads if idle-unload swept
+    // the model out from under us. Returns false on reload failure.
+    auto ensure_loaded_locked = [&]() -> bool {
+        note_activity();
+        if (tts.is_loaded()) return true;
+        int64_t t0 = now_ms();
+        bool ok = tts.reload_model();
+        if (ok) {
+            fprintf(stderr, "idle-unload: lazy reload took %lld ms\n",
+                    (long long) (now_ms() - t0));
+        }
+        return ok;
+    };
+
     httplib::Server svr;
 
     // log all requests
@@ -666,7 +698,7 @@ int main(int argc, char ** argv) {
     // --- POST /v1/audio/voices --- create custom voice from reference audio
     svr.Post("/v1/audio/voices",
         [&tts, &synth_mutex, &voices, &voices_mutex, &next_voice_id,
-         &voice_cache_dir, &model_id](const httplib::Request & req, httplib::Response & res) {
+         &voice_cache_dir, &model_id, &ensure_loaded_locked](const httplib::Request & req, httplib::Response & res) {
 
         // runtime audio cloning needs the speaker encoder, which only ships in the Base variant
         if (!tts.has_speaker_encoder()) {
@@ -732,6 +764,14 @@ int main(int argc, char ** argv) {
         }
         if (!used_cached_embed) {
             std::lock_guard<std::mutex> lock(synth_mutex);
+            if (!ensure_loaded_locked()) {
+                unlink(tmppath);
+                res.status = 503;
+                json err = {{"error", {{"message", "model reload failed: " + tts.get_error()},
+                                        {"type", "server_error"}}}};
+                res.set_content(err.dump(), "application/json");
+                return;
+            }
             ok = tts.extract_speaker_embedding(tmppath, embedding);
         }
 
@@ -787,6 +827,14 @@ int main(int argc, char ** argv) {
                 bool codec_ok;
                 {
                     std::lock_guard<std::mutex> lock(synth_mutex);
+                    if (!ensure_loaded_locked()) {
+                        unlink(tmppath);
+                        res.status = 503;
+                        json err = {{"error", {{"message", "model reload failed: " + tts.get_error()},
+                                                {"type", "server_error"}}}};
+                        res.set_content(err.dump(), "application/json");
+                        return;
+                    }
                     codec_ok = tts.encode_speech_codes(samples.data(),
                                                         (int32_t)samples.size(),
                                                         ref_codes, n_ref_frames);
@@ -887,7 +935,7 @@ int main(int argc, char ** argv) {
 
     // --- POST /v1/audio/speech ---
     svr.Post("/v1/audio/speech",
-        [&tts, &synth_mutex, &sp, &voices, &voices_mutex](const httplib::Request & req, httplib::Response & res) {
+        [&tts, &synth_mutex, &sp, &voices, &voices_mutex, &ensure_loaded_locked](const httplib::Request & req, httplib::Response & res) {
 
         // parse request body
         json body;
@@ -988,6 +1036,13 @@ int main(int argc, char ** argv) {
             // try built-in speaker first (custom_voice models)
             if (tts.get_speaker_id(voice) >= 0) {
                 std::lock_guard<std::mutex> lock(synth_mutex);
+                if (!ensure_loaded_locked()) {
+                    res.status = 503;
+                    json err = {{"error", {{"message", "model reload failed: " + tts.get_error()},
+                                            {"type", "server_error"}}}};
+                    res.set_content(err.dump(), "application/json");
+                    return;
+                }
                 if (!tts.get_speaker_embedding(voice, voice_embedding)) {
                     res.status = 500;
                     json err = {{"error", {
@@ -1051,9 +1106,14 @@ int main(int argc, char ** argv) {
                  voice_ref_codes = std::move(voice_ref_codes),
                  voice_n_ref_frames,
                  stream_batch_size, stream_first_batch_size, is_sse, is_wav,
-                 synth_mutex = &synth_mutex, sample_rate_fallback = 24000]
+                 synth_mutex = &synth_mutex, sample_rate_fallback = 24000,
+                 &ensure_loaded_locked]
                 (size_t /*offset*/, httplib::DataSink & sink) mutable -> bool {
                     std::lock_guard<std::mutex> lock(*synth_mutex);
+                    if (!ensure_loaded_locked()) {
+                        sink.done();
+                        return false;
+                    }
 
                     // wav header up front (audio mode only). for SSE, the wav
                     // bytes per-delta are raw pcm — clients reconstruct wav.
@@ -1115,6 +1175,13 @@ int main(int argc, char ** argv) {
         tts_result result;
         {
             std::lock_guard<std::mutex> lock(synth_mutex);
+            if (!ensure_loaded_locked()) {
+                res.status = 503;
+                json err = {{"error", {{"message", "model reload failed: " + tts.get_error()},
+                                        {"type", "server_error"}}}};
+                res.set_content(err.dump(), "application/json");
+                return;
+            }
             if (!voice_ref_codes.empty()) {
                 result = tts.synthesize_with_embedding(
                     input, voice_embedding.data(), (int32_t)voice_embedding.size(), params,
@@ -1209,6 +1276,26 @@ int main(int argc, char ** argv) {
             return;
         }
     });
+
+    if (idle_unload_seconds > 0) {
+        fprintf(stderr, "idle-unload: model will be released after %d s of inactivity\n",
+                idle_unload_seconds);
+        std::thread([&tts, &synth_mutex, &last_activity_ms, idle_unload_seconds, now_ms]() {
+            const int64_t threshold_ms = (int64_t) idle_unload_seconds * 1000;
+            const int     check_s     = std::max(1, idle_unload_seconds / 5);
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::seconds(check_s));
+                if (now_ms() - last_activity_ms.load() < threshold_ms) continue;
+                std::unique_lock<std::mutex> lock(synth_mutex, std::try_to_lock);
+                if (!lock.owns_lock()) continue;  // a request is in flight; skip this tick
+                if (now_ms() - last_activity_ms.load() < threshold_ms) continue;
+                if (!tts.is_loaded()) continue;
+                fprintf(stderr, "idle-unload: %lld s since last activity, releasing model\n",
+                        (long long) ((now_ms() - last_activity_ms.load()) / 1000));
+                tts.unload_model();
+            }
+        }).detach();
+    }
 
     fprintf(stderr, "server listening on %s:%d\n", sp.host.c_str(), sp.port);
     if (!svr.listen(sp.host, sp.port)) {
