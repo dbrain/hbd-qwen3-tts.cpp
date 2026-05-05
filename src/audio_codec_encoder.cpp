@@ -16,6 +16,18 @@ constexpr int32_t codec_encoder_config::cnn_strides[4];
 static constexpr int CONV_LAYERS[]    = {0, 3, 6, 9, 12, 14};
 static constexpr int RESUNIT_LAYERS[] = {1, 4, 7, 10};
 
+// Dispatch helper: prefer the fused direct kernel (tensor cores, no im2col)
+// for F16 weights, fall back to ggml_conv_1d for F32. The codec encoder
+// pre-pads its inputs with ggml_pad_ext, so p_left=p_right=0 here.
+static inline struct ggml_tensor * conv1d_pref_direct(
+    struct ggml_context * ctx, struct ggml_tensor * w, struct ggml_tensor * x,
+    int stride, int dilation
+) {
+    return (w->type == GGML_TYPE_F16)
+        ? ggml_conv_1d_direct(ctx, w, x, stride, 0, 0, dilation)
+        : ggml_conv_1d(ctx, w, x, stride, 0, dilation);
+}
+
 AudioCodecEncoder::AudioCodecEncoder() = default;
 
 AudioCodecEncoder::~AudioCodecEncoder() {
@@ -284,7 +296,7 @@ struct ggml_tensor * AudioCodecEncoder::apply_resunit(struct ggml_context * ctx,
 
     // causal conv k=3: left_pad = 2
     x = ggml_pad_ext(ctx, x, 2, 0, 0, 0, 0, 0, 0, 0);
-    x = ggml_conv_1d(ctx, ru.conv1_w, x, 1, 0, 1);
+    x = conv1d_pref_direct(ctx, ru.conv1_w, x, 1, 1);
     int64_t out_ch = ru.conv1_w->ne[2];
     if (ru.conv1_b) {
         x = ggml_add(ctx, x, ggml_reshape_3d(ctx, ru.conv1_b, 1, out_ch, 1));
@@ -293,7 +305,7 @@ struct ggml_tensor * AudioCodecEncoder::apply_resunit(struct ggml_context * ctx,
     x = ggml_elu(ctx, x);
 
     // conv k=1: no padding needed
-    x = ggml_conv_1d(ctx, ru.conv2_w, x, 1, 0, 1);
+    x = conv1d_pref_direct(ctx, ru.conv2_w, x, 1, 1);
     out_ch = ru.conv2_w->ne[2];
     if (ru.conv2_b) {
         x = ggml_add(ctx, x, ggml_reshape_3d(ctx, ru.conv2_b, 1, out_ch, 1));
@@ -400,7 +412,7 @@ struct ggml_cgraph * AudioCodecEncoder::build_graph(int32_t n_samples) {
 
     // layer 0: input conv k=7, s=1 (causal pad 6)
     cur = ggml_pad_ext(ctx0, cur, 6, 0, 0, 0, 0, 0, 0, 0);
-    cur = ggml_conv_1d(ctx0, model_.input_conv_w, cur, 1, 0, 1);
+    cur = conv1d_pref_direct(ctx0, model_.input_conv_w, cur, 1, 1);
     if (model_.input_conv_b) {
         int64_t ch = model_.input_conv_w->ne[2];
         cur = ggml_add(ctx0, cur, ggml_reshape_3d(ctx0, model_.input_conv_b, 1, ch, 1));
@@ -430,7 +442,7 @@ struct ggml_cgraph * AudioCodecEncoder::build_graph(int32_t n_samples) {
         int32_t right_pad = extra_pad(seq_len, stride);
 
         cur = ggml_pad_ext(ctx0, cur, left_pad, right_pad, 0, 0, 0, 0, 0, 0);
-        cur = ggml_conv_1d(ctx0, model_.ds_conv_w[s], cur, stride, 0, 1);
+        cur = conv1d_pref_direct(ctx0, model_.ds_conv_w[s], cur, stride, 1);
         int64_t out_ch = model_.ds_conv_w[s]->ne[2];
         if (model_.ds_conv_b[s]) {
             cur = ggml_add(ctx0, cur, ggml_reshape_3d(ctx0, model_.ds_conv_b[s], 1, out_ch, 1));
@@ -450,7 +462,7 @@ struct ggml_cgraph * AudioCodecEncoder::build_graph(int32_t n_samples) {
 
     // layer 14: final projection k=3, s=1 (causal pad 2)
     cur = ggml_pad_ext(ctx0, cur, 2, 0, 0, 0, 0, 0, 0, 0);
-    cur = ggml_conv_1d(ctx0, model_.final_conv_w, cur, 1, 0, 1);
+    cur = conv1d_pref_direct(ctx0, model_.final_conv_w, cur, 1, 1);
     if (model_.final_conv_b) {
         int64_t ch = model_.final_conv_w->ne[2];
         cur = ggml_add(ctx0, cur, ggml_reshape_3d(ctx0, model_.final_conv_b, 1, ch, 1));
@@ -525,7 +537,7 @@ struct ggml_cgraph * AudioCodecEncoder::build_graph(int32_t n_samples) {
     } else {
         cur = ggml_concat(ctx0, left_rep, cur, 0);
     }
-    cur = ggml_conv_1d(ctx0, model_.final_ds_w, cur, 2, 0, 1);
+    cur = conv1d_pref_direct(ctx0, model_.final_ds_w, cur, 2, 1);
     // no bias on final downsample
 
     // output: [final_seq_len, hidden_size, 1]

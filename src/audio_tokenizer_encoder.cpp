@@ -422,7 +422,13 @@ static struct ggml_tensor * apply_conv1d(struct ggml_context * ctx,
         actual_pad = 0;
     }
     
-    struct ggml_tensor * y = ggml_conv_1d(ctx, w, input, stride, actual_pad, dilation);
+    // Prefer the fused direct-conv kernel (tensor cores, no im2col temp)
+    // when the weight dtype matches its requirement. Falls back to im2col +
+    // cuBLAS for F32 weights or padded layouts the direct kernel doesn't
+    // support yet (stride > 1 it does, asymmetric padding it does too).
+    struct ggml_tensor * y = (w->type == GGML_TYPE_F16)
+        ? ggml_conv_1d_direct(ctx, w, input, stride, actual_pad, actual_pad, dilation)
+        : ggml_conv_1d(ctx, w, input, stride, actual_pad, dilation);
     if (debug_name) {
         char name[64];
         snprintf(name, sizeof(name), "%s_conv", debug_name);
@@ -466,7 +472,9 @@ struct ggml_cgraph * AudioTokenizerEncoder::build_graph(int32_t n_frames) {
      struct ggml_tensor * mel_padded = apply_reflect_pad_1d(ctx0, cur, 2);
      ggml_set_name(mel_padded, "mel_padded");
     
-     cur = ggml_conv_1d(ctx0, model_.conv0_w, mel_padded, 1, 0, 1);
+     cur = (model_.conv0_w->type == GGML_TYPE_F16)
+         ? ggml_conv_1d_direct(ctx0, model_.conv0_w, mel_padded, 1, 0, 0, 1)
+         : ggml_conv_1d(ctx0, model_.conv0_w, mel_padded, 1, 0, 1);
      ggml_set_name(cur, "conv0_conv");
 
      if (model_.conv0_b) {
