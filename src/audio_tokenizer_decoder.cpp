@@ -285,10 +285,21 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
         }
     }
     
-    if (!load_tensor_data_from_file(model_path, gguf_ctx, model_.ctx,
-                                     model_.tensors, model_.buffer, error_msg_,
-                                     GGML_BACKEND_DEVICE_TYPE_IGPU)) {
-        return false;
+    {
+        // Match the runtime backend choice: if QWEN3_TTS_VOCODER_CPU=1, load
+        // weights into a CPU buffer so the entire vocoder lives on CPU and
+        // we don't pay any vocoder VRAM (~220 MiB weights + 270-440 MiB
+        // sched scratch).
+        const char * vocoder_cpu = std::getenv("QWEN3_TTS_VOCODER_CPU");
+        const enum ggml_backend_dev_type weight_backend =
+            (vocoder_cpu && vocoder_cpu[0] == '1')
+                ? GGML_BACKEND_DEVICE_TYPE_CPU
+                : GGML_BACKEND_DEVICE_TYPE_IGPU;
+        if (!load_tensor_data_from_file(model_path, gguf_ctx, model_.ctx,
+                                         model_.tensors, model_.buffer, error_msg_,
+                                         weight_backend)) {
+            return false;
+        }
     }
     
     for (int i = 0; i < 4; ++i) {
@@ -352,9 +363,22 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
         }
     }
     
-    state_.backend = init_preferred_backend("AudioTokenizerDecoder", &error_msg_);
-    if (!state_.backend) {
-        return false;
+    // QWEN3_TTS_VOCODER_CPU=1 → run vocoder on CPU, freeing all its GPU
+    // bytes (~220 MiB weights + 270-440 MiB sched scratch). Talker stays on
+    // GPU regardless. Per-component override of the shared CUDA backend.
+    const char * vocoder_cpu = std::getenv("QWEN3_TTS_VOCODER_CPU");
+    if (vocoder_cpu && vocoder_cpu[0] == '1') {
+        state_.backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+        if (!state_.backend) {
+            error_msg_ = "Failed to initialize CPU backend for AudioTokenizerDecoder";
+            return false;
+        }
+        fprintf(stderr, "  AudioTokenizerDecoder: forced to CPU backend (QWEN3_TTS_VOCODER_CPU=1)\n");
+    } else {
+        state_.backend = init_preferred_backend("AudioTokenizerDecoder", &error_msg_);
+        if (!state_.backend) {
+            return false;
+        }
     }
 
     ggml_backend_dev_t device = ggml_backend_get_device(state_.backend);
