@@ -22,6 +22,7 @@
 #include <string>
 #include <vector>
 #include <unistd.h>
+#include <sys/stat.h>
 
 using json = nlohmann::json;
 using namespace qwen3_tts;
@@ -39,6 +40,118 @@ static int language_to_id(const std::string & lang) {
         if (lang == code) return id;
     }
     return -1;
+}
+
+// FNV-1a 64-bit over arbitrary bytes. Used to key the on-disk voice
+// derived-artifact cache by (model_id || ref_wav_bytes).
+static uint64_t fnv1a_64(const void * data, size_t n) {
+    const uint8_t * p = static_cast<const uint8_t *>(data);
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+// Voice bundle: cached speaker embedding + ICL ref_codes derived from a
+// reference WAV. Persisting this lets the C++ server skip the speaker
+// encoder + codec encoder forward passes on every cold spawn (~50-200 ms
+// each per voice), and survives wrapper restarts.
+//
+// Disk format (little-endian, host-aligned):
+//   magic[4]      = "QTVB"
+//   schema u32    = 1
+//   flags  u32    bit0=has_embedding, bit1=has_codes
+//   embed_dim u32
+//   n_ref_frames u32
+//   n_codebooks  u32
+//   model_id_len u32
+//   model_id bytes...
+//   embedding[embed_dim] floats   (if has_embedding)
+//   codes[n_ref_frames * n_codebooks] int32  (if has_codes)
+struct voice_bundle {
+    bool has_embedding = false;
+    bool has_codes = false;
+    std::vector<float>   embedding;
+    std::vector<int32_t> ref_codes;
+    int32_t n_ref_frames = 0;
+    int32_t n_codebooks  = 0;
+    std::string model_id;
+};
+
+static bool voice_bundle_read(const std::string & path, voice_bundle & out) {
+    FILE * fp = std::fopen(path.c_str(), "rb");
+    if (!fp) return false;
+    auto cleanup_fail = [&]() { std::fclose(fp); return false; };
+    char magic[4];
+    if (std::fread(magic, 1, 4, fp) != 4 || memcmp(magic, "QTVB", 4) != 0) return cleanup_fail();
+    uint32_t schema = 0, flags = 0, embed_dim = 0;
+    uint32_t n_ref_frames = 0, n_codebooks = 0, model_id_len = 0;
+    auto rd = [&](uint32_t & v) { return std::fread(&v, 1, 4, fp) == 4; };
+    if (!rd(schema) || schema != 1) return cleanup_fail();
+    if (!rd(flags) || !rd(embed_dim) || !rd(n_ref_frames) ||
+        !rd(n_codebooks) || !rd(model_id_len)) return cleanup_fail();
+    if (model_id_len > 1024 || embed_dim > 8192 ||
+        n_ref_frames > 100000 || n_codebooks > 64) return cleanup_fail();
+    out.model_id.assign(model_id_len, '\0');
+    if (model_id_len > 0 &&
+        std::fread(out.model_id.data(), 1, model_id_len, fp) != model_id_len) return cleanup_fail();
+    out.has_embedding = (flags & 1u) != 0;
+    out.has_codes     = (flags & 2u) != 0;
+    out.n_ref_frames  = (int32_t) n_ref_frames;
+    out.n_codebooks   = (int32_t) n_codebooks;
+    if (out.has_embedding) {
+        out.embedding.resize(embed_dim);
+        if (std::fread(out.embedding.data(), sizeof(float), embed_dim, fp) != embed_dim) return cleanup_fail();
+    }
+    if (out.has_codes) {
+        size_t n = (size_t) n_ref_frames * n_codebooks;
+        out.ref_codes.resize(n);
+        if (std::fread(out.ref_codes.data(), sizeof(int32_t), n, fp) != n) return cleanup_fail();
+    }
+    std::fclose(fp);
+    return true;
+}
+
+static bool voice_bundle_write(const std::string & path, const voice_bundle & b) {
+    std::string tmp = path + ".tmp";
+    FILE * fp = std::fopen(tmp.c_str(), "wb");
+    if (!fp) return false;
+    auto wr = [&](const void * d, size_t n) { return std::fwrite(d, 1, n, fp) == n; };
+    auto wr_u32 = [&](uint32_t v) { return wr(&v, 4); };
+    bool ok = true;
+    ok &= wr("QTVB", 4);
+    ok &= wr_u32(1);
+    ok &= wr_u32((b.has_embedding ? 1u : 0u) | (b.has_codes ? 2u : 0u));
+    ok &= wr_u32((uint32_t) b.embedding.size());
+    ok &= wr_u32((uint32_t) b.n_ref_frames);
+    ok &= wr_u32((uint32_t) b.n_codebooks);
+    ok &= wr_u32((uint32_t) b.model_id.size());
+    if (!b.model_id.empty()) ok &= wr(b.model_id.data(), b.model_id.size());
+    if (b.has_embedding && !b.embedding.empty()) {
+        ok &= wr(b.embedding.data(), b.embedding.size() * sizeof(float));
+    }
+    if (b.has_codes && !b.ref_codes.empty()) {
+        ok &= wr(b.ref_codes.data(), b.ref_codes.size() * sizeof(int32_t));
+    }
+    std::fflush(fp);
+    int fd = fileno(fp);
+    if (fd >= 0) fsync(fd);
+    std::fclose(fp);
+    if (!ok) { std::remove(tmp.c_str()); return false; }
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) { std::remove(tmp.c_str()); return false; }
+    return true;
+}
+
+static std::string voice_cache_path(const std::string & dir,
+                                     const std::string & model_id,
+                                     const std::string & wav_bytes) {
+    if (dir.empty()) return "";
+    std::string seed = model_id;
+    seed.push_back('\0');
+    seed.append(wav_bytes);
+    uint64_t h = fnv1a_64(seed.data(), seed.size());
+    char name[40];
+    snprintf(name, sizeof(name), "%016llx.bundle", (unsigned long long) h);
+    return dir + "/" + name;
 }
 
 // encode float32 audio samples as a WAV byte buffer (16-bit PCM)
@@ -444,6 +557,19 @@ int main(int argc, char ** argv) {
     std::mutex voices_mutex;
     int next_voice_id = 1;
 
+    // optional on-disk cache of derived voice artifacts (speaker embedding +
+    // ref_codes), keyed by FNV-1a 64 of (model_id || ref_wav_bytes). Skips
+    // the speaker-encoder + codec-encoder forward passes on cold spawn when
+    // the same WAV has been registered against the same model before.
+    std::string voice_cache_dir;
+    if (const char * env = std::getenv("QWEN3_TTS_VOICE_CACHE_DIR")) {
+        voice_cache_dir = env;
+    }
+    if (!voice_cache_dir.empty()) {
+        ::mkdir(voice_cache_dir.c_str(), 0755);
+        fprintf(stderr, "voice cache dir: %s\n", voice_cache_dir.c_str());
+    }
+
     httplib::Server svr;
 
     // log all requests
@@ -509,7 +635,8 @@ int main(int argc, char ** argv) {
 
     // --- POST /v1/audio/voices --- create custom voice from reference audio
     svr.Post("/v1/audio/voices",
-        [&tts, &synth_mutex, &voices, &voices_mutex, &next_voice_id](const httplib::Request & req, httplib::Response & res) {
+        [&tts, &synth_mutex, &voices, &voices_mutex, &next_voice_id,
+         &voice_cache_dir, &model_id](const httplib::Request & req, httplib::Response & res) {
 
         // runtime audio cloning needs the speaker encoder, which only ships in the Base variant
         if (!tts.has_speaker_encoder()) {
@@ -554,10 +681,26 @@ int main(int argc, char ** argv) {
         if (req.has_param("ref_text")) ref_text = req.get_param_value("ref_text");
         if (req.has_file("ref_text")) ref_text = req.get_file_value("ref_text").content;
 
+        // disk cache: try to skip encoder forward passes by loading
+        // previously-derived embedding + ref_codes for this WAV.
+        const std::string cache_path = voice_cache_path(voice_cache_dir, model_id, audio_file.content);
+        voice_bundle cached;
+        const bool cache_hit = !cache_path.empty() &&
+                               voice_bundle_read(cache_path, cached) &&
+                               cached.model_id == model_id;
+        const bool need_codes = !ref_text.empty();
+        bool used_cached_embed = false;
+        bool used_cached_codes = false;
+
         // extract speaker embedding (optional when ref_text is provided for ICL mode)
         std::vector<float> embedding;
-        bool ok;
-        {
+        bool ok = false;
+        if (cache_hit && cached.has_embedding) {
+            embedding = cached.embedding;
+            ok = !embedding.empty();
+            used_cached_embed = ok;
+        }
+        if (!used_cached_embed) {
             std::lock_guard<std::mutex> lock(synth_mutex);
             ok = tts.extract_speaker_embedding(tmppath, embedding);
         }
@@ -576,55 +719,108 @@ int main(int argc, char ** argv) {
         // ICL mode: also encode reference audio to discrete speech codes
         std::vector<int32_t> ref_codes;
         int32_t n_ref_frames = 0;
-        if (!ref_text.empty()) {
-            std::vector<float> samples;
-            int sample_rate = 0;
-            if (!qwen3_tts::load_audio_file(tmppath, samples, sample_rate)) {
-                unlink(tmppath);
-                res.status = 400;
-                res.set_content(R"({"error":{"message":"failed to load audio for codec encoding","type":"invalid_request_error"}})",
-                                "application/json");
-                return;
-            }
-
-            // resample to 24kHz if needed
-            if (sample_rate != 24000 && sample_rate > 0) {
-                int64_t new_len = (int64_t)samples.size() * 24000 / sample_rate;
-                std::vector<float> resampled(new_len);
-                for (int64_t i = 0; i < new_len; i++) {
-                    float src = (float)i * sample_rate / 24000.0f;
-                    int idx = (int)src;
-                    float frac = src - idx;
-                    if (idx + 1 < (int)samples.size()) {
-                        resampled[i] = samples[idx] * (1 - frac) + samples[idx + 1] * frac;
-                    } else {
-                        resampled[i] = samples[std::min(idx, (int)samples.size() - 1)];
-                    }
+        int32_t n_codebooks  = 0;
+        if (need_codes) {
+            if (cache_hit && cached.has_codes && cached.n_ref_frames > 0) {
+                ref_codes    = cached.ref_codes;
+                n_ref_frames = cached.n_ref_frames;
+                n_codebooks  = cached.n_codebooks;
+                used_cached_codes = true;
+            } else {
+                std::vector<float> samples;
+                int sample_rate = 0;
+                if (!qwen3_tts::load_audio_file(tmppath, samples, sample_rate)) {
+                    unlink(tmppath);
+                    res.status = 400;
+                    res.set_content(R"({"error":{"message":"failed to load audio for codec encoding","type":"invalid_request_error"}})",
+                                    "application/json");
+                    return;
                 }
-                samples = std::move(resampled);
-            }
 
-            bool codec_ok;
-            {
-                std::lock_guard<std::mutex> lock(synth_mutex);
-                codec_ok = tts.encode_speech_codes(samples.data(),
-                                                    (int32_t)samples.size(),
-                                                    ref_codes, n_ref_frames);
+                // resample to 24kHz if needed
+                if (sample_rate != 24000 && sample_rate > 0) {
+                    int64_t new_len = (int64_t)samples.size() * 24000 / sample_rate;
+                    std::vector<float> resampled(new_len);
+                    for (int64_t i = 0; i < new_len; i++) {
+                        float src = (float)i * sample_rate / 24000.0f;
+                        int idx = (int)src;
+                        float frac = src - idx;
+                        if (idx + 1 < (int)samples.size()) {
+                            resampled[i] = samples[idx] * (1 - frac) + samples[idx + 1] * frac;
+                        } else {
+                            resampled[i] = samples[std::min(idx, (int)samples.size() - 1)];
+                        }
+                    }
+                    samples = std::move(resampled);
+                }
+
+                bool codec_ok;
+                {
+                    std::lock_guard<std::mutex> lock(synth_mutex);
+                    codec_ok = tts.encode_speech_codes(samples.data(),
+                                                        (int32_t)samples.size(),
+                                                        ref_codes, n_ref_frames);
+                }
+                if (!codec_ok) {
+                    unlink(tmppath);
+                    res.status = 500;
+                    json err = {{"error", {
+                        {"message", "failed to encode speech codes: " + tts.get_error()},
+                        {"type", "server_error"},
+                    }}};
+                    res.set_content(err.dump(), "application/json");
+                    return;
+                }
+                n_codebooks = (n_ref_frames > 0)
+                              ? (int32_t) (ref_codes.size() / n_ref_frames) : 0;
+                fprintf(stderr, "encoded %d reference frames for ICL voice cloning\n", n_ref_frames);
             }
-            if (!codec_ok) {
-                unlink(tmppath);
-                res.status = 500;
-                json err = {{"error", {
-                    {"message", "failed to encode speech codes: " + tts.get_error()},
-                    {"type", "server_error"},
-                }}};
-                res.set_content(err.dump(), "application/json");
-                return;
-            }
-            fprintf(stderr, "encoded %d reference frames for ICL voice cloning\n", n_ref_frames);
         }
 
         unlink(tmppath);
+
+        // log cache decision
+        if (!voice_cache_dir.empty()) {
+            fprintf(stderr,
+                    "voice-cache: %s (embed=%s, codes=%s) %s\n",
+                    cache_hit ? "HIT" : "MISS",
+                    used_cached_embed ? "cached" : "encoded",
+                    need_codes ? (used_cached_codes ? "cached" : "encoded") : "skip",
+                    cache_path.c_str());
+        }
+
+        // persist any newly-computed artifacts (or partial-hit upgrades).
+        // Preserve previously-cached artifacts that we didn't recompute on
+        // this request (e.g. cached codes when register-without-ref_text).
+        if (!cache_path.empty()) {
+            const bool need_write =
+                (!used_cached_embed && !embedding.empty()) ||
+                (need_codes && !used_cached_codes && !ref_codes.empty());
+            if (need_write) {
+                voice_bundle out;
+                out.model_id = model_id;
+                if (!embedding.empty()) {
+                    out.has_embedding = true;
+                    out.embedding = embedding;
+                }
+                if (!ref_codes.empty()) {
+                    out.has_codes    = true;
+                    out.ref_codes    = ref_codes;
+                    out.n_ref_frames = n_ref_frames;
+                    out.n_codebooks  = n_codebooks;
+                } else if (cache_hit && cached.has_codes) {
+                    // preserve previously-cached codes (e.g. registered
+                    // without ref_text now, but had codes from a prior pass)
+                    out.has_codes    = true;
+                    out.ref_codes    = cached.ref_codes;
+                    out.n_ref_frames = cached.n_ref_frames;
+                    out.n_codebooks  = cached.n_codebooks;
+                }
+                if (!voice_bundle_write(cache_path, out)) {
+                    fprintf(stderr, "  voice-cache: failed to write %s\n", cache_path.c_str());
+                }
+            }
+        }
 
         // store voice
         std::string voice_id;
