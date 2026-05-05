@@ -1094,7 +1094,16 @@ int main(int argc, char ** argv) {
         float       temperature     = body.value("temperature", sp.temperature);
         int         top_k           = body.value("top_k", sp.top_k);
         float       top_p           = body.value("top_p", 1.0f);
-        int         max_audio_tokens = body.value("max_audio_tokens", 2048);
+        // KV n_ctx is sized to (prefill + max_audio + 8); ggml CUDA FA
+        // decode scans the full n_ctx per step, so raising the default
+        // costs ~linear t/s on every synth. Operators can opt in via
+        // QWEN3_TTS_DEFAULT_MAX_AUDIO_TOKENS; per-request body still wins.
+        int default_max_audio_tokens = 2048;
+        if (const char * env = std::getenv("QWEN3_TTS_DEFAULT_MAX_AUDIO_TOKENS")) {
+            const int v = std::atoi(env);
+            if (v > 0) default_max_audio_tokens = v;
+        }
+        int         max_audio_tokens = body.value("max_audio_tokens", default_max_audio_tokens);
         float       repetition_penalty = body.value("repetition_penalty", sp.repetition_penalty);
         int64_t     seed               = body.value("seed", sp.seed);
         int         stream_batch_size       = body.value("stream_batch_size", 0);
