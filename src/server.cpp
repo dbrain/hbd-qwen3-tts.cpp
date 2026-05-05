@@ -996,6 +996,17 @@ int main(int argc, char ** argv) {
 
         fprintf(stderr, "created voice '%s' (id: %s%s)\n", name.c_str(), voice_id.c_str(),
                 ref_text.empty() ? "" : ", ICL mode");
+
+        // Reclaim VRAM: the speaker encoder + codec encoder are needed
+        // only for register-time work (they extracted embedding +
+        // ref_codes above). The synthesis path uses the cached values
+        // and never touches them again. ~250 MiB recovered immediately;
+        // they reload lazily on the next register call.
+        {
+            std::lock_guard<std::mutex> lock(synth_mutex);
+            tts.unload_encoders();
+        }
+
         json resp = {{"id", voice_id}, {"name", name}};
         if (!ref_text.empty()) {
             resp["mode"] = "icl";

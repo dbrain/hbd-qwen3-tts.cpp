@@ -218,6 +218,16 @@ public:
     // change that would invalidate cached state (e.g. vocoder model swap).
     void clear_icl_cache();
 
+    // Release the speaker encoder + codec encoder VRAM. They are needed
+    // only at voice-registration time (extract speaker embedding +
+    // ref_codes from raw audio); once a voice's bundle is on disk the
+    // synthesis path uses cached embedding/codes and never touches the
+    // encoders. The server triggers this at the end of /v1/audio/voices
+    // POST handlers; the encoders lazily reload on the next register.
+    // Saves ~250 MiB of permanently-resident VRAM after the first
+    // register call.
+    void unload_encoders();
+
     // Release all model GPU/CPU buffers, schedulers, and backends. After
     // this call, is_loaded() returns false until reload_model() (or
     // load_model_files()) is called. Synthesis attempts will fail until

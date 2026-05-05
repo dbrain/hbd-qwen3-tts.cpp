@@ -954,6 +954,17 @@ void Qwen3TTS::clear_icl_cache() {
     icl_cache_.clear();
 }
 
+void Qwen3TTS::unload_encoders() {
+    if (encoder_loaded_) {
+        audio_encoder_.unload_model();
+        encoder_loaded_ = false;
+    }
+    if (codec_encoder_loaded_) {
+        codec_encoder_.unload_model();
+        codec_encoder_loaded_ = false;
+    }
+}
+
 void Qwen3TTS::unload_model() {
     // Release in reverse-of-likely-dependency order. Each component's
     // unload_model() is idempotent (no-op if already unloaded).
