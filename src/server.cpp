@@ -353,6 +353,8 @@ struct server_params {
     std::string hf_file;     // override filename within --hf-repo
     std::string hf_repo_v;   // vocoder HF repo
     std::string hf_file_v;   // override filename within --hf-repo-v
+    std::string hf_repo_se;  // speaker-encoder HF repo (separate GGUF; used when -m is VoiceDesign)
+    std::string hf_file_se;  // override filename within --hf-repo-se
     std::string host      = "127.0.0.1";
     int         port      = 8080;
     int         n_threads = 4;
@@ -438,6 +440,8 @@ static void print_usage(const char * program) {
     fprintf(stderr, "       --hf-file <file>            override GGUF filename within --hf-repo\n");
     fprintf(stderr, "       --hf-repo-v <repo[:quant]>  HuggingFace vocoder repo\n");
     fprintf(stderr, "       --hf-file-v <file>          override GGUF filename within --hf-repo-v\n");
+    fprintf(stderr, "       --hf-repo-se <repo[:quant]> HuggingFace speaker-encoder repo (separate GGUF)\n");
+    fprintf(stderr, "       --hf-file-se <file>         override GGUF filename within --hf-repo-se\n");
     fprintf(stderr, "  -H,  --host <host>              listen host (default: 127.0.0.1)\n");
     fprintf(stderr, "  -p,  --port <port>              listen port (default: 8080)\n");
     fprintf(stderr, "  -j,  --threads <n>              compute threads (default: 4)\n");
@@ -487,6 +491,12 @@ static bool parse_args(int argc, char ** argv, server_params & sp) {
         } else if (arg == "--hf-file-v") {
             if (++i >= argc) { fprintf(stderr, "error: missing hf vocoder file\n"); return false; }
             sp.hf_file_v = argv[i];
+        } else if (arg == "--hf-repo-se") {
+            if (++i >= argc) { fprintf(stderr, "error: missing hf speaker-encoder repo\n"); return false; }
+            sp.hf_repo_se = argv[i];
+        } else if (arg == "--hf-file-se") {
+            if (++i >= argc) { fprintf(stderr, "error: missing hf speaker-encoder file\n"); return false; }
+            sp.hf_file_se = argv[i];
         } else if (arg == "--temperature") {
             if (++i >= argc) { fprintf(stderr, "error: missing temperature\n"); return false; }
             sp.temperature = std::stof(argv[i]);
@@ -528,6 +538,11 @@ int main(int argc, char ** argv) {
         sp.vocoder = hf_resolve(sp.hf_repo_v, sp.hf_file_v, "F16");
         if (sp.vocoder.empty()) return 1;
         fprintf(stderr, "resolved vocoder: %s\n", sp.vocoder.c_str());
+    }
+    if (!sp.hf_repo_se.empty()) {
+        sp.speaker_encoder = hf_resolve(sp.hf_repo_se, sp.hf_file_se);
+        if (sp.speaker_encoder.empty()) return 1;
+        fprintf(stderr, "resolved speaker-encoder: %s\n", sp.speaker_encoder.c_str());
     }
 
     // load models
