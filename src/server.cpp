@@ -689,6 +689,16 @@ int main(int argc, char ** argv) {
         return std::chrono::duration_cast<std::chrono::milliseconds>(t).count();
     };
     std::atomic<int64_t> last_activity_ms{ now_ms() };
+    // In-flight synth counter. Long-running synths (e.g. 9-min audio at
+    // RTF 3.4 = ~160 s wall) used to trip idle-unload mid-call because
+    // last_activity_ms was set only at synth start; the watchdog saw
+    // ">30s since last activity" while the synth was still producing
+    // chunks. The mutex try_to_lock skipped most ticks but if the
+    // provider lambda released the lock briefly the watchdog would
+    // unload the model out from under the in-flight call. Tracking an
+    // explicit in-flight count makes "is anything happening right now?"
+    // separate from "how long since the last call started?".
+    std::atomic<int>     in_flight_synths{ 0 };
     auto note_activity = [&]() { last_activity_ms.store(now_ms()); };
     // Caller must already hold synth_mutex. Reloads if idle-unload swept
     // the model out from under us. Returns false on reload failure.
@@ -702,6 +712,17 @@ int main(int argc, char ** argv) {
                     (long long) (now_ms() - t0));
         }
         return ok;
+    };
+    // RAII guard for in_flight_synths: increment in handlers that drive
+    // long-running synth, decrement on lambda exit. note_activity() is
+    // called at both ends so the idle window starts only after the
+    // synth completes.
+    struct InFlightGuard {
+        std::atomic<int> & ctr;
+        std::function<void()> note;
+        InFlightGuard(std::atomic<int> & c, std::function<void()> n)
+            : ctr(c), note(std::move(n)) { ctr.fetch_add(1); note(); }
+        ~InFlightGuard() { note(); ctr.fetch_sub(1); }
     };
 
     httplib::Server svr;
@@ -1064,7 +1085,8 @@ int main(int argc, char ** argv) {
     // --- POST /v1/audio/speech ---
     svr.Post("/v1/audio/speech",
         [&tts, &synth_mutex, &sp, &voices, &voices_mutex,
-         &voice_archive_dir, &model_id, &ensure_loaded_locked](const httplib::Request & req, httplib::Response & res) {
+         &voice_archive_dir, &model_id, &ensure_loaded_locked,
+         &in_flight_synths, &note_activity](const httplib::Request & req, httplib::Response & res) {
 
         // parse request body
         json body;
@@ -1287,8 +1309,15 @@ int main(int argc, char ** argv) {
                  stream_batch_size, stream_first_batch_size, is_sse, is_wav,
                  synth_mutex = &synth_mutex,
                  voice = voice, warmup_path = warmup_path, model_id = model_id,
+                 in_flight = &in_flight_synths,
+                 &note_activity,
                  &ensure_loaded_locked]
                 (size_t /*offset*/, httplib::DataSink & sink) mutable -> bool {
+                    // Guard the in-flight counter for the entire synth so
+                    // idle-unload doesn't release the model out from under
+                    // a long-running call. Bumps note_activity at start +
+                    // end so the idle window restarts after the synth.
+                    InFlightGuard guard(*in_flight, note_activity);
                     std::lock_guard<std::mutex> lock(*synth_mutex);
                     if (!ensure_loaded_locked()) {
                         sink.done();
@@ -1370,6 +1399,7 @@ int main(int argc, char ** argv) {
         // synthesize (serialized), using voice embedding if provided
         tts_result result;
         {
+            InFlightGuard guard(in_flight_synths, note_activity);
             std::lock_guard<std::mutex> lock(synth_mutex);
             if (!ensure_loaded_locked()) {
                 res.status = 503;
@@ -1485,14 +1515,23 @@ int main(int argc, char ** argv) {
     if (idle_unload_seconds > 0) {
         fprintf(stderr, "idle-unload: model will be released after %d s of inactivity\n",
                 idle_unload_seconds);
-        std::thread([&tts, &synth_mutex, &last_activity_ms, idle_unload_seconds, now_ms]() {
+        std::thread([&tts, &synth_mutex, &last_activity_ms, &in_flight_synths,
+                     idle_unload_seconds, now_ms]() {
             const int64_t threshold_ms = (int64_t) idle_unload_seconds * 1000;
             const int     check_s     = std::max(1, idle_unload_seconds / 5);
             for (;;) {
                 std::this_thread::sleep_for(std::chrono::seconds(check_s));
+                // Don't unload while a synth is in flight — irrespective of
+                // last_activity_ms, which was set at synth start and may now
+                // be far in the past for a long-running synth.
+                if (in_flight_synths.load() > 0) continue;
                 if (now_ms() - last_activity_ms.load() < threshold_ms) continue;
                 std::unique_lock<std::mutex> lock(synth_mutex, std::try_to_lock);
                 if (!lock.owns_lock()) continue;  // a request is in flight; skip this tick
+                // Re-check both conditions under the lock to avoid a TOCTOU
+                // where a new request grabbed the in-flight counter between
+                // our checks and the lock acquisition.
+                if (in_flight_synths.load() > 0) continue;
                 if (now_ms() - last_activity_ms.load() < threshold_ms) continue;
                 if (!tts.is_loaded()) continue;
                 fprintf(stderr, "idle-unload: %lld s since last activity, releasing model\n",
