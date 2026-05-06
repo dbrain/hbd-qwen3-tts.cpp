@@ -16,6 +16,7 @@
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -28,7 +29,9 @@
 #include <thread>
 #include <vector>
 #include <unistd.h>
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 
 using json = nlohmann::json;
 using namespace qwen3_tts;
@@ -147,12 +150,27 @@ static bool voice_bundle_write(const std::string & path, const voice_bundle & b)
 //
 // The WAV is never read at synth time — embeds + codes are the persistent
 // representation. WAV is only the ingest format and an optional preview.
+// Voice IDs are user-supplied and used as filesystem path components in the
+// voice archive. Reject anything that could escape the archive root or trip
+// the OS layer: empty / overlong, leading dot, path separators, NULs, and
+// any control byte. `.` and `..` are explicitly disallowed.
+static bool is_safe_voice_name(const std::string & name) {
+    if (name.empty() || name.size() > 64) return false;
+    if (name == "." || name == "..") return false;
+    if (name[0] == '.') return false;
+    for (unsigned char c : name) {
+        if (c < 0x20) return false;
+        if (c == '/' || c == '\\') return false;
+    }
+    return true;
+}
+
 static std::string voice_dir_path(const std::string & archive_dir, const std::string & name) {
-    if (archive_dir.empty() || name.empty()) return "";
+    if (archive_dir.empty() || !is_safe_voice_name(name)) return "";
     return archive_dir + "/" + name;
 }
 static std::string voice_bundle_path(const std::string & archive_dir, const std::string & name) {
-    if (archive_dir.empty() || name.empty()) return "";
+    if (archive_dir.empty() || !is_safe_voice_name(name)) return "";
     return archive_dir + "/" + name + "/voice.bundle";
 }
 
@@ -366,23 +384,70 @@ struct server_params {
     int64_t     seed               = -1;
 };
 
-// download a file from a huggingface repo, returns local cache path
+// download a file from a huggingface repo, returns local cache path.
+// `repo` and `filename` come from CLI flags but can be derived from
+// untrusted parts of the model spec — pass them as argv to a no-shell
+// fork+execvp instead of building a shell command, so embedded quotes /
+// `$` / backticks can't escape into the shell.
 static std::string hf_download(const std::string & repo, const std::string & filename) {
-    std::string cmd = "hf download \"" + repo + "\" \"" + filename + "\" --quiet";
-    FILE * fp = popen(cmd.c_str(), "r");
-    if (!fp) return "";
+    int pipefd[2];
+    if (pipe(pipefd) != 0) return "";
 
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return "";
+    }
+    if (pid == 0) {
+        // child: redirect stdout to the pipe, drop stderr (matches --quiet
+        // contract), exec the hf cli with argv that needs no shell parsing.
+        close(pipefd[0]);
+        if (dup2(pipefd[1], STDOUT_FILENO) < 0) _exit(127);
+        close(pipefd[1]);
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) { dup2(devnull, STDERR_FILENO); close(devnull); }
+        const char * argv[] = {
+            "hf", "download", repo.c_str(), filename.c_str(), "--quiet", nullptr
+        };
+        execvp("hf", const_cast<char * const *>(argv));
+        _exit(127);
+    }
+
+    close(pipefd[1]);
     std::string path;
     char buf[4096];
-    while (fgets(buf, sizeof(buf), fp)) {
-        path = buf;
+    while (true) {
+        ssize_t n = read(pipefd[0], buf, sizeof(buf));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (n == 0) break;
+        path.append(buf, (size_t) n);
     }
-    int status = pclose(fp);
-    if (status != 0) return "";
+    close(pipefd[0]);
 
-    // trim trailing whitespace
-    while (!path.empty() && (path.back() == '\n' || path.back() == '\r' || path.back() == ' ')) {
-        path.pop_back();
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) { status = -1; break; }
+    }
+    if (status != 0 && !(WIFEXITED(status) && WEXITSTATUS(status) == 0)) {
+        return "";
+    }
+
+    // hf cli prints multiple lines (download progress + final path); the
+    // last non-empty line is the cache path. Trim and pick it.
+    auto rtrim = [](std::string & s) {
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' || s.back() == '\t')) {
+            s.pop_back();
+        }
+    };
+    rtrim(path);
+    auto last_nl = path.find_last_of('\n');
+    if (last_nl != std::string::npos) {
+        path = path.substr(last_nl + 1);
+        rtrim(path);
     }
     return path;
 }
@@ -617,7 +682,7 @@ int main(int argc, char ** argv) {
                 if (ec) break;
                 if (!entry.is_directory()) continue;
                 const std::string name = entry.path().filename().string();
-                if (name.empty() || name[0] == '.') continue;
+                if (!is_safe_voice_name(name)) continue;
                 const auto bundle = entry.path() / "voice.bundle";
                 if (!std::filesystem::exists(bundle)) {
                     fprintf(stderr, "  voice-archive: '%s' deferred (no voice.bundle yet)\n",
@@ -846,6 +911,13 @@ int main(int argc, char ** argv) {
         if (req.has_param("name")) name = req.get_param_value("name");
         if (req.has_file("name")) name = req.get_file_value("name").content;
 
+        if (!is_safe_voice_name(name)) {
+            res.status = 400;
+            res.set_content(R"j({"error":{"message":"invalid voice name (allowed: 1-64 chars, no '/', '\\', leading '.', or control bytes)","type":"invalid_request_error"}})j",
+                            "application/json");
+            return;
+        }
+
         auto audio_file = req.get_file_value("audio_sample");
 
         // write to temp file for the encoder (expects a file path)
@@ -857,8 +929,36 @@ int main(int argc, char ** argv) {
                             "application/json");
             return;
         }
-        write(fd, audio_file.content.data(), audio_file.content.size());
-        close(fd);
+        // Loop on write() — short writes (signal interruption, ENOSPC) would
+        // otherwise silently truncate the temp WAV, which then encodes into a
+        // garbage embedding that gets persisted to the voice bundle.
+        {
+            const char * data = audio_file.content.data();
+            size_t remaining = audio_file.content.size();
+            bool write_ok = true;
+            while (remaining > 0) {
+                ssize_t n = write(fd, data, remaining);
+                if (n < 0) {
+                    if (errno == EINTR) continue;
+                    write_ok = false;
+                    break;
+                }
+                if (n == 0) {  // shouldn't happen, but treat as failure
+                    write_ok = false;
+                    break;
+                }
+                data += n;
+                remaining -= (size_t) n;
+            }
+            close(fd);
+            if (!write_ok) {
+                unlink(tmppath);
+                res.status = 500;
+                res.set_content(R"({"error":{"message":"failed to write temp file","type":"server_error"}})",
+                                "application/json");
+                return;
+            }
+        }
 
         // optional ref_text for ICL voice cloning
         std::string ref_text;
@@ -1071,6 +1171,12 @@ int main(int argc, char ** argv) {
     svr.Delete(R"(/v1/audio/voices/(.+))",
         [&voices, &voices_mutex](const httplib::Request & req, httplib::Response & res) {
         std::string voice_id = req.matches[1];
+        if (!is_safe_voice_name(voice_id)) {
+            res.status = 400;
+            res.set_content(R"({"error":{"message":"invalid voice id","type":"invalid_request_error"}})",
+                            "application/json");
+            return;
+        }
         std::lock_guard<std::mutex> lock(voices_mutex);
         if (voices.erase(voice_id)) {
             res.set_content(R"({"deleted":true})", "application/json");
@@ -1331,11 +1437,13 @@ int main(int argc, char ** argv) {
 
         // Compute path for the voice's persistent warmup blob (cold-path
         // cache file). Only set when the request is bound to a registered
-        // voice and the voice archive is enabled.
+        // voice and the voice archive is enabled. voice_dir_path() returns
+        // empty for unsafe names — we silently skip the warmup write rather
+        // than letting "" + "/voice.warmup" land at filesystem root.
         std::string warmup_path;
-        if (!voice.empty() && !voice_archive_dir.empty()) {
+        if (!voice.empty() && !voice_archive_dir.empty() && is_safe_voice_name(voice)) {
             const std::string vd = voice_dir_path(voice_archive_dir, voice);
-            warmup_path = vd + "/voice.warmup";
+            if (!vd.empty()) warmup_path = vd + "/voice.warmup";
         }
 
         // live streaming path: when stream_format is set and stream_batch_size
