@@ -102,6 +102,45 @@ Hot-path TTFA stays flat across audio length — neither doubles for a 17 s synt
 
 The ICL cache-MISS path pays the warmup decode once per voice on the first synth in a fresh process, then persists the snapshot to `voice.warmup` on disk so subsequent boots restore from disk in single-digit-ms. The decode itself is chunked at the steady-state streaming batch size, so it doesn't pin the scheduler arena (see "Performance" above).
 
+### HTTP API
+
+OpenAI-compatible endpoints with this fork's extras layered on top. Per-request body always overrides defaults; defaults are tuned for single-stream decode on a 12 GB Ampere.
+
+**`POST /v1/audio/speech`**
+
+| Parameter | Origin | Notes |
+|---|---|---|
+| `input` | OpenAI | required; default cap 6144 chars (env `QWEN3_TTS_MAX_INPUT_CHARS`) |
+| `voice` | OpenAI | `"default"`, a built-in speaker, or a registered clone id; empty = `"default"` |
+| `instructions` | OpenAI | VoiceDesign description; works alongside `voice="default"` (no clone needed) |
+| `response_format` | OpenAI (subset) | this fork accepts `wav` and `pcm`; OpenAI's `mp3`/`opus`/`aac`/`flac` are not implemented |
+| `stream_format` | OpenAI | `audio` (chunked binary) or `sse` (`speech.audio.delta` events with base64 audio); empty = one-shot |
+| `model`, `speed` | OpenAI | accepted in the body but currently ignored |
+| `language` | this fork | language code (`en`, `zh`, ...); see `GET /v1/audio/languages` |
+| `temperature`, `top_k`, `top_p`, `seed`, `repetition_penalty` | this fork | sampling controls |
+| `max_audio_tokens` | this fork | 1..8192, default 2048; KV `n_ctx` scales linearly (see Performance for the t/s tax) |
+| `stream_batch_size` | this fork | vocoder chunk size, default 30; smaller = lower per-chunk sched_cu, similar TTFA |
+| `stream_first_batch_size` | this fork | first chunk only, default 1 = lowest TTFA |
+
+Streaming mode matrix (`response_format` × `stream_format`):
+
+| `response_format` | `stream_format` | Wire format |
+|---|---|---|
+| `wav` | `audio` | `audio/wav`, chunked: 44-byte placeholder header (size fields = `0xFFFFFFFF`) emitted with first PCM batch, then 16-bit-LE PCM chunks. Most players accept the placeholder; `wave.open()` rejects it — fix by rewriting bytes 4 and 40 once the stream lands. |
+| `pcm` | `audio` | `audio/pcm`, chunked: raw 16-bit-LE PCM, no header. Caller must know the sample rate (24 kHz V1, 48 kHz V2). |
+| `wav` \| `pcm` | `sse` | `text/event-stream`: `speech.audio.delta` events with `{type, audio: <base64>}` data, then a closing `speech.audio.done` event carrying usage/timing for both OpenAI clients and llama-swap's `metrics_monitor`. |
+| any | empty | one-shot: full WAV/PCM body in a single response, no chunked transfer encoding. |
+
+Lifecycle and discovery:
+
+- `GET /health` → `{"status":"ok","model_loaded":bool}`
+- `GET /v1/models` / `GET /v1/audio/languages` / `GET /v1/audio/voices`
+- `POST /v1/audio/voices` — register a clone (multipart: `name`, `audio_sample` file, optional `ref_text` for ICL). HITs the on-disk `voice.bundle` if one exists for that name + current model and skips the encoder forward passes.
+- `DELETE /v1/audio/voices/<id>` — drop the in-memory voice; on-disk `voice.bundle` / `voice.warmup` persist (re-register or restart-rescan re-loads them).
+- `POST /v1/admin/unload` / `POST /v1/admin/load` — explicit lifecycle for sharing the GPU; idle unload is automatic via `QWEN3_TTS_IDLE_UNLOAD_SECONDS`.
+
+`docker/tts-qwen3-dev/cold-start.py` exercises every path above end-to-end (model reload, voice register HIT/MISS, post-reload TTFA, VoiceDesign, all four streaming-mode combinations) and reports TTFA / wall / framing checks. Run it after a deploy to validate that the table above and the TTFA numbers above still hold on your hardware.
+
 ### Current limitations
 
 - **CUDA-context floor (~370 MiB)**: ggml's CUDA backend reserves a per-device pool that doesn't shrink mid-process. Below this floor needs a `cudaDeviceReset()` on idle-unload, which would risk re-init safety on the ggml CUDA statics. Not currently attempted.
