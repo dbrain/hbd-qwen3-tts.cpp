@@ -2,7 +2,76 @@
 
 ## Added In This Fork
 
-This fork ([khimaros/qwen3-tts.cpp](https://github.com/khimaros/qwen3-tts.cpp)) layers the following on top of [predict-woo/qwen3-tts.cpp](https://github.com/predict-woo/qwen3-tts.cpp):
+This fork ([dbrain/qwen3-tts.cpp](https://github.com/dbrain/qwen3-tts.cpp), paired with [dbrain/ggml](https://github.com/dbrain/ggml)) layers the following on top of [khimaros/qwen3-tts.cpp](https://github.com/khimaros/qwen3-tts.cpp). Headline number on a single RTX 3060 / 12 GB / Ampere: **~2.78× realtime** on Q8_0 (i.e. ~2.78 s of 24 kHz audio per wall-second), measured across the bench suite at peak ~3.35 GB VRAM. Compared to upstream PyTorch + transformers on the same model (BF16), that's roughly **+50 %** end-to-end at single-stream decode.
+
+### Performance
+
+- **wmma `conv_1d_direct` kernel** in dbrain/ggml — single biggest fork-arc jump (RTF 1.87 → 2.61). Tensor-core `nvcuda::wmma` GEMM with on-the-fly im2col index calculation, replacing the im2col-temp + cuBLAS path. **F16 weights only** (vocoder cascade — do not quantise the vocoder beyond F16, that drops the kernel).
+- **Fused `GGML_OP_SNAKE` op** (CPU + CUDA) — replaces the `pow(sin(αx), 2) / α + β·x` broadcast chain used at every vocoder residual. Removes a ~10× tensor-broadcast overhead and a `powf` NaN edge case.
+- **Q8_0 KV cache for the talker**, paired with the FA prefill path, default ON. Saves ~64 MiB peak VRAM at no measurable RTFA cost. `QWEN3_TTS_KV_Q8=0` reverts to F16 KV.
+- **Talker prefill K/V view narrowed** to `round_up(n_past + n_tokens, 256)` per call (vs full `n_ctx`). +8 % realtime-speedup, +13 % t/s.
+- **Voice-keyed prefill ICL cache** + per-voice prefill K/V state cache — cold-from-disk TTFA <300 ms.
+- **`max_audio_tokens` env-tunable** (default 2048). Higher values cost linear t/s on every synth via FA's full-`n_ctx` scan; expose so ops can pick.
+- **Streaming defaults baked in**: `--streaming-batch-size 60`, `--streaming-first-batch-size 1`. Bounds vocoder per-call peak and improves TTFA without throughput regression. Per-request body always wins; envs `QWEN3_TTS_DEFAULT_STREAM_*` override defaults.
+- **CUDA graphs disabled by default** (`GGML_CUDA_DISABLE_GRAPHS=1`) — at batch=1 autoregressive decode they cost +~700 MiB peak with no measurable gain (talker-step cgraph rebuilds every frame, capture's per-key warmup never converges). `=0` to re-enable for workloads where capture pays off.
+
+### Functionality
+
+- **In-process model lifecycle**: `POST /v1/admin/unload` releases all GPU/CPU buffers; `POST /v1/admin/load` reloads from the captured paths. Idle-unload via `QWEN3_TTS_IDLE_UNLOAD_SECONDS=N` triggers automatic unload after N seconds of synth inactivity, with lazy reload on the next request. Lets a server share a GPU with intermittent workloads.
+- **`QWEN3_TTS_LAZY_LOAD=1`** — skip startup model load, defer until first request. Voice-archive scan still runs at startup (host-only). Useful for fast-restart prod compose.
+- **C++-owned voice archive** at `$QWEN3_TTS_VOICE_ARCHIVE_DIR`. Each voice is a directory with:
+  - `voice.bundle` — primary persistent format (binary `QTVB` magic): speaker embedding + ref_codes + model_id stamp. Atomically written on register; re-validated against the loaded model on startup.
+  - `ref_text.txt` — optional ICL transcript.
+  - `description.txt` — optional VoiceDesign description.
+  - `ref.wav` — optional, kept only for human replay (never read at synth time).
+  The WAV is purely the ingest format. Embeds + codes are the durable representation, so a voice survives across model swaps as long as the model_id matches.
+- **`voice.warmup`** — persistent on-disk snapshot of the vocoder's ICL warm-up state (causal-conv tails, conv_t overlap buffers, per-layer KV cache) keyed by ref_codes hash. Restored on first synth per voice — eliminates the ~700–1200 ms vocoder warm-up decode that would otherwise run on every cold-from-disk request.
+- **Persistent voice caches** — derived voice artefacts (codec embeddings, speaker embeddings) are cached on disk per voice and re-used across restarts.
+- **Speaker + codec encoders unloaded after voice register** — they're one-shot pieces, no need to keep their VRAM resident after a voice is registered. The next register lazily reloads them.
+- **Speaker-encoder-only GGUF sidecar**: `--speaker-encoder <file>` accepts a tiny GGUF that contains *only* `spk_enc.*` tensors and `qwen3-tts.speaker_encoder.*` metadata. The full Base GGUF (~2.4 GB) carries the entire talker + codec + tokenizer + speaker-encoder, but the running binary only reads the spk_enc subset. The sidecar is **~24 MB** (F16 weights + F32 biases — Q8_0 quantization in the conventional Base GGUF skips the small/odd-shaped speaker-encoder convs anyway). Pair with a VoiceDesign GGUF for a "design + clone" stack at ~3.4 GB peak resident. Extraction script: `scripts/extract_spk_enc.py`. Companion `--hf-repo-se / --hf-file-se` flags auto-download from a HuggingFace repo.
+- **Voice-archive C++ ownership** — the archive scanner is in-process (`server.cpp`), not a wrapper. Bundles with `model_id` mismatch are deferred (not deleted) so a model swap doesn't lose voices.
+- **`--hf-repo-v` / `--hf-repo-se`** — separate HuggingFace repos for the vocoder and speaker-encoder GGUFs (paired with `--hf-file-v` / `--hf-file-se` overrides for the file within the repo). Lets the server pull a 1.7B-VoiceDesign talker + a 24 MB spk_enc sidecar + a tokenizer in three independent fetches.
+- **Input character cap raised** to 6144 (env-tunable via `QWEN3_TTS_INPUT_CHAR_CAP`).
+- **C API** (`qwen3tts_c_api.h`) for bindings into non-C++ hosts.
+- **`/health` endpoint** + bench-friendly timing log (`-V` / `--print-timing`) splitting prefill, decode steps, and vocoder.
+
+### Required GGML kernels (dbrain/ggml@master, 5 commits ahead of upstream)
+
+| Commit | Op |
+|---|---|
+| `f9d89c05` | `GGML_OP_SNAKE` (CPU + CUDA), fused `α·sin(βx)² + γx` for the vocoder activation |
+| `a8474481` | `GGML_OP_CONV_1D_DIRECT`, smem-tiled CUDA kernel |
+| `68a08cbf` | Asymmetric padding API for `conv_1d_direct` + `im2col` `gridDim.y` chunking |
+| `963780ac` | Snake powf NaN fix + `conv_1d_direct` early-return sync hazard |
+| `963d6660` | tensor-core `wmma` kernel for `conv_1d_direct` (RTF 1.87 → 2.61) |
+
+The submodule pointer in `.gitmodules` references this fork. From upstream `ggml-org/ggml`, both ops and the wmma kernel are non-mergeable as-is (Qwen3-TTS-specific layouts), so they live in the fork.
+
+### A note on "RTF"
+
+This fork uses **RTF as audio-seconds-per-wall-second** (higher is better — 2.78 means we produce ~2.78 s of audio per wall-second of compute). The strict definition (wall / audio, lower is better) is the inverse. We've kept the audio-per-wall convention to stay consistent with the upstream khimaros benchmarks.
+
+### Quant ladder on Ampere (RTX 3060) — single-stream decode
+
+| Quant | RTF (audio/wall) | weights VRAM | Notes |
+|-------|------------------|---------------|-------|
+| Q8_0  | **2.78** | 2316 MiB | fastest — best-tuned MMVQ for batch=1 decode |
+| F16   | 2.15 | ~3400 MiB | slower than Q8 *and* fattest; only use if you want unquantised weights for some external reason |
+| Q4_K_M | 2.11 | 1000 MiB | only useful when VRAM-bound or on pre-Volta GPUs (Q4_K MMQ is slow on cc=86) |
+
+Don't promote F16 or Q4_K_M to default on Ampere. Q8_0 is the sweet spot.
+
+### Known gaps / next-agent inheritance
+
+- **Vocoder VRAM**: 5 of the vocoder's `conv_transpose_1d` ops still fall back to CPU because ggml's CUDA kernel only supports F32 weights and the vocoder uses F16. The CPU fallback eats ~158 MiB scheduler memory plus CPU↔GPU staging buffers (~110 MiB CUDA scheduler) per call. The naive CUDA kernel is too slow on these shapes (a templated F16 extension was tried and ran ~1000× slower than the CPU fallback). The right fix is a smem-tiled F16 `conv_transpose_1d` kernel, parallel to the existing `conv_1d_direct` wmma work.
+- **48 kHz vocoder**: the takuma104/Qwen3-TTS-Tokenizer-12Hz-48kHz model is a V2 architecture (5 decoder blocks vs 4, codebook_dim 512 vs 256) — not a drop-in for the V1 vocoder cascade in `audio_tokenizer_decoder.cpp`. Needs config-driven `upsample_rates` + `dec_blocks[]` and an updated `convert_tokenizer_to_gguf.py` for V2 tensor names.
+- **F32 speaker encoder**: the encoder asserts F16 weights (the `conv_1d_direct` path is F16-only); F32 spk_enc would need either a new code path or a bias dtype that's already F32 anyway. Not worth pursuing — the F16 spk_enc sidecar is bit-identical to the embeddings produced from the upstream BF16 weights for ECAPA-TDNN-class encoders.
+
+---
+
+## Added In Khimaros' Fork
+
+The [khimaros/qwen3-tts.cpp](https://github.com/khimaros/qwen3-tts.cpp) fork layered the following on top of [predict-woo/qwen3-tts.cpp](https://github.com/predict-woo/qwen3-tts.cpp):
 
 - **1.7B model support** with MTP projection bridging the 2048-dim talker and 1024-dim code predictor, plus dynamic model detection
 - **ICL voice cloning** via Mimi codec encoder — reference audio is encoded to discrete speech codes and combined with `ref_text` in prefill, as an alternative to x-vector speaker embeddings
