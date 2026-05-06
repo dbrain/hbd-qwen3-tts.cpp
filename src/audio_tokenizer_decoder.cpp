@@ -1519,13 +1519,24 @@ void AudioTokenizerDecoder::stream_reset(int32_t max_n_past_hint) {
     conv_t_overlap_hosts_.clear();
     stream_tails_.clear();
     stream_conv_ts_.clear();
-    // Slab is intentionally NOT freed here: it's reused across synths.
-    // The next stream_decode() with n_past_=0 starts writing from row 0,
-    // and the narrowed view never reads beyond what the new chunks have
-    // written. Dropping it on every reset would re-pay the allocation
-    // cost on every request for no benefit. If the hint is smaller than
-    // the current slab capacity, we keep the bigger slab — shrinking
-    // would just trigger a re-grow on a longer subsequent synth.
+    // Free the slab between synths when the next synth's budget is much
+    // smaller than what's currently allocated. Avoids the situation where
+    // a single max-budget request leaves a 256 MiB slab pinned for the
+    // rest of the process lifetime even though every subsequent request
+    // is short. Threshold: shrink when current capacity is >= 2× the
+    // next hint AND > 1024 frames (don't churn tiny slabs).
+    // QWEN3_TTS_STREAM_KV_KEEP=1 forces the old "always keep" behaviour.
+    const char * keep = std::getenv("QWEN3_TTS_STREAM_KV_KEEP");
+    const bool always_keep = keep && keep[0] && keep[0] != '0';
+    if (!always_keep && stream_max_n_past_hint_ > 0 &&
+        state_.stream_kv.max_n_past > 1024 &&
+        state_.stream_kv.max_n_past >= 2 * stream_max_n_past_hint_) {
+        fprintf(stderr,
+                "  AudioTokenizerDecoder stream KV slab: shrink %d → 0 frames "
+                "(next hint=%d ≤ ½ current)\n",
+                state_.stream_kv.max_n_past, stream_max_n_past_hint_);
+        free_stream_kv_cache();
+    }
 }
 
 void AudioTokenizerDecoder::capture_stream_state(stream_state_snapshot & out) const {
