@@ -1588,6 +1588,7 @@ static bool load_wav_file(const std::string & path, std::vector<float> & samples
     uint16_t num_channels = 0;
     uint32_t sr = 0;
     uint16_t bits_per_sample = 0;
+    bool have_fmt = false;
 
     while (!feof(f)) {
         char chunk_id[4];
@@ -1616,8 +1617,17 @@ static bool load_wav_file(const std::string & path, std::vector<float> & samples
             else if (chunk_size > 16) {
                 fseek(f, chunk_size - 16, SEEK_CUR);
             }
+            have_fmt = true;
         }
         else if (strncmp(chunk_id, "data", 4) == 0) {
+            // Hostile / malformed WAVs (data before fmt, num_channels==0, sr==0,
+            // bits_per_sample==0) would otherwise divide by zero in the
+            // n_samples computations below.
+            if (!have_fmt || num_channels == 0 || sr == 0 || bits_per_sample == 0) {
+                fprintf(stderr, "ERROR: WAV data chunk seen before valid fmt chunk\n");
+                fclose(f);
+                return false;
+            }
             sample_rate = sr;
 
             if (audio_format == 1) {  // PCM
