@@ -19,6 +19,8 @@
 > - Q4_K_M model I'll publish at some point (nothing special, just quanted from F16) drops it to something like 2.2GB peak with TBH a "hard to tell if its worse" quality a bit of a drop RTF (2.8ish -> 2.1ish)
 >
 > YMMV, "works well" on my shoddy RTX 3060 12GB / "AMD CPU with a 5 in it" / RAM that I needed to down the frequency of because it kept crashing gaming PC now server that I bought from "some guy on facebook marketplace" when I thought it'd be funny to plan with local LLMs/ASR/.. vision? for a project that apparently now does everything.
+>
+> Probably a "never upstream change" - I'm sure as hell not creating a PR for (likely horrible) code I may never bother to understand properly. Potentially a "Only works on my hardware". Basically "Here be dragons" - but pretty dragons that turned my frown upside down because I can use this TTS now and its quick.
 
 This fork ([dbrain/qwen3-tts.cpp](https://github.com/dbrain/qwen3-tts.cpp), paired with [dbrain/ggml](https://github.com/dbrain/ggml)) layers the following on top of [khimaros/qwen3-tts.cpp](https://github.com/khimaros/qwen3-tts.cpp). Headline number on a single RTX 3060 / 12 GB / Ampere: **~2.78× realtime** on Q8_0 (i.e. ~2.78 s of 24 kHz audio per wall-second), measured across the bench suite at peak ~3.35 GB VRAM. Compared to upstream PyTorch + transformers on the same model (BF16), that's roughly **+50 %** end-to-end at single-stream decode.
 
