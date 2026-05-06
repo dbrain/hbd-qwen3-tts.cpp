@@ -625,7 +625,11 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
                 sample_memory("synth/after-vocoder-load-stream");
             }
         }
-        audio_decoder_.stream_reset();
+        // Hand the talker's max_audio_tokens to stream_reset so the
+        // streaming KV slab caps at this synth's actual budget rather than
+        // the env-wide ceiling. Default-budget synth (2048) → ~64 MiB
+        // slab instead of 256 MiB.
+        audio_decoder_.stream_reset(params.max_audio_tokens);
         const int n_cb = transformer_.get_config().n_codebooks;
 
         // ICL warm-up: feed ref_codes through the streaming decoder and

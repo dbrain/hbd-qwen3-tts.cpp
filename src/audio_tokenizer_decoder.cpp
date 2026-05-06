@@ -78,13 +78,21 @@ bool AudioTokenizerDecoder::ensure_stream_kv_cache(int32_t max_n_past) {
         return true;
     }
 
-    // Slab tensor type: F16 keeps the weight-bytes in line with the rest of
-    // the F16 vocoder. set_rows handles the F32-Kcur → F16-slab cast on
-    // ggml-cuda, same path the talker uses for its Q8_0 KV cache.
-    // QWEN3_TTS_STREAM_KV_F32=1 forces F32 for parity testing.
-    const char * env_f32 = std::getenv("QWEN3_TTS_STREAM_KV_F32");
-    const ggml_type kv_type = (env_f32 && env_f32[0] && env_f32[0] != '0')
-        ? GGML_TYPE_F32 : GGML_TYPE_F16;
+    // Slab tensor type. F16 is the default: with flash_attn_ext on F16 K/V,
+    // sched_cu is ~192 MiB (slab capacity 8192 = 256 MiB). Switching to
+    // Q8_0 K/V (head_dim=64 is QK8_0-aligned, set_rows + flash_attn_ext
+    // both handle the conversion) halves the slab to 137 MiB but adds
+    // ~96 MiB of FA dequantisation scratch on ggml-cuda — net peak win
+    // only ~23 MiB, not worth the extra moving piece. QWEN3_TTS_STREAM_KV
+    // overrides for A/B testing.
+    const char * env_kv = std::getenv("QWEN3_TTS_STREAM_KV");
+    ggml_type kv_type = GGML_TYPE_F16;
+    if (env_kv && env_kv[0]) {
+        if (std::strcmp(env_kv, "f16") == 0)      kv_type = GGML_TYPE_F16;
+        else if (std::strcmp(env_kv, "f32") == 0) kv_type = GGML_TYPE_F32;
+        else if (std::strcmp(env_kv, "q8") == 0 || std::strcmp(env_kv, "q8_0") == 0)
+            kv_type = GGML_TYPE_Q8_0;
+    }
 
     // If we already have a slab and only need to grow it, save the populated
     // [0..n_past_) bytes from each layer's K/V, free, and re-alloc bigger.
@@ -828,17 +836,21 @@ struct ggml_tensor * AudioTokenizerDecoder::apply_pre_tfm_layer(struct ggml_cont
 
     // Streaming mode: write Kcur/Vcur into the persistent GPU-resident KV
     // slab at positions [n_past..n_past+n_frames) via ggml_set_rows, then
-    // attend over a narrowed view [0..n_past+n_frames) of the slab. No
-    // per-call past_K/V scratch input, no next_past_K/V output, no host
-    // round-trip — the slab data stays GPU-resident across chunks.
+    // attend over a narrowed view [0..n_past+n_frames) of the slab via
+    // ggml_flash_attn_ext. No per-call past_K/V scratch input, no
+    // next_past_K/V output, no host round-trip, no V transpose-cont
+    // intermediate (which previously cost ~128 MiB of sched_cu scratch).
     //
-    // This replaces an earlier approach that allocated past_K/V scratch
-    // tensors of size n_past per chunk, concatenated with Kcur/Vcur, and
-    // shipped the full result back to host every call. That made the
-    // ggml CUDA pool's high-water-mark grow ~linearly with n_past — fine
-    // for short synth, ~1 GB+ at 8000 frames.
-    struct ggml_tensor * K_full = Kcur;
-    struct ggml_tensor * V_full = Vcur;
+    // This replaces (a) the per-chunk ggml_concat(past_K, Kcur) rebuild
+    // (linear graph growth with n_past, ~1 GB+ pool high-water at 8k
+    // frames) and (b) the manual mul_mat + transpose + cont attention
+    // path (V cont scratch ≈ 128 MiB constant). One-shot decode (n_past
+    // == 0, streaming_mode_ == false) keeps the manual path for the
+    // moment — only the streaming hot loop matters here.
+    struct ggml_tensor * Q = ggml_permute(ctx, Qcur, 0, 2, 1, 3);
+    struct ggml_tensor * attn_out = nullptr;
+    const float KQscale = 1.0f / sqrtf((float)head_dim);
+
     if (streaming_mode_) {
         GGML_ASSERT(layer_idx >= 0 && layer_idx < (int) state_.stream_kv.k.size());
         struct ggml_tensor * k_slab = state_.stream_kv.k[layer_idx];
@@ -861,37 +873,54 @@ struct ggml_tensor * AudioTokenizerDecoder::apply_pre_tfm_layer(struct ggml_cont
         struct ggml_tensor * Vcur_2d = ggml_view_2d(ctx, Vcur,
                                                    head_dim * n_heads, n_frames,
                                                    Vcur->nb[2], 0);
-        // The set_rows ops are not on the path from `audio` so the
-        // scheduler would prune them; expand explicitly so they execute.
+        // set_rows ops are not on the path from `audio` so expand explicitly.
         ggml_build_forward_expand(gf,
             ggml_set_rows(ctx, k_slab_2d, Kcur_2d, positions));
         ggml_build_forward_expand(gf,
             ggml_set_rows(ctx, v_slab_2d, Vcur_2d, positions));
 
-        // Narrowed view of the populated slab for the attention path.
-        const int n_kv_eff = n_past + n_frames;
-        K_full = ggml_view_3d(ctx, k_slab, head_dim, n_heads, n_kv_eff,
-                              k_slab->nb[1], k_slab->nb[2], 0);
-        V_full = ggml_view_3d(ctx, v_slab, head_dim, n_heads, n_kv_eff,
-                              v_slab->nb[1], v_slab->nb[2], 0);
-    }
+        // Narrowed view of the slab for FA. The view's seq dim must match
+        // the per-graph kv_n_eff_padded that build_graph encoded into the
+        // shared inp_mask tensor (round_up(n_past+n_frames, FATTN_KQ_STRIDE)).
+        constexpr int32_t kFattnKqStride = 256;
+        const int n_kv_eff =
+            ((n_past + n_frames + kFattnKqStride - 1) / kFattnKqStride)
+            * kFattnKqStride;
+        GGML_ASSERT(n_kv_eff <= max_n_past);
+        struct ggml_tensor * K_view = ggml_view_3d(ctx, k_slab,
+            head_dim, n_heads, n_kv_eff,
+            k_slab->nb[1], k_slab->nb[2], 0);
+        struct ggml_tensor * V_view = ggml_view_3d(ctx, v_slab,
+            head_dim, n_heads, n_kv_eff,
+            v_slab->nb[1], v_slab->nb[2], 0);
+        struct ggml_tensor * K = ggml_permute(ctx, K_view, 0, 2, 1, 3);
+        struct ggml_tensor * V = ggml_permute(ctx, V_view, 0, 2, 1, 3);
 
-    struct ggml_tensor * Q = ggml_permute(ctx, Qcur, 0, 2, 1, 3);
-    struct ggml_tensor * K = ggml_permute(ctx, K_full, 0, 2, 1, 3);
-    struct ggml_tensor * V = ggml_permute(ctx, V_full, 0, 2, 1, 3);
-    
-    struct ggml_tensor * KQ = ggml_mul_mat(ctx, K, Q);
-    KQ = ggml_scale(ctx, KQ, 1.0f / sqrtf((float)head_dim));
-    // Apply causal mask. n_past is the KV-cache length; with n_past=0
-    // this reduces to the original full causal mask.
-    KQ = ggml_diag_mask_inf(ctx, KQ, n_past);
-    KQ = ggml_soft_max(ctx, KQ);
-    
-    V = ggml_cont(ctx, ggml_transpose(ctx, V));
-    
-    struct ggml_tensor * KQV = ggml_mul_mat(ctx, V, KQ);
-    KQV = ggml_permute(ctx, KQV, 0, 2, 1, 3);
-    struct ggml_tensor * attn_out = ggml_cont_2d(ctx, KQV, n_heads * head_dim, n_frames);
+        // Causal mask is shared across all pre_tfm layers — built once in
+        // build_graph and named "inp_mask". Filled at runtime (stream_decode).
+        struct ggml_tensor * mask = ggml_get_tensor(ctx, "inp_mask");
+        GGML_ASSERT(mask != nullptr);
+
+        struct ggml_tensor * cur = ggml_flash_attn_ext(ctx, Q, K, V, mask,
+                                                      KQscale, 0.0f, 0.0f);
+        attn_out = ggml_cont_2d(ctx, cur, n_heads * head_dim, n_frames);
+    } else {
+        // One-shot decode path (kept verbatim from the original): manual
+        // attention via mul_mat + diag_mask + softmax. n_past=0 always here.
+        struct ggml_tensor * K = ggml_permute(ctx, Kcur, 0, 2, 1, 3);
+        struct ggml_tensor * V = ggml_permute(ctx, Vcur, 0, 2, 1, 3);
+
+        struct ggml_tensor * KQ = ggml_mul_mat(ctx, K, Q);
+        KQ = ggml_scale(ctx, KQ, KQscale);
+        KQ = ggml_diag_mask_inf(ctx, KQ, n_past);
+        KQ = ggml_soft_max(ctx, KQ);
+
+        V = ggml_cont(ctx, ggml_transpose(ctx, V));
+
+        struct ggml_tensor * KQV = ggml_mul_mat(ctx, V, KQ);
+        KQV = ggml_permute(ctx, KQV, 0, 2, 1, 3);
+        attn_out = ggml_cont_2d(ctx, KQV, n_heads * head_dim, n_frames);
+    }
     
     attn_out = ggml_mul_mat(ctx, layer.attn_output_w, attn_out);
     
@@ -1260,7 +1289,23 @@ struct ggml_cgraph * AudioTokenizerDecoder::build_graph(int32_t n_frames, int32_
     struct ggml_tensor * positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_frames);
     ggml_set_name(positions, "positions");
     ggml_set_input(positions);
-    
+
+    // Streaming mode FA mask. Shared across all 8 pre_tfm layers, sized
+    // once per graph: shape (kv_n_eff_padded, n_frames) F16, where
+    // kv_n_eff_padded = round_up(n_past+n_frames, FATTN_KQ_STRIDE=256)
+    // so the FA dispatcher stays on its preferred kernel. Filled at
+    // runtime by stream_decode (causal: 0 for k <= n_past+q, -inf else).
+    if (streaming_mode_) {
+        constexpr int32_t kFattnKqStride = 256;
+        const int kv_n_eff =
+            ((n_past + n_frames + kFattnKqStride - 1) / kFattnKqStride)
+            * kFattnKqStride;
+        struct ggml_tensor * inp_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16,
+                                                          kv_n_eff, n_frames);
+        ggml_set_name(inp_mask, "inp_mask");
+        ggml_set_input(inp_mask);
+    }
+
      for (int i = 0; i < cfg.n_pre_tfm_layers; ++i) {
          cur = apply_pre_tfm_layer(ctx0, gf, cur, model_.pre_tfm_layers[i], n_frames, n_past, i, positions);
      }
@@ -1466,9 +1511,10 @@ void AudioTokenizerDecoder::log_vram_breakdown(const char * label) const {
             label, weights, sched_cuda, sched_cpu, total);
 }
 
-void AudioTokenizerDecoder::stream_reset() {
+void AudioTokenizerDecoder::stream_reset(int32_t max_n_past_hint) {
     streaming_mode_ = false;
     n_past_ = 0;
+    stream_max_n_past_hint_ = max_n_past_hint > 0 ? max_n_past_hint : 0;
     tail_rings_.clear();
     conv_t_overlap_hosts_.clear();
     stream_tails_.clear();
@@ -1477,7 +1523,9 @@ void AudioTokenizerDecoder::stream_reset() {
     // The next stream_decode() with n_past_=0 starts writing from row 0,
     // and the narrowed view never reads beyond what the new chunks have
     // written. Dropping it on every reset would re-pay the allocation
-    // cost on every request for no benefit.
+    // cost on every request for no benefit. If the hint is smaller than
+    // the current slab capacity, we keep the bigger slab — shrinking
+    // would just trigger a re-grow on a longer subsequent synth.
 }
 
 void AudioTokenizerDecoder::capture_stream_state(stream_state_snapshot & out) const {
@@ -1581,21 +1629,29 @@ bool AudioTokenizerDecoder::stream_decode(const int32_t * codes, int32_t n_frame
     streaming_mode_ = true;
 
     // Persistent KV slab capacity: start small (256 frames, ~8 MiB F16) and
-    // grow geometrically as synth advances. Most synths never reach the
-    // server's 8192-frame ceiling, so doubling-grow keeps the steady-state
-    // slab tight to actual usage. QWEN3_TTS_STREAM_KV_MAX_NPAST clamps the
-    // upper bound (default == server max_audio_tokens cap).
+    // grow geometrically as synth advances. The cap is the smaller of:
+    //   - the per-synth hint passed to stream_reset() (== this synth's
+    //     max_audio_tokens, when callers pipe it through)
+    //   - QWEN3_TTS_STREAM_KV_MAX_NPAST (default 8192, the server's ceiling)
+    // Default-budget synth (max_audio_tokens=2048) caps slab at ~64 MiB,
+    // not 256 MiB.
+    constexpr int32_t kFattnKqStride = 256;
     int32_t cap = 8192;
     if (const char * env = std::getenv("QWEN3_TTS_STREAM_KV_MAX_NPAST")) {
         const int v = std::atoi(env);
         if (v > 0) cap = v;
     }
-    int32_t needed = n_past_ + n_frames + 32;
+    if (stream_max_n_past_hint_ > 0 && stream_max_n_past_hint_ < cap) {
+        cap = stream_max_n_past_hint_;
+    }
+    // FA narrows over [0..kv_n_eff_padded); slab capacity must cover that.
+    int32_t kv_n_eff_padded =
+        ((n_past_ + n_frames + kFattnKqStride - 1) / kFattnKqStride)
+        * kFattnKqStride;
     int32_t target = state_.stream_kv.max_n_past;
-    if (target < needed) {
-        // Geometric grow: 2× current, but at least `needed`, capped at cap.
-        target = std::max(needed, target == 0 ? 256 : target * 2);
-        if (target > cap) target = std::max(needed, cap);
+    if (target < kv_n_eff_padded) {
+        target = std::max(kv_n_eff_padded, target == 0 ? 256 : target * 2);
+        if (target > cap) target = std::max(kv_n_eff_padded, cap);
     }
     if (!ensure_stream_kv_cache(target)) {
         return false;
@@ -1639,6 +1695,28 @@ bool AudioTokenizerDecoder::stream_decode(const int32_t * codes, int32_t n_frame
         for (int i = 0; i < n_frames; ++i) positions[i] = n_past_ + i;
         ggml_backend_tensor_set(positions_tensor, positions.data(), 0,
                                 n_frames * sizeof(int32_t));
+    }
+
+    // Causal FA mask. inp_mask shape is (kv_n_eff_padded, n_frames) F16:
+    // row q (the q-th query in this chunk, attending from absolute position
+    // n_past+q) opens [0, n_past+q] inclusive, blocks the rest as -inf.
+    // The padding past kv_n_eff_real stays masked because the slab tail
+    // is zero and we want FA to ignore it.
+    struct ggml_tensor * mask_tensor = ggml_graph_get_tensor(gf, "inp_mask");
+    if (mask_tensor) {
+        const int32_t kv_n_eff_padded = (int32_t) mask_tensor->ne[0];
+        std::vector<ggml_fp16_t> mask((size_t) n_frames * kv_n_eff_padded,
+                                       ggml_fp32_to_fp16(-INFINITY));
+        const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+        for (int q = 0; q < n_frames; ++q) {
+            const int q_pos = n_past_ + q;
+            const int kv_end = std::min(q_pos + 1, kv_n_eff_padded);
+            for (int k = 0; k < kv_end; ++k) {
+                mask[(size_t) q * kv_n_eff_padded + k] = zero;
+            }
+        }
+        ggml_backend_tensor_set(mask_tensor, mask.data(), 0,
+                                mask.size() * sizeof(ggml_fp16_t));
     }
 
     // fill tail inputs from persistent host rings.

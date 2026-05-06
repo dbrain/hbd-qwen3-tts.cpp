@@ -216,7 +216,11 @@ public:
                        std::vector<float> & samples);
 
     // Reset streaming state. Must be called before starting a new utterance.
-    void stream_reset();
+    // max_n_past_hint is an upper bound on the codec frames this synth will
+    // produce (use the talker's max_audio_tokens). The slab will lazy-grow
+    // up to this bound rather than the env-wide cap, so a default-budget
+    // synth doesn't pay for an 8192-frame slab. Pass 0 to use the env cap.
+    void stream_reset(int32_t max_n_past_hint = 0);
 
     // Persistent host-side snapshot of streaming state. Used to skip ICL
     // ref-codes warmup re-decode when the same reference has already been
@@ -383,6 +387,7 @@ private:
     void free_stream_kv_cache();
 
     int32_t n_past_ = 0;  // current KV / tail history length
+    int32_t stream_max_n_past_hint_ = 0;  // synth-budget hint (0 = env cap)
 
     // Create a causal-conv tail input tensor, concat it with x along dim 0,
     // register the input in tail_names_, and (in streaming mode) also emit
