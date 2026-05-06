@@ -17,6 +17,11 @@
 //   - OggOpus: an ogg-muxed opus stream. avformat_write_header() emits
 //              OpusHead + OpusTags up front so streaming clients can
 //              join on the next page boundary. Content-Type: audio/ogg.
+//   - Aac:     ffmpeg's native AAC-LC encoder wrapped in ADTS framing
+//              via libavformat's "adts" muxer. Each ADTS frame is
+//              self-syncing (12-bit 0xFFF syncword + 7-byte header),
+//              so streaming clients can join on any frame boundary.
+//              Content-Type: audio/aac.
 
 #pragma once
 
@@ -30,6 +35,7 @@ namespace qwen3_tts_audio {
 enum class Codec {
     Mp3,
     OggOpus,
+    Aac,
 };
 
 const char * content_type_for(Codec codec);

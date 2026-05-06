@@ -1176,21 +1176,26 @@ int main(int argc, char ** argv) {
         if (const char * env = std::getenv("QWEN3_TTS_DEFAULT_STREAM_FIRST_BATCH_SIZE")) {
             default_stream_first_batch_size = std::atoi(env);
         }
-        // mp3-specific first-batch default. libmp3lame's bit reservoir
-        // buffers 1-2 frames internally before emitting, so the global
-        // default of 1 codec frame (~83 ms audio = 3 mp3 frames at either
-        // 24 or 48 kHz) produces ZERO output on the first emit and TTFA
-        // collapses to the second vocoder batch (~700 ms). 4 codec frames
-        // (~330 ms audio = ~14 mp3 frames) reliably crosses the lookahead
-        // threshold and brings TTFA back into the few-hundred-ms range.
-        // ogg-opus has no lookahead — its default stays at 1.
+        // Frame-based encoders with bit-reservoir / psychoacoustic
+        // lookahead (mp3 via libmp3lame, AAC via ffmpeg's native
+        // encoder) buffer 1-2 frames internally before emitting. The
+        // global default of 1 codec frame (~83 ms audio) produces ZERO
+        // output on the first emit and TTFA collapses to the second
+        // vocoder batch (~700 ms). 4 codec frames (~330 ms audio)
+        // reliably crosses the lookahead threshold and brings TTFA
+        // back to the few-hundred-ms range. opus has no lookahead — its
+        // default stays at 1.
         int default_stream_first_batch_size_mp3 = 4;
         if (const char * env = std::getenv("QWEN3_TTS_DEFAULT_STREAM_FIRST_BATCH_SIZE_MP3")) {
             default_stream_first_batch_size_mp3 = std::atoi(env);
         }
-        const int per_format_first_batch = (response_format == "mp3")
-            ? default_stream_first_batch_size_mp3
-            : default_stream_first_batch_size;
+        int default_stream_first_batch_size_aac = 4;
+        if (const char * env = std::getenv("QWEN3_TTS_DEFAULT_STREAM_FIRST_BATCH_SIZE_AAC")) {
+            default_stream_first_batch_size_aac = std::atoi(env);
+        }
+        int per_format_first_batch = default_stream_first_batch_size;
+        if (response_format == "mp3") per_format_first_batch = default_stream_first_batch_size_mp3;
+        else if (response_format == "aac") per_format_first_batch = default_stream_first_batch_size_aac;
         int stream_batch_size       = body.value("stream_batch_size",       default_stream_batch_size);
         int stream_first_batch_size = body.value("stream_first_batch_size", per_format_first_batch);
         if (stream_format.empty() && stream_batch_size > 0) {
@@ -1225,17 +1230,20 @@ int main(int argc, char ** argv) {
 
         // validate response format
         if (response_format != "wav" && response_format != "pcm" &&
-            response_format != "mp3" && response_format != "ogg") {
+            response_format != "mp3" && response_format != "ogg" &&
+            response_format != "aac") {
             res.status = 400;
             json err = {{"error", {
                 {"message", "unsupported response_format '" + response_format +
-                            "', supported: wav, pcm, mp3, ogg"},
+                            "', supported: wav, pcm, mp3, ogg, aac"},
                 {"type", "invalid_request_error"},
             }}};
             res.set_content(err.dump(), "application/json");
             return;
         }
-        const bool is_compressed = (response_format == "mp3" || response_format == "ogg");
+        const bool is_compressed = (response_format == "mp3" ||
+                                    response_format == "ogg" ||
+                                    response_format == "aac");
         if (is_compressed && (bitrate_kbps < 32 || bitrate_kbps > 192)) {
             res.status = 400;
             json err = {{"error", {
@@ -1245,9 +1253,9 @@ int main(int argc, char ** argv) {
             res.set_content(err.dump(), "application/json");
             return;
         }
-        const auto compressed_codec = (response_format == "mp3")
-            ? qwen3_tts_audio::Codec::Mp3
-            : qwen3_tts_audio::Codec::OggOpus;
+        qwen3_tts_audio::Codec compressed_codec = qwen3_tts_audio::Codec::Mp3;
+        if (response_format == "ogg") compressed_codec = qwen3_tts_audio::Codec::OggOpus;
+        else if (response_format == "aac") compressed_codec = qwen3_tts_audio::Codec::Aac;
 
         // validate stream format (empty = one-shot, openai-spec values = chunked)
         if (!stream_format.empty() && stream_format != "audio" && stream_format != "sse") {

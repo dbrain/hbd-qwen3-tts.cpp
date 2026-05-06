@@ -72,9 +72,48 @@ const char * content_type_for(Codec codec) {
     switch (codec) {
         case Codec::Mp3:     return "audio/mpeg";
         case Codec::OggOpus: return "audio/ogg";
+        case Codec::Aac:     return "audio/aac";
     }
     return "application/octet-stream";
 }
+
+namespace {
+// Codec needs the libavformat-side muxer (so its packets get wrapped into
+// pages/ADTS frames before hitting the wire). Mp3 packets are
+// self-syncing MPEG audio frames straight from the encoder — no muxer.
+bool codec_needs_muxer(Codec c) {
+    return c == Codec::OggOpus || c == Codec::Aac;
+}
+
+// Muxer name for the libavformat side. Must match an avformat_alloc_output_context2
+// recognised muxer.
+const char * codec_muxer(Codec c) {
+    switch (c) {
+        case Codec::OggOpus: return "ogg";
+        case Codec::Aac:     return "adts";
+        default:             return nullptr;
+    }
+}
+
+// Codec id for avcodec_find_encoder.
+AVCodecID codec_av_id(Codec c) {
+    switch (c) {
+        case Codec::Mp3:     return AV_CODEC_ID_MP3;
+        case Codec::OggOpus: return AV_CODEC_ID_OPUS;
+        case Codec::Aac:     return AV_CODEC_ID_AAC;
+    }
+    return AV_CODEC_ID_NONE;
+}
+
+const char * codec_pretty(Codec c) {
+    switch (c) {
+        case Codec::Mp3:     return "mp3";
+        case Codec::OggOpus: return "ogg-opus";
+        case Codec::Aac:     return "aac";
+    }
+    return "?";
+}
+} // namespace
 
 struct StreamingEncoder::Impl {
     Codec            codec;
@@ -111,18 +150,21 @@ struct StreamingEncoder::Impl {
     void close();
 
     AVSampleFormat sample_fmt() const {
-        // libmp3lame wants planar int16; libopus wants interleaved float.
-        return codec == Codec::Mp3 ? AV_SAMPLE_FMT_S16P : AV_SAMPLE_FMT_FLT;
+        // libmp3lame wants planar int16; libopus wants interleaved float;
+        // ffmpeg's native AAC encoder wants planar float (FLTP).
+        switch (codec) {
+            case Codec::Mp3:     return AV_SAMPLE_FMT_S16P;
+            case Codec::OggOpus: return AV_SAMPLE_FMT_FLT;
+            case Codec::Aac:     return AV_SAMPLE_FMT_FLTP;
+        }
+        return AV_SAMPLE_FMT_NONE;
     }
 };
 
 bool StreamingEncoder::Impl::open() {
-    AVCodecID codec_id = (codec == Codec::Mp3) ? AV_CODEC_ID_MP3
-                                                : AV_CODEC_ID_OPUS;
-    const AVCodec * encoder = avcodec_find_encoder(codec_id);
+    const AVCodec * encoder = avcodec_find_encoder(codec_av_id(codec));
     if (!encoder) {
-        fprintf(stderr, "ffmpeg_encode: no encoder for %s\n",
-                codec == Codec::Mp3 ? "mp3" : "opus");
+        fprintf(stderr, "ffmpeg_encode: no encoder for %s\n", codec_pretty(codec));
         return false;
     }
 
@@ -150,8 +192,8 @@ bool StreamingEncoder::Impl::open() {
     fifo = av_audio_fifo_alloc(cctx->sample_fmt, 1, frame->nb_samples * 4);
     if (!fifo) return false;
 
-    if (codec == Codec::OggOpus) {
-        err = avformat_alloc_output_context2(&fmt_ctx, nullptr, "ogg", nullptr);
+    if (codec_needs_muxer(codec)) {
+        err = avformat_alloc_output_context2(&fmt_ctx, nullptr, codec_muxer(codec), nullptr);
         if (err < 0 || !fmt_ctx) { log_av_error("avformat_alloc_output_context2", err); return false; }
 
         avio_buffer = (uint8_t *) av_malloc(kAvioBufferSize);
@@ -218,13 +260,11 @@ bool StreamingEncoder::Impl::drain_packets(std::vector<uint8_t> & out) {
         if (err == AVERROR(EAGAIN) || err == AVERROR_EOF) return true;
         if (err < 0) { log_av_error("avcodec_receive_packet", err); return false; }
 
-        if (codec == Codec::Mp3) {
-            // Each packet IS one self-syncing MPEG audio frame. Append
-            // straight to the wire — no muxer.
-            out.insert(out.end(), pkt->data, pkt->data + pkt->size);
-        } else {
-            // Ogg-opus: hand to the muxer. It calls our AVIO write_packet
-            // callback to spool muxed bytes into mux_sink.
+        if (codec_needs_muxer(codec)) {
+            // OggOpus + Aac: hand to the muxer. It wraps each packet in
+            // its container framing (ogg pages / 7-byte ADTS header) and
+            // calls our AVIO write_packet callback to spool the muxed
+            // bytes into mux_sink, which we then drain.
             pkt->stream_index = stream->index;
             av_packet_rescale_ts(pkt, cctx->time_base, stream->time_base);
             int werr = av_write_frame(fmt_ctx, pkt);
@@ -234,6 +274,10 @@ bool StreamingEncoder::Impl::drain_packets(std::vector<uint8_t> & out) {
                 return false;
             }
             drain_mux_sink(out);
+        } else {
+            // Mp3: each packet IS one self-syncing MPEG audio frame.
+            // Append straight to the wire — no muxer.
+            out.insert(out.end(), pkt->data, pkt->data + pkt->size);
         }
         av_packet_unref(pkt);
     }
@@ -363,7 +407,7 @@ bool StreamingEncoder::finish(std::vector<uint8_t> & out) {
     }
     if (!I.drain_packets(out)) return false;
 
-    if (I.codec == Codec::OggOpus && I.fmt_ctx) {
+    if (codec_needs_muxer(I.codec) && I.fmt_ctx) {
         int werr = av_write_trailer(I.fmt_ctx);
         if (werr < 0) {
             log_av_error("av_write_trailer", werr);
