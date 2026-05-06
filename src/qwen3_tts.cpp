@@ -1,6 +1,8 @@
 #include "qwen3_tts.h"
 #include "gguf_loader.h"
 
+#include "ggml-backend.h"  // for ggml_backend_dev_memory probe
+
 #include <cstdio>
 #include <cstring>
 #include <chrono>
@@ -83,6 +85,49 @@ static void log_memory_usage(const char * label) {
     fprintf(stderr, "  [mem] %-24s rss=%s  phys=%s\n",
             label, format_bytes(mem.rss_bytes).c_str(),
             format_bytes(mem.phys_footprint_bytes).c_str());
+}
+
+// VRAM growth probe: reports per-section ggml-managed buffers (talker
+// weights/KV/code-pred-KV/sched, vocoder weights/sched), the GPU device's
+// reported free/total memory (catches anything the ggml CUDA pool has
+// pinned but not assigned to a sched buffer), the process RSS, and a
+// chunk index + n_past pair so the curve is interpretable.
+//
+// Gated by env var QWEN3_TTS_LOG_VRAM_PROBE=N (chunk-period; 0 disables).
+// Designed for streaming-synth diagnosis — log line per N stream callback
+// fires. Cheap (one device-mem query, two backend buffer-size lookups).
+static int probe_period() {
+    const char * env = std::getenv("QWEN3_TTS_LOG_VRAM_PROBE");
+    if (!env || !*env) return 0;
+    int v = std::atoi(env);
+    return v < 0 ? 0 : v;
+}
+
+static void log_vram_probe(const char * label,
+                           int chunk_idx,
+                           int talker_n_past,
+                           int vocoder_n_past,
+                           const TTSTransformer & talker,
+                           const AudioTokenizerDecoder & decoder) {
+    process_memory_snapshot mem;
+    get_process_memory_snapshot(mem);
+
+    size_t dev_free = 0, dev_total = 0;
+    ggml_backend_dev_t gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (gpu) {
+        ggml_backend_dev_memory(gpu, &dev_free, &dev_total);
+    }
+
+    fprintf(stderr,
+            "  [vram-probe %-14s] chunk=%4d t_n_past=%5d v_n_past=%5d "
+            "rss=%6.0f MiB  gpu_used=%6.0f / %6.0f MiB  (free=%6.0f)\n",
+            label, chunk_idx, talker_n_past, vocoder_n_past,
+            (double) mem.rss_bytes / (1024.0 * 1024.0),
+            (double) (dev_total - dev_free) / (1024.0 * 1024.0),
+            (double) dev_total / (1024.0 * 1024.0),
+            (double) dev_free / (1024.0 * 1024.0));
+    talker.log_vram_breakdown(label);
+    decoder.log_vram_breakdown(label);
 }
 
 static void resample_linear(const float * input, int input_len, int input_rate,
@@ -635,8 +680,9 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
         }
 
         stream_buf.reserve((size_t) stream->batch_size * n_cb);
+        const int probe_every = probe_period();
         transformer_.set_frame_callback(
-            [this, stream, &stream_buf, &stream_cb_count, &stream_cb_aborted, n_cb, &result]
+            [this, stream, &stream_buf, &stream_cb_count, &stream_cb_aborted, n_cb, &result, probe_every]
             (int32_t /*frame_idx*/, const int32_t * frame_codes) -> bool {
                 for (int c = 0; c < n_cb; ++c) stream_buf.push_back(frame_codes[c]);
                 const int frames_buffered = (int) (stream_buf.size() / n_cb);
@@ -658,9 +704,22 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
                         stream_cb_aborted = true;
                         return false;
                     }
+                    if (probe_every > 0 && (int) stream_cb_count % probe_every == 0) {
+                        log_vram_probe("post-chunk",
+                                       (int) stream_cb_count,
+                                       transformer_.get_kv_n_used(),
+                                       audio_decoder_.get_stream_n_past(),
+                                       transformer_, audio_decoder_);
+                    }
                 }
                 return true;
             });
+        if (probe_every > 0) {
+            log_vram_probe("pre-stream", 0,
+                           transformer_.get_kv_n_used(),
+                           audio_decoder_.get_stream_n_past(),
+                           transformer_, audio_decoder_);
+        }
     }
 
     // Voice-keyed prefill cache key. Hash everything that determines the
@@ -793,6 +852,13 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
         }
         result.t_decode_ms = get_time_ms() - t_decode_start;
         sample_memory("synth/after-stream-decode");
+        if (probe_period() > 0) {
+            log_vram_probe("post-stream",
+                           (int) stream_cb_count + 1,
+                           transformer_.get_kv_n_used(),
+                           audio_decoder_.get_stream_n_past(),
+                           transformer_, audio_decoder_);
+        }
         if (params.print_progress) {
             fprintf(stderr, "Streaming: %zu batches dispatched, %zu total samples\n",
                     stream_cb_count, result.audio.size());

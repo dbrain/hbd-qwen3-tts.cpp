@@ -233,6 +233,10 @@ public:
     // VRAM inventory dump — weights buffer + sched per-backend reservations.
     void log_vram_breakdown(const char * label) const;
 
+    // Current streaming KV / tail-history length, in codec frames.
+    // Used by VRAM probes; returns 0 outside streaming mode.
+    int32_t get_stream_n_past() const { return n_past_; }
+
     const std::string & get_error() const { return error_msg_; }
     
 private:

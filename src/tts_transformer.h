@@ -331,6 +331,10 @@ public:
     // buffer sizes so a session can audit where bytes are going.
     void log_vram_breakdown(const char * label) const;
 
+    // Talker KV-cache occupancy (positions written, including any restored
+    // prefix snapshot). Used by VRAM probes to correlate with chunk index.
+    int32_t get_kv_n_used() const { return state_.cache.n_used; }
+
     // -- Persistence helpers (used by Qwen3TTS::save/load_voice_warmup) ---
 
     // Read-only access to a cached entry, if present. Returns nullptr when
