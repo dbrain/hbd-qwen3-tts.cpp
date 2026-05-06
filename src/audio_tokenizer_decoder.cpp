@@ -1083,12 +1083,14 @@ struct ggml_tensor * AudioTokenizerDecoder::apply_residual_block(struct ggml_con
     // Fused conv_1d_direct (wmma tensor-core kernel, no im2col temp). Causal
     // padding via asymmetric p_left = (K-1)*d, p_right = 0 — no
     // INPUT-flagged tail tensor needed (which would force the chain to CPU).
+    // Output dtype mirrors input so an F16 cascade stays F16 end-to-end.
     GGML_UNUSED(tail_name_prefix);
     GGML_UNUSED(in_channels);
+    const ggml_type chain_t = x->type;
     {
         const int kernel  = (int) block.conv1_w->ne[0];
         const int p_left  = (kernel - 1) * block.dilation;
-        x = ggml_conv_1d_direct(ctx, block.conv1_w, x, 1, p_left, 0, block.dilation);
+        x = ggml_conv_1d_direct_to(ctx, block.conv1_w, x, 1, p_left, 0, block.dilation, chain_t);
     }
     if (block.conv1_b) {
         x = ggml_add(ctx, x, ggml_reshape_3d(ctx, block.conv1_b, 1, out_channels, 1));
@@ -1102,12 +1104,12 @@ struct ggml_tensor * AudioTokenizerDecoder::apply_residual_block(struct ggml_con
     {
         const int kernel = (int) block.conv2_w->ne[0];
         const int p_left = kernel - 1;  // dilation=1
-        x = ggml_conv_1d_direct(ctx, block.conv2_w, x, 1, p_left, 0, 1);
+        x = ggml_conv_1d_direct_to(ctx, block.conv2_w, x, 1, p_left, 0, 1, chain_t);
     }
     if (block.conv2_b) {
         x = ggml_add(ctx, x, ggml_reshape_3d(ctx, block.conv2_b, 1, out_channels, 1));
     }
-    
+
     return ggml_add(ctx, residual, x);
 }
 
@@ -1124,10 +1126,14 @@ struct ggml_tensor * AudioTokenizerDecoder::apply_decoder_block(struct ggml_cont
      int64_t in_channels = x->ne[1];
      int64_t out_channels = block.conv_t_w->ne[1];
      int kernel_size = block.conv_t_w->ne[0];
-     
+
+     // F16-cascade: when the input flowing into the dec_block is F16, keep
+     // the conv_transpose output F16 too so every downstream buffer
+     // (residual chain + emit_view + acc_inplace) halves in size.
+     const ggml_type chain_t = x->type;
      struct ggml_tensor * x_2d = ggml_reshape_2d(ctx, x, seq_len, in_channels);
-     x_2d = ggml_conv_transpose_1d(ctx, block.conv_t_w, x_2d, upsample_rate, 0, 1);
-     
+     x_2d = ggml_conv_transpose_1d_to(ctx, block.conv_t_w, x_2d, upsample_rate, 0, 1, chain_t);
+
      int64_t new_seq_len = x_2d->ne[0];
      x = ggml_reshape_3d(ctx, x_2d, new_seq_len, out_channels, 1);
 
@@ -1404,7 +1410,24 @@ struct ggml_cgraph * AudioTokenizerDecoder::build_graph(int32_t n_frames, int32_
      }
      
      ggml_set_name(cur, "dec0_output");
-     
+
+     // F16 cascade: the decoder-block stack dominates sched_cu via its
+     // 17-ish dec_block buffers held live by residual `use=2` refs. Casting
+     // to F16 at the cascade entry halves every one of those buffers and
+     // every transpose-1d intermediate (wmma kernel keeps its accumulator
+     // F32 internally so precision is preserved at gemm endpoints; only the
+     // dst write rounds to F16). Cast back to F32 right before the final
+     // snake so final_conv + tanh + audio output stay bit-identical to the
+     // F32 path. Default ON; QWEN3_TTS_VOCODER_FP16_CASCADE=0 reverts.
+     bool fp16_cascade = true;
+     if (const char * env = std::getenv("QWEN3_TTS_VOCODER_FP16_CASCADE")) {
+         fp16_cascade = !(env[0] == '0' && env[1] == '\0');
+     }
+     if (fp16_cascade) {
+         cur = ggml_cast(ctx0, cur, GGML_TYPE_F16);
+         ggml_set_name(cur, "cascade_f16_in");
+     }
+
      const int n_blocks = (int) model_.dec_blocks.size();
      for (int i = 0; i < n_blocks; ++i) {
          cur = apply_decoder_block(ctx0, cur, model_.dec_blocks[i],
@@ -1412,6 +1435,11 @@ struct ggml_cgraph * AudioTokenizerDecoder::build_graph(int32_t n_frames, int32_
          char name[32];
          snprintf(name, sizeof(name), "dec%d_output", i + 1);
          ggml_set_name(cur, name);
+     }
+
+     if (fp16_cascade) {
+         cur = ggml_cast(ctx0, cur, GGML_TYPE_F32);
+         ggml_set_name(cur, "cascade_f32_out");
      }
 
      if (model_.final_snake_alpha) {
@@ -1800,12 +1828,20 @@ bool AudioTokenizerDecoder::stream_decode(const int32_t * codes, int32_t n_frame
     }
 
     // fill per-decoder-block conv_transpose overlap inputs (zeros on first
-    // chunk, prior chunk's right-tail on subsequent chunks).
+    // chunk, prior chunk's right-tail on subsequent chunks). Host buffer
+    // is always F32; convert on the fly when the cascade runs F16.
+    std::vector<ggml_fp16_t> overlap_f16;
     for (const auto & ct : stream_conv_ts_) {
         struct ggml_tensor * oin = ggml_graph_get_tensor(gf, ct.in_name.c_str());
         if (!oin) continue;
         const auto & buf = conv_t_overlap_hosts_[ct.in_name];
-        ggml_backend_tensor_set(oin, buf.data(), 0, ggml_nbytes(oin));
+        if (oin->type == GGML_TYPE_F16) {
+            overlap_f16.resize(buf.size());
+            for (size_t i = 0; i < buf.size(); ++i) overlap_f16[i] = ggml_fp32_to_fp16(buf[i]);
+            ggml_backend_tensor_set(oin, overlap_f16.data(), 0, ggml_nbytes(oin));
+        } else {
+            ggml_backend_tensor_set(oin, buf.data(), 0, ggml_nbytes(oin));
+        }
     }
 
     // No past_K/past_V upload here anymore: the slab lives on GPU across
@@ -1840,13 +1876,21 @@ bool AudioTokenizerDecoder::stream_decode(const int32_t * codes, int32_t n_frame
         ggml_backend_tensor_get(nx, ring.data(), 0, ggml_nbytes(nx));
     }
 
-    // roll each decoder-block conv_transpose overlap forward.
+    // roll each decoder-block conv_transpose overlap forward. Host buffer
+    // stays F32; convert from device F16 if the cascade ran F16.
+    std::vector<ggml_fp16_t> overlap_f16_out;
     for (const auto & ct : stream_conv_ts_) {
         struct ggml_tensor * nx = ggml_graph_get_tensor(gf, ct.out_name.c_str());
         if (!nx) continue;
         auto & buf = conv_t_overlap_hosts_[ct.in_name];
         buf.assign((size_t) ct.stride * ct.channels, 0.0f);
-        ggml_backend_tensor_get(nx, buf.data(), 0, ggml_nbytes(nx));
+        if (nx->type == GGML_TYPE_F16) {
+            overlap_f16_out.resize(buf.size());
+            ggml_backend_tensor_get(nx, overlap_f16_out.data(), 0, ggml_nbytes(nx));
+            for (size_t i = 0; i < buf.size(); ++i) buf[i] = ggml_fp16_to_fp32(overlap_f16_out[i]);
+        } else {
+            ggml_backend_tensor_get(nx, buf.data(), 0, ggml_nbytes(nx));
+        }
     }
 
     // No next_past_K/V download here anymore: the slab is the source of
