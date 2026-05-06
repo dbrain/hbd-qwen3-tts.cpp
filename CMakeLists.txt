@@ -234,13 +234,27 @@ target_link_libraries(test_icl_dump PRIVATE
 
 # Server executable (OpenAI-compatible TTS API)
 if(QWEN3_TTS_SERVER)
+    # In-process audio encoders (mp3 via libmp3lame, ogg-opus via libopus +
+    # ogg muxer) for the /v1/audio/speech response_format options. Linked
+    # via pkg-config against the BtBN ffmpeg-7.1 shared-libs install
+    # dropped into /usr/local by the builder image. lgpl variants of BtBN
+    # don't ship libmp3lame — image must use the gpl-shared tarball.
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(LIBAV REQUIRED IMPORTED_TARGET
+        libavcodec
+        libavformat
+        libavutil
+    )
+
     add_executable(qwen3-tts-server
         src/server.cpp
+        src/audio/ffmpeg_encode.cpp
     )
     target_link_libraries(qwen3-tts-server PRIVATE
         qwen3_tts
         httplib::httplib
         nlohmann_json::nlohmann_json
+        PkgConfig::LIBAV
     )
 endif()
 

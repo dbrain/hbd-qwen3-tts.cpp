@@ -10,6 +10,7 @@
 //   POST /v1/audio/speech     - synthesize speech (supports voice cloning)
 
 #include "qwen3_tts.h"
+#include "audio/ffmpeg_encode.h"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -717,6 +718,13 @@ int main(int argc, char ** argv) {
     };
 
     httplib::Server svr;
+    // TCP_NODELAY: chunked-streaming responses (especially compressed audio)
+    // emit small per-frame writes — without this, Nagle's algorithm coalesces
+    // them with the receiver's delayed-ACK, costing hundreds of ms TTFA on
+    // mp3 / ogg-opus streams whose first frames are < MSS. Default httplib
+    // value is false. Wav/pcm chunks are large enough that flipping this on
+    // doesn't change their behavior.
+    svr.set_tcp_nodelay(true);
 
     // log all requests
     svr.set_logger([](const httplib::Request & req, const httplib::Response & res) {
@@ -1123,6 +1131,15 @@ int main(int argc, char ** argv) {
 
         std::string response_format = body.value("response_format", "wav");
         std::string stream_format   = body.value("stream_format", "");
+        // Bitrate for compressed formats (mp3 / ogg-opus). Ignored silently
+        // for wav / pcm. Default 64 kbps mono — comfortable voice-quality
+        // zone at 48 kHz; ear-test against this before tweaking.
+        int default_bitrate_kbps = 64;
+        if (const char * env = std::getenv("QWEN3_TTS_DEFAULT_BITRATE_KBPS")) {
+            const int v = std::atoi(env);
+            if (v >= 32 && v <= 192) default_bitrate_kbps = v;
+        }
+        int bitrate_kbps = body.value("bitrate_kbps", default_bitrate_kbps);
         std::string voice           = body.value("voice", "");
         std::string instructions    = body.value("instructions", "");
         std::string language        = body.value("language", "en");
@@ -1159,8 +1176,23 @@ int main(int argc, char ** argv) {
         if (const char * env = std::getenv("QWEN3_TTS_DEFAULT_STREAM_FIRST_BATCH_SIZE")) {
             default_stream_first_batch_size = std::atoi(env);
         }
+        // mp3-specific first-batch default. libmp3lame's bit reservoir
+        // buffers 1-2 frames internally before emitting, so the global
+        // default of 1 codec frame (~83 ms audio = 3 mp3 frames at either
+        // 24 or 48 kHz) produces ZERO output on the first emit and TTFA
+        // collapses to the second vocoder batch (~700 ms). 4 codec frames
+        // (~330 ms audio = ~14 mp3 frames) reliably crosses the lookahead
+        // threshold and brings TTFA back into the few-hundred-ms range.
+        // ogg-opus has no lookahead — its default stays at 1.
+        int default_stream_first_batch_size_mp3 = 4;
+        if (const char * env = std::getenv("QWEN3_TTS_DEFAULT_STREAM_FIRST_BATCH_SIZE_MP3")) {
+            default_stream_first_batch_size_mp3 = std::atoi(env);
+        }
+        const int per_format_first_batch = (response_format == "mp3")
+            ? default_stream_first_batch_size_mp3
+            : default_stream_first_batch_size;
         int stream_batch_size       = body.value("stream_batch_size",       default_stream_batch_size);
-        int stream_first_batch_size = body.value("stream_first_batch_size", default_stream_first_batch_size);
+        int stream_first_batch_size = body.value("stream_first_batch_size", per_format_first_batch);
         if (stream_format.empty() && stream_batch_size > 0) {
             // unspecified stream_format with streaming on → assume the
             // chunked-audio variant (matches response_format).
@@ -1192,16 +1224,30 @@ int main(int argc, char ** argv) {
         }
 
         // validate response format
-        if (response_format != "wav" && response_format != "pcm") {
+        if (response_format != "wav" && response_format != "pcm" &&
+            response_format != "mp3" && response_format != "ogg") {
             res.status = 400;
             json err = {{"error", {
                 {"message", "unsupported response_format '" + response_format +
-                            "', supported: wav, pcm"},
+                            "', supported: wav, pcm, mp3, ogg"},
                 {"type", "invalid_request_error"},
             }}};
             res.set_content(err.dump(), "application/json");
             return;
         }
+        const bool is_compressed = (response_format == "mp3" || response_format == "ogg");
+        if (is_compressed && (bitrate_kbps < 32 || bitrate_kbps > 192)) {
+            res.status = 400;
+            json err = {{"error", {
+                {"message", "bitrate_kbps out of range (32..192)"},
+                {"type", "invalid_request_error"},
+            }}};
+            res.set_content(err.dump(), "application/json");
+            return;
+        }
+        const auto compressed_codec = (response_format == "mp3")
+            ? qwen3_tts_audio::Codec::Mp3
+            : qwen3_tts_audio::Codec::OggOpus;
 
         // validate stream format (empty = one-shot, openai-spec values = chunked)
         if (!stream_format.empty() && stream_format != "audio" && stream_format != "sse") {
@@ -1293,8 +1339,11 @@ int main(int argc, char ** argv) {
         if (live_stream) {
             const bool is_sse = (stream_format == "sse");
             const bool is_wav = (response_format == "wav");
-            const char * ctype = is_sse ? "text/event-stream"
-                                        : (is_wav ? "audio/wav" : "audio/pcm");
+            const bool is_pcm = (response_format == "pcm");
+            const char * audio_ctype = is_wav ? "audio/wav"
+                : is_pcm ? "audio/pcm"
+                : qwen3_tts_audio::content_type_for(compressed_codec);
+            const char * ctype = is_sse ? "text/event-stream" : audio_ctype;
 
             // capture synthesis inputs; move into provider lambda below.
             res.set_chunked_content_provider(ctype,
@@ -1303,6 +1352,7 @@ int main(int argc, char ** argv) {
                  voice_ref_codes = std::move(voice_ref_codes),
                  voice_n_ref_frames,
                  stream_batch_size, stream_first_batch_size, is_sse, is_wav,
+                 is_compressed, compressed_codec, bitrate_kbps,
                  synth_mutex = &synth_mutex,
                  voice = voice, warmup_path = warmup_path, model_id = model_id,
                  in_flight = &in_flight_synths,
@@ -1326,6 +1376,22 @@ int main(int argc, char ** argv) {
                     // first-request path sees the real vocoder rate (48 kHz on
                     // V2) rather than the audio_decoder_config default (24 kHz).
                     const int wav_sample_rate = this_tts->get_sample_rate();
+
+                    // mp3 / ogg-opus: per-response RAII encoder. Constructed
+                    // after ensure_loaded so wav_sample_rate is the real
+                    // vocoder rate. Destructor (lambda exit) frees codec +
+                    // muxer state cleanly even on cancel-mid-stream.
+                    std::unique_ptr<qwen3_tts_audio::StreamingEncoder> enc;
+                    if (is_compressed) {
+                        enc = std::make_unique<qwen3_tts_audio::StreamingEncoder>(
+                            compressed_codec, wav_sample_rate, bitrate_kbps);
+                        if (!enc->valid()) {
+                            fprintf(stderr, "ffmpeg_encode: failed to open encoder\n");
+                            sink.done();
+                            return false;
+                        }
+                    }
+
                     bool header_written = false;
                     auto ensure_header = [&]() {
                         if (!header_written && !is_sse && is_wav) {
@@ -1335,22 +1401,36 @@ int main(int argc, char ** argv) {
                         header_written = true;
                     };
 
-                    streaming_opts sopts;
-                    sopts.batch_size = stream_batch_size;
-                    sopts.first_batch_size = stream_first_batch_size;
-                    sopts.on_pcm = [&](const float * pcm, size_t n) -> bool {
-                        ensure_header();
-                        std::string bytes = encode_pcm(std::vector<float>(pcm, pcm + n));
+                    // Single bytes-out path — wraps base64 + SSE framing for
+                    // sse mode, raw write for chunked-audio. Same call site
+                    // for pcm / wav / mp3 / ogg bytes.
+                    auto emit_bytes = [&](const char * data, size_t len) -> bool {
+                        if (len == 0) return true;
                         if (is_sse) {
                             json delta = {
                                 {"type", "speech.audio.delta"},
-                                {"audio", base64_encode(bytes.data(), bytes.size())},
+                                {"audio", base64_encode(data, len)},
                             };
                             std::string frame = "event: speech.audio.delta\ndata: "
                                               + delta.dump() + "\n\n";
                             return sink.write(frame.data(), frame.size());
                         }
-                        return sink.write(bytes.data(), bytes.size());
+                        return sink.write(data, len);
+                    };
+
+                    streaming_opts sopts;
+                    sopts.batch_size = stream_batch_size;
+                    sopts.first_batch_size = stream_first_batch_size;
+                    sopts.on_pcm = [&](const float * pcm, size_t n) -> bool {
+                        ensure_header();
+                        if (is_compressed) {
+                            std::vector<uint8_t> encoded;
+                            if (!enc->push_pcm(pcm, n, encoded)) return false;
+                            return emit_bytes(reinterpret_cast<const char *>(encoded.data()),
+                                              encoded.size());
+                        }
+                        std::string bytes = encode_pcm(std::vector<float>(pcm, pcm + n));
+                        return emit_bytes(bytes.data(), bytes.size());
                     };
 
                     tts_result result;
@@ -1368,6 +1448,17 @@ int main(int argc, char ** argv) {
 
                     // ensure a header went out even if no pcm was produced.
                     ensure_header();
+
+                    // Drain compressed-encoder tail (final mp3 frame, ogg
+                    // trailer page).
+                    if (is_compressed && enc) {
+                        std::vector<uint8_t> tail;
+                        enc->finish(tail);
+                        if (!tail.empty()) {
+                            emit_bytes(reinterpret_cast<const char *>(tail.data()),
+                                       tail.size());
+                        }
+                    }
 
                     if (is_sse) {
                         std::string done_frame = "event: speech.audio.done\ndata: "
@@ -1446,24 +1537,66 @@ int main(int argc, char ** argv) {
                                   result.ref_codes_hash, warmup_path, model_id);
         }
 
+        // Helper: encode the full result.audio into the chosen response_format.
+        // Used by all three non-live-stream paths (one-shot, audio-chunked,
+        // sse-non-live). Returns the encoded payload + Content-Type. For wav
+        // the bytes include the RIFF/data sizes; for streaming-audio the
+        // caller still prepends a placeholder-size header (see below).
+        auto encode_full = [&](void) -> std::pair<std::string, const char *> {
+            if (response_format == "pcm") return {encode_pcm(result.audio), "audio/pcm"};
+            if (response_format == "wav") {
+                return {encode_wav(result.audio, result.sample_rate), "audio/wav"};
+            }
+            // mp3 / ogg-opus
+            std::vector<uint8_t> v = qwen3_tts_audio::encode_one_shot(
+                compressed_codec, result.sample_rate, bitrate_kbps,
+                result.audio.data(), result.audio.size());
+            return {std::string(v.begin(), v.end()),
+                    qwen3_tts_audio::content_type_for(compressed_codec)};
+        };
+
         // one-shot (no stream_format): preserve legacy behavior
         if (stream_format.empty()) {
-            if (response_format == "pcm") {
-                res.set_content(encode_pcm(result.audio), "audio/pcm");
-            } else {
-                res.set_content(encode_wav(result.audio, result.sample_rate), "audio/wav");
+            auto [bytes, ctype] = encode_full();
+            if (is_compressed && bytes.empty()) {
+                res.status = 500;
+                res.set_content(R"({"error":{"message":"encoder failed","type":"server_error"}})",
+                                "application/json");
+                return;
             }
+            res.set_content(bytes, ctype);
             return;
         }
 
         // stream_format=audio: raw chunked bytes in the chosen response_format.
         // wav uses a placeholder-size header so playback can start immediately.
+        // mp3 frames are self-syncing; ogg pages stand alone — neither needs a
+        // streaming-friendly leading header beyond what the encoder emits.
         if (stream_format == "audio") {
             std::string header = (response_format == "wav")
                 ? wav_streaming_header(result.sample_rate)
                 : std::string();
-            std::string body_bytes = encode_pcm(result.audio);
-            const char * ctype = (response_format == "wav") ? "audio/wav" : "audio/pcm";
+            std::string body_bytes;
+            const char * ctype;
+            if (response_format == "wav") {
+                body_bytes = encode_pcm(result.audio);
+                ctype = "audio/wav";
+            } else if (response_format == "pcm") {
+                body_bytes = encode_pcm(result.audio);
+                ctype = "audio/pcm";
+            } else {
+                std::vector<uint8_t> v = qwen3_tts_audio::encode_one_shot(
+                    compressed_codec, result.sample_rate, bitrate_kbps,
+                    result.audio.data(), result.audio.size());
+                if (v.empty()) {
+                    res.status = 500;
+                    res.set_content(R"({"error":{"message":"encoder failed","type":"server_error"}})",
+                                    "application/json");
+                    return;
+                }
+                body_bytes.assign(v.begin(), v.end());
+                ctype = qwen3_tts_audio::content_type_for(compressed_codec);
+            }
 
             res.set_chunked_content_provider(ctype,
                 [header = std::move(header), body_bytes = std::move(body_bytes)]
@@ -1479,13 +1612,18 @@ int main(int argc, char ** argv) {
         }
 
         // stream_format=sse: emit speech.audio.delta + speech.audio.done.
-        // response_format still selects the bytes carried inside delta (wav or
-        // pcm). usage/timings on the done event are shaped to be consumed by
-        // both openai clients and llama-swap's metrics_monitor.
+        // response_format still selects the bytes carried inside delta. wav
+        // delta bytes include the RIFF header for the client; mp3/ogg deltas
+        // carry the full encoded payload (the muxer/frames stand alone).
         {
-            std::string audio_bytes = (response_format == "wav")
-                ? encode_wav(result.audio, result.sample_rate)
-                : encode_pcm(result.audio);
+            auto [audio_bytes, _ctype] = encode_full();
+            (void) _ctype;
+            if (is_compressed && audio_bytes.empty()) {
+                res.status = 500;
+                res.set_content(R"({"error":{"message":"encoder failed","type":"server_error"}})",
+                                "application/json");
+                return;
+            }
 
             json delta = {
                 {"type", "speech.audio.delta"},
