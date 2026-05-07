@@ -463,22 +463,21 @@ struct FusedEntry {
 // graph-begin). Lookup by raw ggml_tensor pointer.
 static std::unordered_map<const ggml_tensor *, FusedEntry> g_fusion_plan;
 static bool      g_fusion_enabled = true;
-// QKV fusion is OFF (and likely permanently). Confirmed root cause: ggml's
-// graph allocator aliases K's and V's dsts to the same buffer slot — it's
-// safe under the standard topo order (K's rms_norm consumes K before V's
-// mul_mat dispatches), but combining all three mmvqs into the leader's
-// hook violates that ordering and V silently overwrites K's data before
-// K's downstream reads it. Gate-up doesn't have this issue (gate and up
-// dsts get distinct buffers because gate's silu doesn't free it before
-// up's mul_mat).
-static bool      g_fusion_qkv_enabled     = false;
+// QKV fusion is ON. The graph-build path in tts_transformer.cpp explicitly
+// expands Q/K/V mul_mats adjacently before any consumer is built, so
+// ggml's graph allocator gives them distinct dst slots. Without that
+// (older builds) the allocator aliased K's and V's dsts because K's
+// rms_norm consumed K before V's mul_mat in topo order — breaking any
+// fusion that reorders the K/V launches.
+static bool      g_fusion_qkv_enabled     = true;
 static bool      g_fusion_gate_up_enabled = true;
-// When true: the fused leader hook launches one mmvq per output (3 for QKV,
-// 2 for gate-up), all reading the same hoisted Q8_1 staging buffer. Same
-// per-row kernel layout as the standalone path → bit-equivalent outputs.
-// When false: a single multi-route kernel handles all outputs from one
-// launch. Bigger launch reduction; gated until correctness is proven.
-static bool      g_fusion_split_only = true;
+// When false (default): a single multi-route kernel handles all outputs
+// from one launch (1 quantize + 1 fused kernel = 2 launches per group),
+// vs 4 launches in split mode. ~+0.04 RTF win measured on breakit.
+// When true: the fused leader launches one mmvq per output, all reading
+// the same hoisted Q8_1 staging buffer — bit-equivalent to the standalone
+// path. Useful as a numerical-correctness escape hatch.
+static bool      g_fusion_split_only = false;
 static uint64_t  g_fusion_groups_built  = 0;
 static uint64_t  g_fusion_leader_fires  = 0;
 static uint64_t  g_fusion_follower_fires = 0;
@@ -584,6 +583,23 @@ extern "C" bool qwen3_mul_mat_hook(
             const void * x_data = e.src1 ? e.src1->data : nullptr;
 
             ++g_fusion_leader_fires;
+
+            if (s_log_budget > 0) {
+                if (e.role == ROLE_LEADER_QKV) {
+                    std::fprintf(stderr,
+                        "[qwen3-megakernel] qkv-leader fire #%llu: y_q=%p y_k=%p y_v=%p (alias=%s)\n",
+                        (unsigned long long) g_fusion_leader_fires,
+                        y_q, y_k, y_v,
+                        (y_q == y_k || y_q == y_v || y_k == y_v) ? "YES-BAD" : "no");
+                } else {
+                    std::fprintf(stderr,
+                        "[qwen3-megakernel] gate-up-leader fire #%llu: y_g=%p y_u=%p (alias=%s)\n",
+                        (unsigned long long) g_fusion_leader_fires,
+                        y_q, y_k,
+                        (y_q == y_k) ? "YES-BAD" : "no");
+                }
+                --s_log_budget;
+            }
 
             // Bail to standalone if any required ptr isn't ready (shouldn't
             // happen if the leader is the lowest-cgraph-index of the group,
@@ -899,14 +915,16 @@ bool install() {
     if (const char * f = std::getenv("QWEN3_TTS_SPECIALIZED_MMVQ_NO_FUSION")) {
         if (f[0] != '\0' && std::strcmp(f, "0") != 0) g_fusion_enabled = false;
     }
-    // Multi-route fused kernel (one launch per group). Default off until
-    // numerical correctness is verified — use the safe split path otherwise.
-    if (const char * mr = std::getenv("QWEN3_TTS_SPECIALIZED_MMVQ_FUSION_MULTIROUTE")) {
-        if (mr[0] != '\0' && std::strcmp(mr, "0") != 0) g_fusion_split_only = false;
+    // Force the safe split path (one mmvq per output, bit-equivalent to the
+    // standalone path). Useful as a numerical-correctness escape hatch.
+    if (const char * sp = std::getenv("QWEN3_TTS_SPECIALIZED_MMVQ_FUSION_SPLIT")) {
+        if (sp[0] != '\0' && std::strcmp(sp, "0") != 0) g_fusion_split_only = true;
     }
-    // QKV fusion is opt-in for experimentation (broken on this allocator).
-    if (const char * eq = std::getenv("QWEN3_TTS_SPECIALIZED_MMVQ_FUSION_QKV")) {
-        if (eq[0] != '\0' && std::strcmp(eq, "0") != 0) g_fusion_qkv_enabled = true;
+    // Disable QKV fusion (the topo-order patch in tts_transformer.cpp gives
+    // Q/K/V distinct dst slots; if you suspect that's not landed for some
+    // reason, this is the kill switch.)
+    if (const char * nq = std::getenv("QWEN3_TTS_SPECIALIZED_MMVQ_NO_FUSION_QKV")) {
+        if (nq[0] != '\0' && std::strcmp(nq, "0") != 0) g_fusion_qkv_enabled = false;
     }
     if (const char * ng = std::getenv("QWEN3_TTS_SPECIALIZED_MMVQ_NO_FUSION_GATE_UP")) {
         if (ng[0] != '\0' && std::strcmp(ng, "0") != 0) g_fusion_gate_up_enabled = false;

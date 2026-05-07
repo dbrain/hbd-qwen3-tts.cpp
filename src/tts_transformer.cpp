@@ -1827,7 +1827,19 @@ struct ggml_cgraph * TTSTransformer::build_prefill_forward_graph(int32_t n_token
         struct ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.attn_q, cur);
         struct ggml_tensor * Kcur = ggml_mul_mat(ctx0, layer.attn_k, cur);
         struct ggml_tensor * Vcur = ggml_mul_mat(ctx0, layer.attn_v, cur);
-        
+
+        // Force Q/K/V mul_mats into topo order BEFORE any consumer is built.
+        // The default DFS-from-set_rows-first build path interleaves K-rms-norm
+        // between K-mm and V-mm; ggml's graph allocator then frees K's dst slot
+        // (its only consumer is K-rms-norm) before V is allocated, and V grabs
+        // K's freed slot. That aliasing breaks hook-level QKV fusion (V's mmvq
+        // overwrites K's data while K's downstream rms_norm still expects it).
+        // Explicit expand here keeps Q/K/V adjacent in cgraph->nodes, so all
+        // three live simultaneously past V's allocation.
+        ggml_build_forward_expand(gf, Qcur);
+        ggml_build_forward_expand(gf, Kcur);
+        ggml_build_forward_expand(gf, Vcur);
+
         Qcur = ggml_reshape_3d(ctx0, Qcur, head_dim, n_head, n_tokens);
         Kcur = ggml_reshape_3d(ctx0, Kcur, head_dim, n_kv_head, n_tokens);
         Vcur = ggml_reshape_3d(ctx0, Vcur, head_dim, n_kv_head, n_tokens);
@@ -1985,7 +1997,19 @@ struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past) {
         struct ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.attn_q, cur);
         struct ggml_tensor * Kcur = ggml_mul_mat(ctx0, layer.attn_k, cur);
         struct ggml_tensor * Vcur = ggml_mul_mat(ctx0, layer.attn_v, cur);
-        
+
+        // Force Q/K/V mul_mats into topo order BEFORE any consumer is built.
+        // The default DFS-from-set_rows-first build path interleaves K-rms-norm
+        // between K-mm and V-mm; ggml's graph allocator then frees K's dst slot
+        // (its only consumer is K-rms-norm) before V is allocated, and V grabs
+        // K's freed slot. That aliasing breaks hook-level QKV fusion (V's mmvq
+        // overwrites K's data while K's downstream rms_norm still expects it).
+        // Explicit expand here keeps Q/K/V adjacent in cgraph->nodes, so all
+        // three live simultaneously past V's allocation.
+        ggml_build_forward_expand(gf, Qcur);
+        ggml_build_forward_expand(gf, Kcur);
+        ggml_build_forward_expand(gf, Vcur);
+
         Qcur = ggml_reshape_3d(ctx0, Qcur, head_dim, n_head, n_tokens);
         Kcur = ggml_reshape_3d(ctx0, Kcur, head_dim, n_kv_head, n_tokens);
         Vcur = ggml_reshape_3d(ctx0, Vcur, head_dim, n_kv_head, n_tokens);
@@ -2134,7 +2158,11 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_graph(int32_t n_prev_codes)
         struct ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.attn_q, cur);
         struct ggml_tensor * Kcur = ggml_mul_mat(ctx0, layer.attn_k, cur);
         struct ggml_tensor * Vcur = ggml_mul_mat(ctx0, layer.attn_v, cur);
-        
+
+        ggml_build_forward_expand(gf, Qcur);
+        ggml_build_forward_expand(gf, Kcur);
+        ggml_build_forward_expand(gf, Vcur);
+
         Qcur = ggml_reshape_3d(ctx0, Qcur, head_dim, n_head, 1);
         Kcur = ggml_reshape_3d(ctx0, Kcur, head_dim, n_kv_head, 1);
         Vcur = ggml_reshape_3d(ctx0, Vcur, head_dim, n_kv_head, 1);
@@ -2254,7 +2282,19 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_prefill_graph() {
         struct ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.attn_q, cur);
         struct ggml_tensor * Kcur = ggml_mul_mat(ctx0, layer.attn_k, cur);
         struct ggml_tensor * Vcur = ggml_mul_mat(ctx0, layer.attn_v, cur);
-        
+
+        // Force Q/K/V mul_mats into topo order BEFORE any consumer is built.
+        // The default DFS-from-set_rows-first build path interleaves K-rms-norm
+        // between K-mm and V-mm; ggml's graph allocator then frees K's dst slot
+        // (its only consumer is K-rms-norm) before V is allocated, and V grabs
+        // K's freed slot. That aliasing breaks hook-level QKV fusion (V's mmvq
+        // overwrites K's data while K's downstream rms_norm still expects it).
+        // Explicit expand here keeps Q/K/V adjacent in cgraph->nodes, so all
+        // three live simultaneously past V's allocation.
+        ggml_build_forward_expand(gf, Qcur);
+        ggml_build_forward_expand(gf, Kcur);
+        ggml_build_forward_expand(gf, Vcur);
+
         Qcur = ggml_reshape_3d(ctx0, Qcur, head_dim, n_head, n_tokens);
         Kcur = ggml_reshape_3d(ctx0, Kcur, head_dim, n_kv_head, n_tokens);
         Vcur = ggml_reshape_3d(ctx0, Vcur, head_dim, n_kv_head, n_tokens);
@@ -2404,7 +2444,19 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_step_graph(int32_t /*n_past
         struct ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.attn_q, cur);
         struct ggml_tensor * Kcur = ggml_mul_mat(ctx0, layer.attn_k, cur);
         struct ggml_tensor * Vcur = ggml_mul_mat(ctx0, layer.attn_v, cur);
-        
+
+        // Force Q/K/V mul_mats into topo order BEFORE any consumer is built.
+        // The default DFS-from-set_rows-first build path interleaves K-rms-norm
+        // between K-mm and V-mm; ggml's graph allocator then frees K's dst slot
+        // (its only consumer is K-rms-norm) before V is allocated, and V grabs
+        // K's freed slot. That aliasing breaks hook-level QKV fusion (V's mmvq
+        // overwrites K's data while K's downstream rms_norm still expects it).
+        // Explicit expand here keeps Q/K/V adjacent in cgraph->nodes, so all
+        // three live simultaneously past V's allocation.
+        ggml_build_forward_expand(gf, Qcur);
+        ggml_build_forward_expand(gf, Kcur);
+        ggml_build_forward_expand(gf, Vcur);
+
         Qcur = ggml_reshape_3d(ctx0, Qcur, head_dim, n_head, n_tokens);
         Kcur = ggml_reshape_3d(ctx0, Kcur, head_dim, n_kv_head, n_tokens);
         Vcur = ggml_reshape_3d(ctx0, Vcur, head_dim, n_kv_head, n_tokens);
