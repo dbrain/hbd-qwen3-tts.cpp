@@ -1,0 +1,3 @@
+# Built bench binaries — `nvcc -arch=sm_86 -O3 ... .cu -o name` writes here.
+grid_sync_bench
+mmvq_int8_bench
