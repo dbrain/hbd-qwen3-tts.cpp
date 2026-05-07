@@ -1,14 +1,38 @@
 // Qwen3-TTS megakernel — Phase A specialized MMVQ + Phase B layer megakernel.
 // See kobbler/docker/tts-qwen3-dev/HANDOFF-megakernel-v0.md for the full plan.
 //
-// Phase A: 7 shape-specialized Q8_0 MMVQ kernels for known (K, N) pairs.
-// Phase B: per-layer megakernel that calls Phase A's matmul as device functions.
+// Phase A: shape-specialized Q8_0 mul_mat_vec_q for the model's known (K, N)
+// pairs. Hooks into ggml-cuda's mul_mat dispatcher so any matching mul_mat
+// (talker layer or code-pred layer) routes to a compile-time-specialized
+// kernel.
+//
+// Phase B: per-layer talker megakernel — not implemented. See handoff for
+// design.
 
 #pragma once
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cstdint>
+
+// Forward declarations for the ggml types we touch — full definitions live
+// in ggml-cuda. We only need the struct names to receive opaque pointers.
+struct ggml_tensor;
+struct ggml_backend_cuda_context;
+
+extern "C" {
+
+// Hook signature accepted by ggml-cuda.cu's dispatcher.
+typedef bool (*ggml_cuda_mul_mat_hook_fn)(
+    ggml_backend_cuda_context * ctx,
+    const ggml_tensor *         src0,
+    const ggml_tensor *         src1,
+    ggml_tensor *               dst);
+
+// Implemented in ggml-cuda.cu.
+void ggml_cuda_set_mul_mat_hook(ggml_cuda_mul_mat_hook_fn fn);
+
+}  // extern "C"
 
 namespace qwen3_megakernel {
 
@@ -27,85 +51,56 @@ constexpr int N_TALKER_LAYERS     = 28;
 constexpr int N_CODE_PRED_LAYERS  = 5;
 constexpr int CODE_PRED_VOCAB     = 2048;
 
-// Q8_0 block layout (matches ggml's block_q8_0):
-// 32 quantized int8 values + 1 fp16 scale per block.
+// Q8_0 block: 32 int8 values + fp16 scale. Matches ggml's block_q8_0 layout.
 struct block_q8_0 {
     __half d;
     int8_t qs[32];
 };
 static_assert(sizeof(block_q8_0) == 34, "block_q8_0 layout mismatch with ggml");
 
-// ----------------------------------------------------------------------------
-// Phase A — Shape-specialized Q8_0 MMVQ
-// ----------------------------------------------------------------------------
-//
-// Computes y = W * x for M=1, where W is Q8_0 [K, N] and x is F16/F32 [K].
-// K and N are compile-time constants per instantiation. nvcc fully unrolls
-// the K-loop and chooses register tile size based on the known shape.
-//
-// Caller convention: launch with grid configured to cover N output columns,
-// pass device pointers, run on the supplied stream. Falls back to ggml
-// MMVQ if the shape isn't one we instantiated.
+// Q8_1 block: 32 int8 activations + (fp16 scale, fp16 sum-of-quants*scale).
+// Matches ggml's block_q8_1 layout.
+struct block_q8_1 {
+    __half d;
+    __half s;
+    int8_t qs[32];
+};
+static_assert(sizeof(block_q8_1) == 36, "block_q8_1 layout mismatch with ggml");
 
+// install() / is_installed() are declared in qwen3_megakernel.h (C++-only).
+// Defined in qwen3_megakernel.cu.
+
+// ----------------------------------------------------------------------------
+// Standalone launchers — exposed for the microbench harness so it can compare
+// each specialization against ggml's MMVQ in isolation. Production traffic
+// goes through install()/the hook, not these.
+// ----------------------------------------------------------------------------
+
+// Quantize a F32 vector x[K] into K/32 Q8_1 blocks. K is compile-time.
+// One launch per call (32 threads, 1 block per K-block).
+template <int K>
+void launch_quantize_x_q8_1(
+    const float *      x,           // [K]
+    block_q8_1 *       x_q8_1,      // [K/32]
+    cudaStream_t       stream);
+
+// Specialized MMVQ: y = W * x, M=1, K and N compile-time. Q8_0 weights,
+// Q8_1 staged activations, F32 output.
 template <int K, int N>
-__global__ void mmvq_q8_0_f32_specialized(
-    float * __restrict__ y,            // [N]
-    const block_q8_0 * __restrict__ w, // [K/32, N] (column-major Q8_0 blocks)
-    const float * __restrict__ x);     // [K]
+void launch_mmvq_q8_0_q8_1(
+    float *            y,           // [N]
+    const block_q8_0 * w,           // [N, K/32] row-major
+    const block_q8_1 * x_q8_1,      // [K/32]
+    cudaStream_t       stream);
 
-// Launch wrappers — one per (K, N) pair we ship.
-// Each wrapper picks block/grid config tuned for the shape, then launches
-// the templated kernel above.
-
-void launch_mmvq_q8_0_K1024_N2048(float * y, const block_q8_0 * w,
-                                   const float * x, cudaStream_t stream);
-void launch_mmvq_q8_0_K1024_N1024(float * y, const block_q8_0 * w,
-                                   const float * x, cudaStream_t stream);
-void launch_mmvq_q8_0_K2048_N1024(float * y, const block_q8_0 * w,
-                                   const float * x, cudaStream_t stream);
-void launch_mmvq_q8_0_K1024_N3072(float * y, const block_q8_0 * w,
-                                   const float * x, cudaStream_t stream);
-void launch_mmvq_q8_0_K3072_N1024(float * y, const block_q8_0 * w,
-                                   const float * x, cudaStream_t stream);
-
-// Codec / code-pred head shapes — N is data-dependent so dispatch picks the
-// nearest specialized variant or falls back to ggml at runtime.
-void launch_mmvq_q8_0_K1024_codec_head(float * y, const block_q8_0 * w,
-                                        const float * x, int N,
-                                        cudaStream_t stream);
-
-// ----------------------------------------------------------------------------
-// Phase B — Per-layer megakernel for talker AR step
-// ----------------------------------------------------------------------------
-//
-// Computes one full transformer layer at M=1 in a single CUDA kernel.
-// All sub-ops (norm / qkv / rope / FA / out_proj / ffn / residual) live in
-// one kernel; cooperative_groups::grid_group::sync between phases.
-//
-// NOT IMPLEMENTED in v0 — skeleton only. The first agent to take this on
-// should answer the open questions in HANDOFF-megakernel-v0.md before
-// writing the body.
-
-void launch_talker_layer_q8_0(
-    float * residual_out,              // [HIDDEN]
-    const float * residual_in,         // [HIDDEN]
-    const __half * attn_norm_w,        // [HIDDEN]
-    const __half * ffn_norm_w,         // [HIDDEN]
-    const __half * q_norm_w,           // [HEAD_DIM] or nullptr
-    const __half * k_norm_w,           // [HEAD_DIM] or nullptr
-    const block_q8_0 * wq,             // [HIDDEN, N_ATTN_OUT]
-    const block_q8_0 * wk,             // [HIDDEN, N_KV_OUT]
-    const block_q8_0 * wv,             // [HIDDEN, N_KV_OUT]
-    const block_q8_0 * wo,             // [N_ATTN_OUT, HIDDEN]
-    const block_q8_0 * wgate,          // [HIDDEN, INTERMEDIATE]
-    const block_q8_0 * wup,            // [HIDDEN, INTERMEDIATE]
-    const block_q8_0 * wdown,          // [INTERMEDIATE, HIDDEN]
-    __half * k_cache,                  // [n_ctx, N_KV_HEADS, HEAD_DIM]
-    __half * v_cache,                  // [n_ctx, N_KV_HEADS, HEAD_DIM]
-    int kv_n_past,
-    int kv_n_eff,
-    float rope_theta,
-    float kq_scale,
-    cudaStream_t stream);
+// Convenience: F32 input → Q8_1 staging → specialized MMVQ. Same launches as
+// ggml's path; used by the hook and the microbench.
+template <int K, int N>
+void launch_mmvq_q8_0_f32(
+    float *            y,           // [N]
+    const block_q8_0 * w,           // [N, K/32]
+    const float *      x,           // [K]
+    block_q8_1 *       x_q8_1_scratch,  // [K/32], caller-provided
+    cudaStream_t       stream);
 
 }  // namespace qwen3_megakernel

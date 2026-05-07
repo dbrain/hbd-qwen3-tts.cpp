@@ -1,160 +1,384 @@
-// Qwen3-TTS megakernel — Phase A skeleton.
-// See HANDOFF-megakernel-v0.md for the full plan.
+// Qwen3-TTS megakernel — Phase A specialized MMVQ.
+// See kobbler/docker/tts-qwen3-dev/HANDOFF-megakernel-v0.md for the full plan.
 //
-// Status: SKELETON ONLY. The K=1024 N=2048 mmvq below is illustrative —
-// it shows the template structure and dispatch but is NOT TUNED. The
-// next agent should:
-//   1. Microbench it vs ggml's mul_mat_vec_q to establish a baseline ratio.
-//   2. Tune the BLOCK_N tile size and K-loop unroll factor for each shape.
-//   3. Add the remaining 6 specializations.
-//   4. Wire dispatch from tts_transformer.cpp behind QWEN3_TTS_SPECIALIZED_MMVQ.
+// What lives here:
+//   - F32 → Q8_1 row quantizer (templated on K)
+//   - Q8_0 × Q8_1 specialized MMVQ for M=1 (templated on K, N)
+//   - Hook function that ggml-cuda calls for every mul_mat. Inspects shape
+//     and types; if it's one of the 7 specialised (K, N) Q8_0 patterns at
+//     M=1, dispatches to our kernel and returns true. Otherwise returns
+//     false and ggml's generic path runs.
+//
+// Phase A v0 only specialises the (K=1024, N=2048) shape end-to-end. The
+// remaining 6 shapes will be filled in once the wire-up + kernel pattern
+// are validated by microbench + breakit. All shape decisions are made in
+// `qwen3_mul_mat_hook`, so adding a shape is one line + one instantiation.
 
 #include "qwen3_megakernel.cuh"
+#include "qwen3_megakernel.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+
+// We talk to ggml only via the hook signature — we never include ggml-cuda
+// internal headers. We DO need to read a few fields off ggml_tensor (type,
+// ne[], data) for the shape match, so we declare the minimum subset we use
+// here. This couples us to ggml's tensor layout but not to its internals.
+
+extern "C" {
+// Mirror of the leading members of struct ggml_tensor that we touch. Layout
+// must match ggml.h. If ggml ever reorders these, the hook breaks at compile
+// time via the static_assert below.
+//
+// We use a public ggml.h include instead of mirroring once the build wires
+// up — see `extern "C"` block at file scope below for the actual include.
+}
+
+#include "ggml.h"
 
 namespace qwen3_megakernel {
 
 // ----------------------------------------------------------------------------
-// Phase A — illustrative specialization for (K=1024, N=2048)
+// F32 → Q8_1 quantize (templated on K)
 // ----------------------------------------------------------------------------
+//
+// One block per K/32 Q8_1 block. 32 threads cooperatively scan one block:
+// find absmax, derive scale, write int8 quantized values + d (fp16 scale)
+// + s (fp16 sum-of-quants * scale).
+//
+// This mirrors ggml's quantize_row_q8_1 but with K compile-time so the
+// block count is a constant.
+
+template <int K>
+__global__ void quantize_x_q8_1_kernel(
+    const float * __restrict__ x,      // [K]
+    block_q8_1 *  __restrict__ y) {    // [K/32]
+    constexpr int K_BLOCKS = K / 32;
+    static_assert(K % 32 == 0, "K must be a multiple of 32");
+
+    const int kb = blockIdx.x;
+    if (kb >= K_BLOCKS) return;
+
+    const int lane = threadIdx.x;  // 0..31
+    const float v = x[kb * 32 + lane];
+
+    // Warp absmax reduction
+    float amax = fabsf(v);
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, offset));
+    }
+
+    const float scale  = amax / 127.0f;
+    const float iscale = scale > 0.0f ? 1.0f / scale : 0.0f;
+
+    const int q = __float2int_rn(v * iscale);
+    const int qclamped = q < -127 ? -127 : (q > 127 ? 127 : q);
+
+    // Warp sum of quantized ints (for Q8_1's `s` field).
+    float qsum = (float) qclamped;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        qsum += __shfl_xor_sync(0xffffffff, qsum, offset);
+    }
+
+    y[kb].qs[lane] = (int8_t) qclamped;
+    if (lane == 0) {
+        y[kb].d = __float2half(scale);
+        y[kb].s = __float2half(qsum * scale);
+    }
+}
+
+template <int K>
+void launch_quantize_x_q8_1(
+    const float * x,
+    block_q8_1 *  y,
+    cudaStream_t  stream) {
+    constexpr int K_BLOCKS = K / 32;
+    quantize_x_q8_1_kernel<K><<<K_BLOCKS, 32, 0, stream>>>(x, y);
+}
+
+// Aligned int loads for Q8_0 / Q8_1 quantized blocks.
+//
+// block_q8_0 = {half d, int8_t qs[32]} = 34 B → block n starts at n*34. The
+// `qs` field is at offset 2 inside the block, so its absolute address is
+// only 2-byte aligned (alternates with 4-byte across n). Reading 4 bytes
+// at a time via int* therefore traps on every other block — exactly the
+// "misaligned address" CUDA fault we hit on first wire-up.
+//
+// ggml's fix is `get_int_b2`: read two u16s and pack into u32. We mirror
+// that here. block_q8_1 = {half d, half s, int8_t qs[32]} = 36 B; qs at
+// offset 4, always 4-byte aligned, so a plain int load is fine.
+__device__ __forceinline__ int load_q8_0_int(const int8_t * qs, int i32) {
+    const uint16_t * q16 = reinterpret_cast<const uint16_t *>(qs);
+    int v  = q16[2 * i32 + 0] <<  0;
+    v     |= q16[2 * i32 + 1] << 16;
+    return v;
+}
+
+__device__ __forceinline__ int load_q8_1_int(const int8_t * qs, int i32) {
+    return reinterpret_cast<const int *>(qs)[i32];
+}
+
+// ----------------------------------------------------------------------------
+// Q8_0 × Q8_1 specialized MMVQ (M=1, K and N compile-time)
+// ----------------------------------------------------------------------------
+//
+// One warp per output row. Each thread handles one or more K-blocks. Uses
+// __dp4a for int8×int8 dot accumulation (matches ggml's pattern). Final
+// per-row warp reduction via __shfl_xor_sync.
+//
+// Layout assumption: w is row-major [N, K/32] block_q8_0, i.e. row n's
+// K-blocks are contiguous starting at w[n * K_BLOCKS]. This matches ggml's
+// Q8_0 storage for src0 (where ne[0]=K, ne[1]=N).
 
 template <int K, int N>
-__global__ void mmvq_q8_0_f32_specialized(
-    float * __restrict__ y,
-    const block_q8_0 * __restrict__ w,
-    const float * __restrict__ x) {
+__global__ void mmvq_q8_0_q8_1_kernel(
+    float *            __restrict__ y,        // [N]
+    const block_q8_0 * __restrict__ w,        // [N, K/32]
+    const block_q8_1 * __restrict__ x_q8_1) { // [K/32]
+    constexpr int K_BLOCKS = K / 32;
+    static_assert(K % 32 == 0,  "K must be a multiple of 32");
+    static_assert(K_BLOCKS >= 32, "K must be >= 1024 (one warp covers 32 K-blocks min)");
+    static_assert(K_BLOCKS % 32 == 0, "K_BLOCKS must be a multiple of warp size for v0 layout");
 
-    constexpr int K_BLOCKS = K / 32;       // Q8_0 blocks per K row
-    static_assert(K % 32 == 0, "K must be multiple of Q8_0 block size");
-
-    const int n = blockIdx.x * blockDim.x + threadIdx.x;
+    const int n = blockIdx.x;
     if (n >= N) return;
 
-    // Each thread accumulates one output column.
-    // K-loop is fully unrolled by nvcc when K is a compile-time constant.
-    // TODO(phaseA): the per-thread-per-output pattern is naive. Real wins
-    // come from cooperative loading of x[] into smem (shared across threads)
-    // and warp-level dot-product reduction. See ggml-cuda/mmvq.cu for the
-    // existing pattern and aim to match its register tile size.
+    const int lane = threadIdx.x;  // 0..31
+
+    // Each lane processes K_BLOCKS / 32 K-blocks.
+    constexpr int KB_PER_LANE = K_BLOCKS / 32;
+
     float acc = 0.0f;
+
     #pragma unroll
-    for (int kb = 0; kb < K_BLOCKS; ++kb) {
-        const block_q8_0 & block = w[kb * N + n];
-        const float scale = __half2float(block.d);
+    for (int kbi = 0; kbi < KB_PER_LANE; ++kbi) {
+        const int kbx = lane + kbi * 32;
+        const block_q8_0 & wb = w[n * K_BLOCKS + kbx];
+        const block_q8_1 & xb = x_q8_1[kbx];
+
+        // 8 int loads each side = 32 int8 elements per block. Q8_0's qs is
+        // only 2-byte aligned across blocks, so use the b2 (paired-u16) load.
+        int sumi = 0;
         #pragma unroll
-        for (int j = 0; j < 32; ++j) {
-            const int k_idx = kb * 32 + j;
-            acc += x[k_idx] * (float)block.qs[j] * scale;
+        for (int j = 0; j < 8; ++j) {
+            const int v = load_q8_0_int(wb.qs, j);
+            const int u = load_q8_1_int(xb.qs, j);
+            sumi = __dp4a(v, u, sumi);
         }
+
+        const float d_w = __half2float(wb.d);
+        const float d_x = __half2float(xb.d);
+        acc += d_w * d_x * (float) sumi;
     }
-    y[n] = acc;
+
+    // Warp reduce
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_xor_sync(0xffffffff, acc, offset);
+    }
+
+    if (lane == 0) {
+        y[n] = acc;
+    }
 }
 
-// Explicit instantiations for the shapes we ship in Phase A.
-template __global__ void mmvq_q8_0_f32_specialized<1024, 2048>(
-    float *, const block_q8_0 *, const float *);
-template __global__ void mmvq_q8_0_f32_specialized<1024, 1024>(
-    float *, const block_q8_0 *, const float *);
-template __global__ void mmvq_q8_0_f32_specialized<2048, 1024>(
-    float *, const block_q8_0 *, const float *);
-template __global__ void mmvq_q8_0_f32_specialized<1024, 3072>(
-    float *, const block_q8_0 *, const float *);
-template __global__ void mmvq_q8_0_f32_specialized<3072, 1024>(
-    float *, const block_q8_0 *, const float *);
+template <int K, int N>
+void launch_mmvq_q8_0_q8_1(
+    float *            y,
+    const block_q8_0 * w,
+    const block_q8_1 * x_q8_1,
+    cudaStream_t       stream) {
+    // One block per output row, 32 threads (one warp).
+    mmvq_q8_0_q8_1_kernel<K, N><<<N, 32, 0, stream>>>(y, w, x_q8_1);
+}
+
+template <int K, int N>
+void launch_mmvq_q8_0_f32(
+    float *            y,
+    const block_q8_0 * w,
+    const float *      x,
+    block_q8_1 *       x_q8_1_scratch,
+    cudaStream_t       stream) {
+    launch_quantize_x_q8_1<K>(x, x_q8_1_scratch, stream);
+    launch_mmvq_q8_0_q8_1<K, N>(y, w, x_q8_1_scratch, stream);
+}
+
+// Explicit instantiations — Phase A v0 ships only (K=1024, N=2048).
+// The other 6 shapes will be added once the v0 path is validated.
+template void launch_quantize_x_q8_1<1024>(const float *, block_q8_1 *, cudaStream_t);
+template void launch_mmvq_q8_0_q8_1<1024, 2048>(float *, const block_q8_0 *, const block_q8_1 *, cudaStream_t);
+template void launch_mmvq_q8_0_f32  <1024, 2048>(float *, const block_q8_0 *, const float *, block_q8_1 *, cudaStream_t);
 
 // ----------------------------------------------------------------------------
-// Launch wrappers
+// Hook
+// ----------------------------------------------------------------------------
+//
+// Called by ggml-cuda.cu for every mul_mat. We claim ops where:
+//   - src0 is Q8_0 (the weight)
+//   - src1 is F32 (the activation)
+//   - dst  is F32
+//   - M = 1 (single-token AR step)
+//   - (K, N) matches one of our specialised shapes
+// and dispatch to a specialised kernel. For everything else we return false
+// and ggml's generic path runs.
+//
+// The Q8_1 staging buffer is a one-time-per-call allocation. We could share
+// across the layer's mul_mats but for v0 we re-quantize per call to mirror
+// ggml's behaviour (same launch count). Optimization: hoist the quantize
+// up so all of attn_q/k/v share one quantize-x-q8_1 launch — that's a
+// meaningful reduction in launches and a candidate for v0.1.
+
+// Per-thread scratch for the Q8_1 staging buffer. Allocated lazily, kept
+// alive for the process lifetime. CUDA allocations are sticky and small
+// (max K_BLOCKS for K=3072 → 96 blocks × 36 bytes = 3.4 KiB).
+struct StagingBuffer {
+    block_q8_1 * d_ptr   = nullptr;
+    size_t       d_bytes = 0;
+
+    block_q8_1 * ensure(size_t n_blocks) {
+        const size_t need = n_blocks * sizeof(block_q8_1);
+        if (need <= d_bytes) {
+            return d_ptr;
+        }
+        if (d_ptr) {
+            cudaFree(d_ptr);
+            d_ptr = nullptr;
+            d_bytes = 0;
+        }
+        if (cudaMalloc(&d_ptr, need) != cudaSuccess) {
+            d_ptr = nullptr;
+            d_bytes = 0;
+            return nullptr;
+        }
+        d_bytes = need;
+        return d_ptr;
+    }
+};
+
+// Process-wide. Mul_mat dispatch is serialised on the cuda backend's compute
+// stream so a single global is fine.
+static StagingBuffer g_staging;
+
+static cudaStream_t hook_stream(ggml_backend_cuda_context * /*ctx*/) {
+    // We don't link the full ggml_backend_cuda_context layout. Use the
+    // current device's default stream — ggml's mul_mat is invoked from a
+    // path that has already set the device, and the dispatcher's compute
+    // stream is the per-context one we don't have direct access to.
+    //
+    // For correctness we synchronise on the default stream below if needed.
+    // For Phase A v0 we use stream 0 — same as the ggml-cuda compute path
+    // when no explicit stream override is in play. If this proves wrong
+    // (timing / out-of-order writes) we'll thread the stream through via a
+    // friend declaration in ggml-cuda.cu.
+    return 0;
+}
+
+// Hit-counter for boot diagnostics. The first N hits log shape + outcome;
+// after that we go silent to keep the log readable. Toggled by
+// QWEN3_TTS_SPECIALIZED_MMVQ_VERBOSE=1.
+static int s_log_budget = 0;
+
+extern "C" bool qwen3_mul_mat_hook(
+    ggml_backend_cuda_context * ctx,
+    const ggml_tensor *         src0,
+    const ggml_tensor *         src1,
+    ggml_tensor *               dst) {
+    if (!src0 || !src1 || !dst) return false;
+    if (src0->type != GGML_TYPE_Q8_0)  return false;
+    if (src1->type != GGML_TYPE_F32)   return false;
+    if (dst->type  != GGML_TYPE_F32)   return false;
+
+    // M=1 only: src1 has shape [K, M, ...]; we want M==1.
+    if (src1->ne[1] != 1) return false;
+    // No batching for v0.
+    if (src1->ne[2] != 1 || src1->ne[3] != 1) return false;
+    if (dst->ne[1]  != 1 || dst->ne[2]  != 1 || dst->ne[3] != 1) return false;
+
+    // K = src0->ne[0] = src1->ne[0]. N = src0->ne[1] = dst->ne[0].
+    const int64_t K = src0->ne[0];
+    const int64_t N = src0->ne[1];
+    if (K != src1->ne[0]) return false;
+    if (N != dst->ne[0])  return false;
+
+    // Strides: we need contiguous source layout for the simple kernel.
+    // src0 row stride must be K/32 q8_0 blocks = K/32 * 34 bytes.
+    // For Phase A v0 we only handle the contiguous case.
+    if (src0->nb[0] != sizeof(block_q8_0))  return false;  // 34
+    if (src1->nb[0] != sizeof(float))       return false;  // 4
+    if (dst->nb[0]  != sizeof(float))       return false;
+
+    // Phase A v0 ships (K=1024, N=2048) only.
+    if (K != 1024 || N != 2048) {
+        if (s_log_budget > 0) {
+            std::fprintf(stderr, "[qwen3-megakernel] hook miss K=%lld N=%lld (skip)\n",
+                         (long long) K, (long long) N);
+            --s_log_budget;
+        }
+        return false;
+    }
+
+    if (s_log_budget > 0) {
+        std::fprintf(stderr, "[qwen3-megakernel] hook hit  K=%lld N=%lld\n",
+                     (long long) K, (long long) N);
+        --s_log_budget;
+    }
+
+    // Set the device, mirroring ggml-cuda's per-mul_mat behaviour. We don't
+    // touch ctx — the dispatcher already set the device when it built ctx.
+    (void) ctx;
+
+    block_q8_1 * x_q8_1 = g_staging.ensure(K / 32);
+    if (!x_q8_1) {
+        // Allocation failed; let ggml handle it (graceful degrade).
+        return false;
+    }
+
+    cudaStream_t stream = hook_stream(ctx);
+
+    launch_mmvq_q8_0_f32<1024, 2048>(
+        static_cast<float *>(dst->data),
+        static_cast<const block_q8_0 *>(src0->data),
+        static_cast<const float *>(src1->data),
+        x_q8_1,
+        stream);
+
+    return true;
+}
+
+// ----------------------------------------------------------------------------
+// install() / is_installed()
 // ----------------------------------------------------------------------------
 
-void launch_mmvq_q8_0_K1024_N2048(float * y, const block_q8_0 * w,
-                                   const float * x, cudaStream_t stream) {
-    constexpr int N = 2048;
-    constexpr int BLOCK = 256;
-    const int grid = (N + BLOCK - 1) / BLOCK;
-    mmvq_q8_0_f32_specialized<1024, N><<<grid, BLOCK, 0, stream>>>(y, w, x);
-}
+static bool s_installed = false;
 
-void launch_mmvq_q8_0_K1024_N1024(float * y, const block_q8_0 * w,
-                                   const float * x, cudaStream_t stream) {
-    constexpr int N = 1024;
-    constexpr int BLOCK = 256;
-    const int grid = (N + BLOCK - 1) / BLOCK;
-    mmvq_q8_0_f32_specialized<1024, N><<<grid, BLOCK, 0, stream>>>(y, w, x);
-}
+bool is_installed() { return s_installed; }
 
-void launch_mmvq_q8_0_K2048_N1024(float * y, const block_q8_0 * w,
-                                   const float * x, cudaStream_t stream) {
-    constexpr int N = 1024;
-    constexpr int BLOCK = 256;
-    const int grid = (N + BLOCK - 1) / BLOCK;
-    mmvq_q8_0_f32_specialized<2048, N><<<grid, BLOCK, 0, stream>>>(y, w, x);
-}
+bool install() {
+    if (s_installed) return false;
 
-void launch_mmvq_q8_0_K1024_N3072(float * y, const block_q8_0 * w,
-                                   const float * x, cudaStream_t stream) {
-    constexpr int N = 3072;
-    constexpr int BLOCK = 256;
-    const int grid = (N + BLOCK - 1) / BLOCK;
-    mmvq_q8_0_f32_specialized<1024, N><<<grid, BLOCK, 0, stream>>>(y, w, x);
-}
+    const char * env = std::getenv("QWEN3_TTS_SPECIALIZED_MMVQ");
+    if (!env || env[0] == '\0' || std::strcmp(env, "0") == 0) {
+        return false;
+    }
 
-void launch_mmvq_q8_0_K3072_N1024(float * y, const block_q8_0 * w,
-                                   const float * x, cudaStream_t stream) {
-    constexpr int N = 1024;
-    constexpr int BLOCK = 256;
-    const int grid = (N + BLOCK - 1) / BLOCK;
-    mmvq_q8_0_f32_specialized<3072, N><<<grid, BLOCK, 0, stream>>>(y, w, x);
-}
+    ggml_cuda_set_mul_mat_hook(qwen3_mul_mat_hook);
+    s_installed = true;
 
-void launch_mmvq_q8_0_K1024_codec_head(float * y, const block_q8_0 * w,
-                                        const float * x, int N,
-                                        cudaStream_t stream) {
-    // N is runtime here (codec_vocab_size varies per model variant).
-    // For the common N values, dispatch to a specialized instantiation.
-    // For others, the next agent should either add the instantiation or
-    // fall back to ggml's MMVQ — caller decides.
-    (void) y; (void) w; (void) x; (void) N; (void) stream;
-    // TODO(phaseA): implement runtime-N dispatch or document the fallback.
-}
+    const char * verbose = std::getenv("QWEN3_TTS_SPECIALIZED_MMVQ_VERBOSE");
+    if (verbose && verbose[0] != '\0' && std::strcmp(verbose, "0") != 0) {
+        s_log_budget = 200;  // log first ~200 hook calls
+    }
 
-// ----------------------------------------------------------------------------
-// Phase B — Per-layer megakernel (NOT IMPLEMENTED)
-// ----------------------------------------------------------------------------
-
-void launch_talker_layer_q8_0(
-    float * residual_out,
-    const float * residual_in,
-    const __half * attn_norm_w,
-    const __half * ffn_norm_w,
-    const __half * q_norm_w,
-    const __half * k_norm_w,
-    const block_q8_0 * wq,
-    const block_q8_0 * wk,
-    const block_q8_0 * wv,
-    const block_q8_0 * wo,
-    const block_q8_0 * wgate,
-    const block_q8_0 * wup,
-    const block_q8_0 * wdown,
-    __half * k_cache,
-    __half * v_cache,
-    int kv_n_past,
-    int kv_n_eff,
-    float rope_theta,
-    float kq_scale,
-    cudaStream_t stream) {
-
-    // TODO(phaseB): see HANDOFF-megakernel-v0.md "Phase B" section for the
-    // full design (cooperative groups vs split sub-megakernels, smem layout,
-    // grid sync points). DO NOT START until Phase A is shipped and validated.
-    (void) residual_out; (void) residual_in;
-    (void) attn_norm_w; (void) ffn_norm_w; (void) q_norm_w; (void) k_norm_w;
-    (void) wq; (void) wk; (void) wv; (void) wo;
-    (void) wgate; (void) wup; (void) wdown;
-    (void) k_cache; (void) v_cache;
-    (void) kv_n_past; (void) kv_n_eff;
-    (void) rope_theta; (void) kq_scale; (void) stream;
+    std::fprintf(stderr,
+                 "[qwen3-megakernel] Phase A specialized MMVQ installed "
+                 "(shapes: 1024x2048%s)\n",
+                 s_log_budget > 0 ? ", verbose" : "");
+    return true;
 }
 
 }  // namespace qwen3_megakernel

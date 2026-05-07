@@ -49,6 +49,34 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(GGML_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ggml")
 add_subdirectory(${GGML_DIR})
 
+# Qwen3-specific CUDA megakernel (Phase A specialized Q8_0 MMVQ + Phase B
+# per-layer talker megakernel — see kobbler/docker/tts-qwen3-dev/HANDOFF-
+# megakernel-v0.md). Built when GGML_CUDA is on; otherwise the install()
+# hook is a no-op and tts_transformer omits the dependency.
+if(GGML_CUDA)
+    enable_language(CUDA)
+    add_library(qwen3_megakernel STATIC
+        src/cuda/qwen3_megakernel.cu
+    )
+    target_include_directories(qwen3_megakernel PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/cuda
+    )
+    target_include_directories(qwen3_megakernel PRIVATE
+        ${GGML_DIR}/include
+    )
+    set_target_properties(qwen3_megakernel PROPERTIES
+        CUDA_STANDARD          17
+        CUDA_STANDARD_REQUIRED ON
+        POSITION_INDEPENDENT_CODE ON
+    )
+    if(CMAKE_CUDA_ARCHITECTURES)
+        set_target_properties(qwen3_megakernel PROPERTIES
+            CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+        )
+    endif()
+    target_link_libraries(qwen3_megakernel PUBLIC ggml)
+endif()
+
 # Text tokenizer library
 add_library(text_tokenizer STATIC
     src/text_tokenizer.cpp
@@ -88,6 +116,10 @@ target_link_libraries(tts_transformer PUBLIC
     ggml
     Threads::Threads
 )
+if(GGML_CUDA)
+    target_link_libraries(tts_transformer PUBLIC qwen3_megakernel)
+    target_compile_definitions(tts_transformer PUBLIC QWEN3_TTS_HAS_MEGAKERNEL=1)
+endif()
 if(APPLE AND QWEN3_TTS_COREML)
     target_link_libraries(tts_transformer PUBLIC
         "-framework Foundation"

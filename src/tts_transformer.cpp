@@ -2,6 +2,10 @@
 #include "gguf_loader.h"
 #include "ggml-cpu.h"
 
+#if defined(QWEN3_TTS_HAS_MEGAKERNEL)
+#include "qwen3_megakernel.h"
+#endif
+
 #include <cmath>
 #include <cstring>
 #include <cstdio>
@@ -56,6 +60,12 @@ void TTSTransformer::unload_model() {
 
 bool TTSTransformer::load_model(const std::string & model_path) {
     unload_model();
+
+#if defined(QWEN3_TTS_HAS_MEGAKERNEL)
+    // QWEN3_TTS_SPECIALIZED_MMVQ=1 → install the shape-specialized Q8_0 MMVQ
+    // hook in ggml-cuda. Idempotent across repeated load_model calls.
+    qwen3_megakernel::install();
+#endif
 
     skip_ggml_code_pred_layers_ = false;
 #if defined(__APPLE__)
