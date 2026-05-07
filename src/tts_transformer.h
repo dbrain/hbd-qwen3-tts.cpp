@@ -460,6 +460,29 @@ private:
     // Build computation graph for 2-token prefill of code predictor
     // Processes [past_hidden, codec_embd(codebook_0_token)] together
     struct ggml_cgraph * build_code_pred_prefill_graph();
+
+    // Build a single graph that fuses the 2-token prefill + all 14 AR steps,
+    // chaining each step's argmax (or Gumbel-max for T>0) into the next
+    // step's embed lookup in-graph. Drops the 14× per-step sched_compute
+    // overhead at the cost of a larger graph build/alloc once per frame.
+    //
+    // temperature == 0  → in-graph greedy argmax(logits) per step.
+    // temperature  > 0  → in-graph argmax(logits/T + gumbel) per step;
+    //                     caller pre-computes a 15× [vocab] Gumbel(0,1)
+    //                     table on host and binds it to inp_gumbel_K inputs.
+    //                     NB: top_k filtering is NOT applied (ggml has no
+    //                     in-graph sort), so this samples from the full
+    //                     softmax — quality may differ from the per-step
+    //                     path which honours top_k.
+    //
+    // Outputs (per step k = 0..14): "tok_k" [1] I32. Inputs are documented
+    // at the call site. See HANDOFF-fused-ar-NO.md for the full receipt.
+    struct ggml_cgraph * build_fused_code_pred_graph(float temperature);
+
+    bool predict_codes_autoregressive_fused(const float * hidden,
+                                            int32_t codebook_0_token,
+                                            std::vector<int32_t> & output,
+                                            float temperature, int32_t top_k);
     
     // Parse hyperparameters from GGUF
     bool parse_config(struct gguf_context * ctx);
