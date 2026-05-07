@@ -617,28 +617,25 @@ void AudioCodecEncoder::vq_encode(const float * features, int32_t n_frames,
     download_f32(model_.vq_sem_out_proj, sem_out_proj.data(), hidden * dim);
     download_f32(model_.vq_acou_out_proj, acou_out_proj.data(), hidden * dim);
 
-    // download codebooks
-    std::vector<float> sem_cb(cfg.codebook_size * dim);
-    ggml_backend_tensor_get(model_.vq_sem_codebook, sem_cb.data(), 0,
-                            cfg.codebook_size * dim * ggml_type_size(model_.vq_sem_codebook->type));
-
-    // for F16 codebook, convert
-    std::vector<float> sem_cb_f32;
+    // download semantic codebook (one branch per dtype — earlier code did an
+    // unconditional get into sem_cb that was wasted in the F16 path and
+    // duplicated in the F32 path).
+    std::vector<float> sem_cb;
     const float * sem_cb_ptr;
     if (model_.vq_sem_codebook->type == GGML_TYPE_F16) {
-        sem_cb_f32.resize(cfg.codebook_size * dim);
+        sem_cb.resize(cfg.codebook_size * dim);
         std::vector<ggml_fp16_t> sem_cb_fp16(cfg.codebook_size * dim);
         ggml_backend_tensor_get(model_.vq_sem_codebook, sem_cb_fp16.data(), 0,
                                 cfg.codebook_size * dim * sizeof(ggml_fp16_t));
-        for (size_t i = 0; i < sem_cb_f32.size(); ++i) {
-            sem_cb_f32[i] = ggml_fp16_to_fp32(sem_cb_fp16[i]);
+        for (size_t i = 0; i < sem_cb.size(); ++i) {
+            sem_cb[i] = ggml_fp16_to_fp32(sem_cb_fp16[i]);
         }
-        sem_cb_ptr = sem_cb_f32.data();
     } else {
+        sem_cb.resize(cfg.codebook_size * dim);
         ggml_backend_tensor_get(model_.vq_sem_codebook, sem_cb.data(), 0,
                                 cfg.codebook_size * dim * sizeof(float));
-        sem_cb_ptr = sem_cb.data();
     }
+    sem_cb_ptr = sem_cb.data();
 
     std::vector<std::vector<float>> acou_cbs(15);
     for (int cb = 0; cb < 15; ++cb) {
