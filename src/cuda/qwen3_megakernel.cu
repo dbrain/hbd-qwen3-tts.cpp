@@ -1,43 +1,33 @@
-// Qwen3-TTS megakernel — Phase A specialized MMVQ.
+// Qwen3-TTS megakernel — Phase A specialized MMVQ + hook-level QKV / gate-up fusion.
 // See kobbler/docker/tts-qwen3-dev/HANDOFF-megakernel-v0.md for the full plan.
 //
 // What lives here:
 //   - F32 → Q8_1 row quantizer (templated on K)
 //   - Q8_0 × Q8_1 specialized MMVQ for M=1 (templated on K, N)
-//   - Hook function that ggml-cuda calls for every mul_mat. Inspects shape
-//     and types; if it's one of the 7 specialised (K, N) Q8_0 patterns at
-//     M=1, dispatches to our kernel and returns true. Otherwise returns
-//     false and ggml's generic path runs.
-//
-// Phase A v0 only specialises the (K=1024, N=2048) shape end-to-end. The
-// remaining 6 shapes will be filled in once the wire-up + kernel pattern
-// are validated by microbench + breakit. All shape decisions are made in
-// `qwen3_mul_mat_hook`, so adding a shape is one line + one instantiation.
+//   - Fused QKV / gate-up kernels: one launch produces multiple outputs
+//     from a shared Q8_1 staging buffer, eliminating ~4 launches per
+//     QKV triplet and ~2 per gate-up pair.
+//   - Hook function ggml-cuda calls for every mul_mat. Inspects shape +
+//     types; when src0 is Q8_0 + M=1 + (K, N) is one of the 8 specialised
+//     pairs, dispatches to our kernel. When the dst belongs to a fused
+//     QKV/gate-up plan, either launches the fused kernel (leader role) or
+//     no-ops (follower — data already written).
+//   - Graph-begin hook: receives cgraph, scans for Q→K→V triplets and
+//     gate→up pairs (matched by tensor-name pattern + shared src1), builds
+//     a per-graph fusion plan, and invalidates the quantize-x cache.
 
 #include "qwen3_megakernel.cuh"
 #include "qwen3_megakernel.h"
+
+#include "ggml.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-
-// We talk to ggml only via the hook signature — we never include ggml-cuda
-// internal headers. We DO need to read a few fields off ggml_tensor (type,
-// ne[], data) for the shape match, so we declare the minimum subset we use
-// here. This couples us to ggml's tensor layout but not to its internals.
-
-extern "C" {
-// Mirror of the leading members of struct ggml_tensor that we touch. Layout
-// must match ggml.h. If ggml ever reorders these, the hook breaks at compile
-// time via the static_assert below.
-//
-// We use a public ggml.h include instead of mirroring once the build wires
-// up — see `extern "C"` block at file scope below for the actual include.
-}
-
-#include "ggml.h"
+#include <unordered_map>
+#include <vector>
 
 namespace qwen3_megakernel {
 
@@ -48,9 +38,6 @@ namespace qwen3_megakernel {
 // One block per K/32 Q8_1 block. 32 threads cooperatively scan one block:
 // find absmax, derive scale, write int8 quantized values + d (fp16 scale)
 // + s (fp16 sum-of-quants * scale).
-//
-// This mirrors ggml's quantize_row_q8_1 but with K compile-time so the
-// block count is a constant.
 
 template <int K>
 __global__ void quantize_x_q8_1_kernel(
@@ -65,7 +52,6 @@ __global__ void quantize_x_q8_1_kernel(
     const int lane = threadIdx.x;  // 0..31
     const float v = x[kb * 32 + lane];
 
-    // Warp absmax reduction
     float amax = fabsf(v);
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -78,7 +64,6 @@ __global__ void quantize_x_q8_1_kernel(
     const int q = __float2int_rn(v * iscale);
     const int qclamped = q < -127 ? -127 : (q > 127 ? 127 : q);
 
-    // Warp sum of quantized ints (for Q8_1's `s` field).
     float qsum = (float) qclamped;
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -106,12 +91,7 @@ void launch_quantize_x_q8_1(
 // block_q8_0 = {half d, int8_t qs[32]} = 34 B → block n starts at n*34. The
 // `qs` field is at offset 2 inside the block, so its absolute address is
 // only 2-byte aligned (alternates with 4-byte across n). Reading 4 bytes
-// at a time via int* therefore traps on every other block — exactly the
-// "misaligned address" CUDA fault we hit on first wire-up.
-//
-// ggml's fix is `get_int_b2`: read two u16s and pack into u32. We mirror
-// that here. block_q8_1 = {half d, half s, int8_t qs[32]} = 36 B; qs at
-// offset 4, always 4-byte aligned, so a plain int load is fine.
+// at a time via int* therefore traps on every other block.
 __device__ __forceinline__ int load_q8_0_int(const int8_t * qs, int i32) {
     const uint16_t * q16 = reinterpret_cast<const uint16_t *>(qs);
     int v  = q16[2 * i32 + 0] <<  0;
@@ -124,16 +104,8 @@ __device__ __forceinline__ int load_q8_1_int(const int8_t * qs, int i32) {
 }
 
 // ----------------------------------------------------------------------------
-// Q8_0 × Q8_1 specialized MMVQ (M=1, K and N compile-time)
+// Single-shape Q8_0 × Q8_1 MMVQ (M=1)
 // ----------------------------------------------------------------------------
-//
-// One warp per output row. Each thread handles one or more K-blocks. Uses
-// __dp4a for int8×int8 dot accumulation (matches ggml's pattern). Final
-// per-row warp reduction via __shfl_xor_sync.
-//
-// Layout assumption: w is row-major [N, K/32] block_q8_0, i.e. row n's
-// K-blocks are contiguous starting at w[n * K_BLOCKS]. This matches ggml's
-// Q8_0 storage for src0 (where ne[0]=K, ne[1]=N).
 
 template <int K, int N>
 __global__ void mmvq_q8_0_q8_1_kernel(
@@ -142,15 +114,13 @@ __global__ void mmvq_q8_0_q8_1_kernel(
     const block_q8_1 * __restrict__ x_q8_1) { // [K/32]
     constexpr int K_BLOCKS = K / 32;
     static_assert(K % 32 == 0,  "K must be a multiple of 32");
-    static_assert(K_BLOCKS >= 32, "K must be >= 1024 (one warp covers 32 K-blocks min)");
-    static_assert(K_BLOCKS % 32 == 0, "K_BLOCKS must be a multiple of warp size for v0 layout");
+    static_assert(K_BLOCKS >= 32, "K must be >= 1024");
+    static_assert(K_BLOCKS % 32 == 0, "K_BLOCKS must be multiple of warp size");
 
     const int n = blockIdx.x;
     if (n >= N) return;
 
     const int lane = threadIdx.x;  // 0..31
-
-    // Each lane processes K_BLOCKS / 32 K-blocks.
     constexpr int KB_PER_LANE = K_BLOCKS / 32;
 
     float acc = 0.0f;
@@ -161,8 +131,6 @@ __global__ void mmvq_q8_0_q8_1_kernel(
         const block_q8_0 & wb = w[n * K_BLOCKS + kbx];
         const block_q8_1 & xb = x_q8_1[kbx];
 
-        // 8 int loads each side = 32 int8 elements per block. Q8_0's qs is
-        // only 2-byte aligned across blocks, so use the b2 (paired-u16) load.
         int sumi = 0;
         #pragma unroll
         for (int j = 0; j < 8; ++j) {
@@ -176,7 +144,6 @@ __global__ void mmvq_q8_0_q8_1_kernel(
         acc += d_w * d_x * (float) sumi;
     }
 
-    // Warp reduce
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         acc += __shfl_xor_sync(0xffffffff, acc, offset);
@@ -193,7 +160,6 @@ void launch_mmvq_q8_0_q8_1(
     const block_q8_0 * w,
     const block_q8_1 * x_q8_1,
     cudaStream_t       stream) {
-    // One block per output row, 32 threads (one warp).
     mmvq_q8_0_q8_1_kernel<K, N><<<N, 32, 0, stream>>>(y, w, x_q8_1);
 }
 
@@ -208,20 +174,169 @@ void launch_mmvq_q8_0_f32(
     launch_mmvq_q8_0_q8_1<K, N>(y, w, x_q8_1_scratch, stream);
 }
 
-// Explicit instantiations.
+// ----------------------------------------------------------------------------
+// Fused QKV / fused gate-up kernels
+// ----------------------------------------------------------------------------
 //
-// Quantize-x: one per K. Three K values cover all known mul_mats (talker +
-// code-pred, both AR and prefill steps).
+// One launch produces all outputs of a Q→K→V triplet (or gate→up pair) from
+// a single shared Q8_1 staging buffer. Each block handles one output row;
+// the block decides which weight matrix and dst it serves from blockIdx.x.
+// Total grid = sum of N over all outputs.
+
+template <int K, int N_Q, int N_K, int N_V>
+__global__ void fused_qkv_q8_0_q8_1_kernel(
+    float *            __restrict__ y_q,
+    float *            __restrict__ y_k,
+    float *            __restrict__ y_v,
+    const block_q8_0 * __restrict__ w_q,
+    const block_q8_0 * __restrict__ w_k,
+    const block_q8_0 * __restrict__ w_v,
+    const block_q8_1 * __restrict__ x_q8_1) {
+    constexpr int K_BLOCKS    = K / 32;
+    constexpr int KB_PER_LANE = K_BLOCKS / 32;
+    constexpr int N_TOTAL     = N_Q + N_K + N_V;
+
+    const int n = blockIdx.x;
+    if (n >= N_TOTAL) return;
+
+    const int lane = threadIdx.x;
+
+    // Route this block to the right (W, y, n_local).
+    const block_q8_0 * w;
+    float *            y;
+    int                n_local;
+    if (n < N_Q) {
+        w = w_q; y = y_q; n_local = n;
+    } else if (n < N_Q + N_K) {
+        w = w_k; y = y_k; n_local = n - N_Q;
+    } else {
+        w = w_v; y = y_v; n_local = n - N_Q - N_K;
+    }
+
+    float acc = 0.0f;
+
+    #pragma unroll
+    for (int kbi = 0; kbi < KB_PER_LANE; ++kbi) {
+        const int kbx = lane + kbi * 32;
+        const block_q8_0 & wb = w[n_local * K_BLOCKS + kbx];
+        const block_q8_1 & xb = x_q8_1[kbx];
+
+        int sumi = 0;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int v = load_q8_0_int(wb.qs, j);
+            const int u = load_q8_1_int(xb.qs, j);
+            sumi = __dp4a(v, u, sumi);
+        }
+
+        const float d_w = __half2float(wb.d);
+        const float d_x = __half2float(xb.d);
+        acc += d_w * d_x * (float) sumi;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_xor_sync(0xffffffff, acc, offset);
+    }
+
+    if (lane == 0) {
+        y[n_local] = acc;
+    }
+}
+
+template <int K, int N_Q, int N_K, int N_V>
+void launch_fused_qkv_q8_0_q8_1(
+    float *            y_q,
+    float *            y_k,
+    float *            y_v,
+    const block_q8_0 * w_q,
+    const block_q8_0 * w_k,
+    const block_q8_0 * w_v,
+    const block_q8_1 * x_q8_1,
+    cudaStream_t       stream) {
+    constexpr int N_TOTAL = N_Q + N_K + N_V;
+    fused_qkv_q8_0_q8_1_kernel<K, N_Q, N_K, N_V><<<N_TOTAL, 32, 0, stream>>>(
+        y_q, y_k, y_v, w_q, w_k, w_v, x_q8_1);
+}
+
+template <int K, int N_GATE, int N_UP>
+__global__ void fused_gate_up_q8_0_q8_1_kernel(
+    float *            __restrict__ y_gate,
+    float *            __restrict__ y_up,
+    const block_q8_0 * __restrict__ w_gate,
+    const block_q8_0 * __restrict__ w_up,
+    const block_q8_1 * __restrict__ x_q8_1) {
+    constexpr int K_BLOCKS    = K / 32;
+    constexpr int KB_PER_LANE = K_BLOCKS / 32;
+    constexpr int N_TOTAL     = N_GATE + N_UP;
+
+    const int n = blockIdx.x;
+    if (n >= N_TOTAL) return;
+
+    const int lane = threadIdx.x;
+
+    const block_q8_0 * w;
+    float *            y;
+    int                n_local;
+    if (n < N_GATE) {
+        w = w_gate; y = y_gate; n_local = n;
+    } else {
+        w = w_up;   y = y_up;   n_local = n - N_GATE;
+    }
+
+    float acc = 0.0f;
+
+    #pragma unroll
+    for (int kbi = 0; kbi < KB_PER_LANE; ++kbi) {
+        const int kbx = lane + kbi * 32;
+        const block_q8_0 & wb = w[n_local * K_BLOCKS + kbx];
+        const block_q8_1 & xb = x_q8_1[kbx];
+
+        int sumi = 0;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int v = load_q8_0_int(wb.qs, j);
+            const int u = load_q8_1_int(xb.qs, j);
+            sumi = __dp4a(v, u, sumi);
+        }
+
+        const float d_w = __half2float(wb.d);
+        const float d_x = __half2float(xb.d);
+        acc += d_w * d_x * (float) sumi;
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        acc += __shfl_xor_sync(0xffffffff, acc, offset);
+    }
+
+    if (lane == 0) {
+        y[n_local] = acc;
+    }
+}
+
+template <int K, int N_GATE, int N_UP>
+void launch_fused_gate_up_q8_0_q8_1(
+    float *            y_gate,
+    float *            y_up,
+    const block_q8_0 * w_gate,
+    const block_q8_0 * w_up,
+    const block_q8_1 * x_q8_1,
+    cudaStream_t       stream) {
+    constexpr int N_TOTAL = N_GATE + N_UP;
+    fused_gate_up_q8_0_q8_1_kernel<K, N_GATE, N_UP><<<N_TOTAL, 32, 0, stream>>>(
+        y_gate, y_up, w_gate, w_up, x_q8_1);
+}
+
+// Explicit instantiations for the 0.6B model. Talker and code-pred share
+// hidden=1024, intermediate=3072, n_heads=16, n_kv_heads=8, head_dim=128, so
+// QKV = (K=1024, N_Q=2048, N_K=1024, N_V=1024) and gate/up = (K=1024,
+// N_GATE=3072, N_UP=3072). If a future model deviates we'll need new
+// instantiations; the hook below falls through to per-op for unknown shapes.
 template void launch_quantize_x_q8_1<1024>(const float *, block_q8_1 *, cudaStream_t);
 template void launch_quantize_x_q8_1<2048>(const float *, block_q8_1 *, cudaStream_t);
 template void launch_quantize_x_q8_1<3072>(const float *, block_q8_1 *, cudaStream_t);
 
-// MMVQ: K x N grid. Code-pred uses (1024, *) and (*, 1024); talker uses
-// (2048, *) and (*, 2048). intermediate=3072 brings in the wider FFN
-// projections for both. Heads (codec_head, code_pred_head) are also
-// covered when their (K, N) lands in this set — code_pred_head is
-// (1024, 2048), already here; talker codec_head depends on the model's
-// codec_vocab_size and may fall through if it's not 1024/2048/3072.
 #define INSTANTIATE_MMVQ(K_, N_) \
     template void launch_mmvq_q8_0_q8_1<K_, N_>(float *, const block_q8_0 *, const block_q8_1 *, cudaStream_t); \
     template void launch_mmvq_q8_0_f32  <K_, N_>(float *, const block_q8_0 *, const float *, block_q8_1 *, cudaStream_t);
@@ -237,77 +352,190 @@ INSTANTIATE_MMVQ(3072, 2048)
 
 #undef INSTANTIATE_MMVQ
 
-// ----------------------------------------------------------------------------
-// Hook
-// ----------------------------------------------------------------------------
-//
-// Called by ggml-cuda.cu for every mul_mat. We claim ops where:
-//   - src0 is Q8_0 (the weight)
-//   - src1 is F32 (the activation)
-//   - dst  is F32
-//   - M = 1 (single-token AR step)
-//   - (K, N) matches one of our specialised shapes
-// and dispatch to a specialised kernel. For everything else we return false
-// and ggml's generic path runs.
-//
-// The Q8_1 staging buffer is a one-time-per-call allocation. We could share
-// across the layer's mul_mats but for v0 we re-quantize per call to mirror
-// ggml's behaviour (same launch count). Optimization: hoist the quantize
-// up so all of attn_q/k/v share one quantize-x-q8_1 launch — that's a
-// meaningful reduction in launches and a candidate for v0.1.
+template void launch_fused_qkv_q8_0_q8_1<1024, 2048, 1024, 1024>(
+    float *, float *, float *,
+    const block_q8_0 *, const block_q8_0 *, const block_q8_0 *,
+    const block_q8_1 *, cudaStream_t);
 
-// Q8_1 staging buffer. Pre-allocated at max K=3072 (96 blocks × 36 B = 3.4 KiB)
-// on first use; never reallocated. cudaFree-on-grow would trigger UB because
-// async kernels queued on the compute stream still read from the old buffer
-// when the realloc happens.
+template void launch_fused_gate_up_q8_0_q8_1<1024, 3072, 3072>(
+    float *, float *,
+    const block_q8_0 *, const block_q8_0 *,
+    const block_q8_1 *, cudaStream_t);
+
+// ----------------------------------------------------------------------------
+// Q8_1 staging buffer
+// ----------------------------------------------------------------------------
+//
+// Pre-allocated at max K=3072 on first use; never freed. Async kernels in
+// flight on the compute stream still read this when subsequent mul_mats
+// arrive, so realloc-on-grow would be UB.
+
 struct StagingBuffer {
     block_q8_1 * d_ptr   = nullptr;
-    size_t       d_bytes = 0;
-
-    static constexpr size_t MAX_BLOCKS = 3072 / 32;  // covers K up to 3072
+    static constexpr size_t MAX_BLOCKS = 3072 / 32;
 
     block_q8_1 * get() {
         if (d_ptr) return d_ptr;
         const size_t need = MAX_BLOCKS * sizeof(block_q8_1);
         if (cudaMalloc(&d_ptr, need) != cudaSuccess) {
             d_ptr = nullptr;
-            d_bytes = 0;
             return nullptr;
         }
-        d_bytes = need;
         return d_ptr;
     }
 };
 
-// Process-wide. Mul_mat dispatch is serialised on the cuda backend's compute
-// stream so a single global is fine.
 static StagingBuffer g_staging;
 
-// Quantize-x cache. ggml's q/k/v projections all consume the same post-
-// attn-norm tensor; ffn_gate/up consume the same post-ffn-norm tensor. We
-// keep one Q8_1 staging buffer and skip the F32->Q8_1 quantize when the
-// next mul_mat's src1 has the same {data ptr, K} as the previously
-// quantized input. Cache invalidates at every graph-compute-begin
-// (qwen3_graph_begin_hook) since pool allocators may reuse the same
-// pointer for a different logical tensor across graph computes.
+// ----------------------------------------------------------------------------
+// Quantize-x cache
+// ----------------------------------------------------------------------------
 //
-// Disable with QWEN3_TTS_SPECIALIZED_MMVQ_NO_CACHE=1 for A/B testing.
-// Cache infrastructure kept for future revisit but DEFAULT OFF — naive
-// "src1->data ptr match" within a single graph compute false-hits because
-// ggml's graph allocator does live-range buffer reuse: a tensor's data
-// pointer can be the same across different logical tensors within the
-// same compute, and skipping the quantize there yields stale Q8_1.
-// Re-enable via QWEN3_TTS_SPECIALIZED_MMVQ_CACHE=1 to debug further.
-static const float * g_cached_x      = nullptr;
-static int64_t       g_cached_x_K    = 0;
-static bool          g_cache_enabled = false;
-static uint64_t      g_cache_hits    = 0;
-static uint64_t      g_cache_misses  = 0;
+// When two consecutive mul_mats consume the same logical input tensor, we
+// can skip re-quantizing x. Key on the *ggml_tensor* pointer of src1, NOT
+// on src1->data: ggml's graph allocator does live-range buffer reuse, so a
+// fresh logical tensor can inherit a recently-freed data pointer within
+// the same graph compute. ggml_tensor* is unique per logical tensor.
+//
+// Invalidated at every graph-compute-begin in qwen3_graph_begin_hook to
+// be safe across graph rebuilds (where ggml_tensor* may be reused as
+// well). Cache also bypassed when the fusion plan handles a triplet —
+// fused dispatch hoists the quantize itself.
 
-// Hit-counter for boot diagnostics. The first N hits log shape + outcome;
-// after that we go silent to keep the log readable. Toggled by
-// QWEN3_TTS_SPECIALIZED_MMVQ_VERBOSE=1.
+// Cache: when two consecutive mul_mats share the same logical input tensor
+// (Q/K/V all consume post-attn-norm `cur`; gate/up share post-ffn-norm
+// `cur`), skip the redundant quantize_x launch. Key on the *ggml_tensor*
+// pointer of src1, not on src1->data — ggml's graph allocator does live-
+// range buffer reuse, so a fresh logical tensor can inherit a recently-
+// freed data ptr; ggml_tensor* is unique per logical tensor within a
+// graph compute.
+//
+// Safe because cache hits keep the per-op kernel-launch order intact
+// (only the quantize_x is skipped). The "QKV fusion" idea of launching
+// all 3 mmvqs from one hook is NOT safe — ggml's allocator may alias
+// K's and V's dsts on the assumption that K's downstream consumer
+// (k_rms_norm) runs before V's mul_mat. See feedback in the megakernel
+// handoff for full receipts.
+static const ggml_tensor * g_cached_src1     = nullptr;
+static int64_t             g_cached_src1_K   = 0;
+static bool                g_cache_enabled   = true;
+static uint64_t            g_cache_hits      = 0;
+static uint64_t            g_cache_misses    = 0;
+
+// Boot diagnostics budget.
 static int s_log_budget = 0;
+
+// ----------------------------------------------------------------------------
+// Fusion plan
+// ----------------------------------------------------------------------------
+//
+// Built per graph in qwen3_graph_begin_hook by walking cgraph->nodes. Each
+// MUL_MAT node whose src0->name contains "attn_q.weight" / "attn_k.weight"
+// / "attn_v.weight" (or "ffn_gate.weight" / "ffn_up.weight") is a fusion
+// candidate. We group by (src1 ggml_tensor *) — Q/K/V all consume the
+// post-attn-norm `cur` so their src1 matches; gate/up consume post-ffn-norm
+// `cur`. The lowest-cgraph-index node in a complete group becomes the
+// "leader" — the first to be dispatched, where the fused launch happens.
+// The other nodes' dsts are marked as "satisfied" and short-circuit on
+// hook entry.
+
+enum FusedRole {
+    ROLE_LEADER_QKV,   // launches fused_qkv kernel
+    ROLE_LEADER_GATE_UP,
+    ROLE_FOLLOWER,     // hook returns true with no kernel launch
+};
+
+struct FusedEntry {
+    FusedRole role;
+    // Shapes captured at plan time.
+    int64_t K = 0;
+    int64_t N_Q = 0, N_K = 0, N_V = 0;       // QKV leader fields (N_V unused for gate-up)
+    int64_t N_GATE = 0, N_UP = 0;            // gate-up leader fields
+    // Node pointers — ggml fills in ->data lazily during dispatch, so we
+    // capture nodes at plan time and dereference ->data at hook-fire time.
+    const ggml_tensor * src1   = nullptr;    // shared input
+    const ggml_tensor * q_node = nullptr;    // Q (or gate) mul_mat node
+    const ggml_tensor * k_node = nullptr;    // K (or up)   mul_mat node
+    const ggml_tensor * v_node = nullptr;    // V (qkv only)
+};
+
+// Map dst tensor → fusion entry. Lifetime: one graph compute (cleared at
+// graph-begin). Lookup by raw ggml_tensor pointer.
+static std::unordered_map<const ggml_tensor *, FusedEntry> g_fusion_plan;
+static bool      g_fusion_enabled = true;
+// QKV fusion is OFF (and likely permanently). Confirmed root cause: ggml's
+// graph allocator aliases K's and V's dsts to the same buffer slot — it's
+// safe under the standard topo order (K's rms_norm consumes K before V's
+// mul_mat dispatches), but combining all three mmvqs into the leader's
+// hook violates that ordering and V silently overwrites K's data before
+// K's downstream reads it. Gate-up doesn't have this issue (gate and up
+// dsts get distinct buffers because gate's silu doesn't free it before
+// up's mul_mat).
+static bool      g_fusion_qkv_enabled     = false;
+static bool      g_fusion_gate_up_enabled = true;
+// When true: the fused leader hook launches one mmvq per output (3 for QKV,
+// 2 for gate-up), all reading the same hoisted Q8_1 staging buffer. Same
+// per-row kernel layout as the standalone path → bit-equivalent outputs.
+// When false: a single multi-route kernel handles all outputs from one
+// launch. Bigger launch reduction; gated until correctness is proven.
+static bool      g_fusion_split_only = true;
+static uint64_t  g_fusion_groups_built  = 0;
+static uint64_t  g_fusion_leader_fires  = 0;
+static uint64_t  g_fusion_follower_fires = 0;
+
+// ----------------------------------------------------------------------------
+// Pre-scan helpers
+// ----------------------------------------------------------------------------
+
+namespace {
+
+// Returns one of {0=q, 1=k, 2=v, 3=gate, 4=up, -1=other} based on src0->name.
+// Pattern match on the suffix; talker / code-pred share the same suffixes.
+int classify_weight(const ggml_tensor * src0) {
+    if (!src0 || !src0->name[0]) return -1;
+    const char * n = src0->name;
+    if (std::strstr(n, "attn_q.weight"))   return 0;
+    if (std::strstr(n, "attn_k.weight"))   return 1;
+    if (std::strstr(n, "attn_v.weight"))   return 2;
+    if (std::strstr(n, "ffn_gate.weight")) return 3;
+    if (std::strstr(n, "ffn_up.weight"))   return 4;
+    return -1;
+}
+
+// Extract "talker.blk.<L>." or "code_pred.blk.<L>." prefix length so we can
+// confirm two ops belong to the same layer block when grouping.
+int layer_block_prefix_len(const ggml_tensor * src0) {
+    if (!src0 || !src0->name[0]) return 0;
+    const char * n = src0->name;
+    const char * dot = std::strchr(n, '.');
+    if (!dot) return 0;
+    // Skip "talker." or "code_pred." prefix.
+    const char * blk = std::strstr(n, "blk.");
+    if (!blk) return 0;
+    const char * after_idx = std::strchr(blk + 4, '.');
+    if (!after_idx) return 0;
+    return (int) (after_idx + 1 - n);  // length up to and including the '.'
+}
+
+bool is_q8_0_mul_mat_at_m1(const ggml_tensor * node) {
+    if (!node) return false;
+    if (node->op != GGML_OP_MUL_MAT) return false;
+    const ggml_tensor * src0 = node->src[0];
+    const ggml_tensor * src1 = node->src[1];
+    if (!src0 || !src1) return false;
+    if (src0->type != GGML_TYPE_Q8_0) return false;
+    if (src1->type != GGML_TYPE_F32)  return false;
+    if (node->type != GGML_TYPE_F32)  return false;
+    if (src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) return false;
+    if (node->ne[1] != 1 || node->ne[2] != 1 || node->ne[3] != 1) return false;
+    return true;
+}
+
+}  // namespace
+
+// ----------------------------------------------------------------------------
+// Hook
+// ----------------------------------------------------------------------------
 
 extern "C" bool qwen3_mul_mat_hook(
     ggml_backend_cuda_context * ctx,
@@ -316,41 +544,137 @@ extern "C" bool qwen3_mul_mat_hook(
     ggml_tensor *               dst,
     cudaStream_t                stream) {
     if (!src0 || !src1 || !dst) return false;
+
+    // Fast path: fusion plan lookup. If this dst is part of a fused group,
+    // we either launch the fused kernel (leader) or no-op (follower).
+    if (g_fusion_enabled) {
+        auto it = g_fusion_plan.find(dst);
+        if (it != g_fusion_plan.end()) {
+            const FusedEntry & e = it->second;
+            if (e.role == ROLE_FOLLOWER) {
+                ++g_fusion_follower_fires;
+                return true;
+            }
+
+            // Leader: hoist quantize-x once; launch fused kernel.
+            block_q8_1 * x_q8_1 = g_staging.get();
+            if (!x_q8_1) return false;
+
+            const float * x_f32 = static_cast<const float *>(e.src1->data);
+            switch (e.K) {
+                case 1024: launch_quantize_x_q8_1<1024>(x_f32, x_q8_1, stream); break;
+                case 2048: launch_quantize_x_q8_1<2048>(x_f32, x_q8_1, stream); break;
+                case 3072: launch_quantize_x_q8_1<3072>(x_f32, x_q8_1, stream); break;
+                default:   return false;
+            }
+
+            // Cache invalidate: fused dispatch wrote a fresh staging buffer
+            // for src1; subsequent same-src1 hits use it via the cache path.
+            g_cached_src1   = e.src1;
+            g_cached_src1_K = e.K;
+
+            // Resolve data pointers lazily — ggml's allocator fills ->data
+            // during dispatch, not at graph_begin time.
+            void *       y_q = e.q_node ? e.q_node->data : nullptr;
+            void *       y_k = e.k_node ? e.k_node->data : nullptr;
+            void *       y_v = e.v_node ? e.v_node->data : nullptr;
+            const void * w_q = (e.q_node && e.q_node->src[0]) ? e.q_node->src[0]->data : nullptr;
+            const void * w_k = (e.k_node && e.k_node->src[0]) ? e.k_node->src[0]->data : nullptr;
+            const void * w_v = (e.v_node && e.v_node->src[0]) ? e.v_node->src[0]->data : nullptr;
+            const void * x_data = e.src1 ? e.src1->data : nullptr;
+
+            ++g_fusion_leader_fires;
+
+            // Bail to standalone if any required ptr isn't ready (shouldn't
+            // happen if the leader is the lowest-cgraph-index of the group,
+            // but defensive — and if a follower's data isn't ready when its
+            // own kernel would have run, we'd wrongly skip work).
+            if (!y_q || !x_data || !w_q) return false;
+            if (e.role == ROLE_LEADER_QKV && (!y_k || !y_v || !w_k || !w_v)) {
+                return false;
+            }
+            if (e.role == ROLE_LEADER_GATE_UP && (!y_k || !w_k)) {
+                return false;
+            }
+
+            if (e.role == ROLE_LEADER_QKV) {
+                if (e.K == 1024 && e.N_Q == 2048 && e.N_K == 1024 && e.N_V == 1024) {
+                    if (g_fusion_split_only) {
+                        launch_mmvq_q8_0_q8_1<1024, 2048>(
+                            static_cast<float *>(y_q),
+                            static_cast<const block_q8_0 *>(w_q),
+                            x_q8_1, stream);
+                        launch_mmvq_q8_0_q8_1<1024, 1024>(
+                            static_cast<float *>(y_k),
+                            static_cast<const block_q8_0 *>(w_k),
+                            x_q8_1, stream);
+                        launch_mmvq_q8_0_q8_1<1024, 1024>(
+                            static_cast<float *>(y_v),
+                            static_cast<const block_q8_0 *>(w_v),
+                            x_q8_1, stream);
+                    } else {
+                        launch_fused_qkv_q8_0_q8_1<1024, 2048, 1024, 1024>(
+                            static_cast<float *>(y_q),
+                            static_cast<float *>(y_k),
+                            static_cast<float *>(y_v),
+                            static_cast<const block_q8_0 *>(w_q),
+                            static_cast<const block_q8_0 *>(w_k),
+                            static_cast<const block_q8_0 *>(w_v),
+                            x_q8_1, stream);
+                    }
+                    return true;
+                }
+                return false;
+            } else if (e.role == ROLE_LEADER_GATE_UP) {
+                if (e.K == 1024 && e.N_GATE == 3072 && e.N_UP == 3072) {
+                    if (g_fusion_split_only) {
+                        launch_mmvq_q8_0_q8_1<1024, 3072>(
+                            static_cast<float *>(y_q),
+                            static_cast<const block_q8_0 *>(w_q),
+                            x_q8_1, stream);
+                        launch_mmvq_q8_0_q8_1<1024, 3072>(
+                            static_cast<float *>(y_k),
+                            static_cast<const block_q8_0 *>(w_k),
+                            x_q8_1, stream);
+                    } else {
+                        launch_fused_gate_up_q8_0_q8_1<1024, 3072, 3072>(
+                            static_cast<float *>(y_q),
+                            static_cast<float *>(y_k),
+                            static_cast<const block_q8_0 *>(w_q),
+                            static_cast<const block_q8_0 *>(w_k),
+                            x_q8_1, stream);
+                    }
+                    return true;
+                }
+                return false;
+            }
+            return false;
+        }
+    }
+
+    // Non-fused path: claim only Q8_0 × F32 → F32 at M=1 with one of our
+    // specialized (K, N) shapes.
     if (src0->type != GGML_TYPE_Q8_0)  return false;
     if (src1->type != GGML_TYPE_F32)   return false;
     if (dst->type  != GGML_TYPE_F32)   return false;
-
-    // M=1 only: src1 has shape [K, M, ...]; we want M==1.
-    if (src1->ne[1] != 1) return false;
-    // No batching for v0.
-    if (src1->ne[2] != 1 || src1->ne[3] != 1) return false;
+    if (src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) return false;
     if (dst->ne[1]  != 1 || dst->ne[2]  != 1 || dst->ne[3] != 1) return false;
 
-    // K = src0->ne[0] = src1->ne[0]. N = src0->ne[1] = dst->ne[0].
     const int64_t K = src0->ne[0];
     const int64_t N = src0->ne[1];
     if (K != src1->ne[0]) return false;
     if (N != dst->ne[0])  return false;
-
-    // Strides: we need contiguous source layout for the simple kernel.
-    // src0 row stride must be K/32 q8_0 blocks = K/32 * 34 bytes.
-    // For Phase A v0 we only handle the contiguous case.
-    if (src0->nb[0] != sizeof(block_q8_0))  return false;  // 34
-    if (src1->nb[0] != sizeof(float))       return false;  // 4
+    if (src0->nb[0] != sizeof(block_q8_0))  return false;
+    if (src1->nb[0] != sizeof(float))       return false;
     if (dst->nb[0]  != sizeof(float))       return false;
 
-    // Dispatch table: only the (K, N) pairs we have explicit instantiations
-    // for are claimed. Everything else falls through to ggml. Operates on
-    // pre-quantized Q8_1 input — caller (the hook below) handles caching
-    // the quantize-x kernel across same-input mul_mats.
     auto dispatch = [&](float * y, const block_q8_0 * w,
-                        const block_q8_1 * x_q8_1, cudaStream_t stream) -> bool {
+                        const block_q8_1 * x_q8_1) -> bool {
 #define TRY_SHAPE(K_, N_) \
         if (K == K_ && N == N_) { \
             launch_mmvq_q8_0_q8_1<K_, N_>(y, w, x_q8_1, stream); \
             return true; \
         }
-
         TRY_SHAPE(1024, 1024)
         TRY_SHAPE(1024, 2048)
         TRY_SHAPE(1024, 3072)
@@ -359,13 +683,10 @@ extern "C" bool qwen3_mul_mat_hook(
         TRY_SHAPE(2048, 3072)
         TRY_SHAPE(3072, 1024)
         TRY_SHAPE(3072, 2048)
-
 #undef TRY_SHAPE
         return false;
     };
 
-    // Probe whether the shape is in our table BEFORE allocating the staging
-    // buffer, to avoid pool churn on misses.
     bool probe = false;
     {
 #define PROBE_SHAPE(K_, N_) if (K == K_ && N == N_) probe = true;
@@ -374,44 +695,27 @@ extern "C" bool qwen3_mul_mat_hook(
         PROBE_SHAPE(3072, 1024) PROBE_SHAPE(3072, 2048)
 #undef PROBE_SHAPE
     }
+    if (!probe) return false;
 
-    if (!probe) {
-        if (s_log_budget > 0) {
-            std::fprintf(stderr, "[qwen3-megakernel] hook miss K=%lld N=%lld (skip)\n",
-                         (long long) K, (long long) N);
-            --s_log_budget;
-        }
-        return false;
-    }
-
-    if (s_log_budget > 0) {
-        std::fprintf(stderr, "[qwen3-megakernel] hook hit  K=%lld N=%lld\n",
-                     (long long) K, (long long) N);
-        --s_log_budget;
-    }
-
-    (void) ctx;  // device already set by ggml-cuda dispatcher
+    (void) ctx;
 
     block_q8_1 * x_q8_1 = g_staging.get();
-    if (!x_q8_1) {
-        return false;  // alloc failure — graceful degrade to ggml
-    }
+    if (!x_q8_1) return false;
 
-    const float *      x_f32 = static_cast<const float *>(src1->data);
-    const bool         can_reuse = g_cache_enabled
-                                && (x_f32 == g_cached_x)
-                                && (K      == g_cached_x_K);
+    const bool can_reuse = g_cache_enabled
+                        && (src1 == g_cached_src1)
+                        && (K    == g_cached_src1_K);
 
     if (!can_reuse) {
-        // Quantize x once; subsequent same-input mul_mats will skip this.
+        const float * x_f32 = static_cast<const float *>(src1->data);
         switch (K) {
             case 1024: launch_quantize_x_q8_1<1024>(x_f32, x_q8_1, stream); break;
             case 2048: launch_quantize_x_q8_1<2048>(x_f32, x_q8_1, stream); break;
             case 3072: launch_quantize_x_q8_1<3072>(x_f32, x_q8_1, stream); break;
-            default:   return false;  // shouldn't happen — probe gates K
+            default:   return false;
         }
-        g_cached_x   = x_f32;
-        g_cached_x_K = K;
+        g_cached_src1   = src1;
+        g_cached_src1_K = K;
         ++g_cache_misses;
     } else {
         ++g_cache_hits;
@@ -420,22 +724,160 @@ extern "C" bool qwen3_mul_mat_hook(
     return dispatch(
         static_cast<float *>(dst->data),
         static_cast<const block_q8_0 *>(src0->data),
-        x_q8_1,
-        stream);
+        x_q8_1);
 }
 
 // ----------------------------------------------------------------------------
 // Graph-compute-begin hook
 // ----------------------------------------------------------------------------
-//
-// ggml-cuda calls this once at the top of each ggml_backend_cuda_graph_compute.
-// We invalidate the quantize-x cache here: across graph computes, the pool
-// allocator may give the same data pointer to a different logical tensor,
-// and reusing the stale Q8_1 staging buffer would give wrong outputs.
 
-extern "C" void qwen3_graph_begin_hook(ggml_backend_cuda_context * /*ctx*/) {
-    g_cached_x   = nullptr;
-    g_cached_x_K = 0;
+namespace {
+
+// Build the fusion plan for one graph. Walks cgraph->nodes once; for each
+// MUL_MAT node that's a Q/K/V or gate/up at our shape, group by (same
+// layer-block prefix, same src1). Complete groups (3-of-3 for QKV, 2-of-2
+// for gate-up) become entries; partial groups are dropped (leader pattern
+// only fires when we can fully replace the per-op work).
+void build_fusion_plan(const ggml_cgraph * cgraph) {
+    g_fusion_plan.clear();
+    if (!g_fusion_enabled || !cgraph) return;
+
+    struct Slot {
+        ggml_tensor * nodes[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};  // q,k,v,gate,up
+        int           idx[5]   = {-1, -1, -1, -1, -1};
+    };
+    // Key = (layer-prefix string, src1 ptr). We intern the prefix into a
+    // small per-call vector so we don't allocate strings repeatedly.
+    struct Key {
+        const char *        layer_name;  // points into a node name; lifetime = this call
+        int                 layer_name_len;
+        const ggml_tensor * src1;
+        bool operator==(const Key & o) const {
+            return src1 == o.src1
+                && layer_name_len == o.layer_name_len
+                && std::strncmp(layer_name, o.layer_name, layer_name_len) == 0;
+        }
+    };
+    struct KeyHash {
+        size_t operator()(const Key & k) const {
+            // FNV-1a over the layer prefix mixed with the src1 ptr.
+            uint64_t h = 1469598103934665603ull;
+            for (int i = 0; i < k.layer_name_len; ++i) {
+                h ^= (unsigned char) k.layer_name[i];
+                h *= 1099511628211ull;
+            }
+            h ^= reinterpret_cast<uintptr_t>(k.src1);
+            h *= 1099511628211ull;
+            return (size_t) h;
+        }
+    };
+    std::unordered_map<Key, Slot, KeyHash> groups;
+
+    // ggml_cgraph is opaque from this TU; go through the public accessors.
+    ggml_cgraph * cg_mut = const_cast<ggml_cgraph *>(cgraph);
+    const int n_nodes = ggml_graph_n_nodes(cg_mut);
+    for (int i = 0; i < n_nodes; ++i) {
+        ggml_tensor * node = ggml_graph_node(cg_mut, i);
+        if (!is_q8_0_mul_mat_at_m1(node)) continue;
+        const int role = classify_weight(node->src[0]);
+        if (role < 0) continue;
+
+        const int prefix_len = layer_block_prefix_len(node->src[0]);
+        if (prefix_len == 0) continue;
+
+        Key k{node->src[0]->name, prefix_len, node->src[1]};
+        Slot & s = groups[k];
+        s.nodes[role] = node;
+        s.idx[role]   = i;
+    }
+
+    for (auto & kv : groups) {
+        Slot & s = kv.second;
+
+        // Try QKV.
+        if (g_fusion_qkv_enabled && s.nodes[0] && s.nodes[1] && s.nodes[2]) {
+            ggml_tensor * q = s.nodes[0];
+            ggml_tensor * k_n = s.nodes[1];
+            ggml_tensor * v = s.nodes[2];
+
+            // Validate shape match against our instantiation. If a future
+            // model deviates, we silently skip and the per-op path runs.
+            const int64_t K   = q->src[0]->ne[0];
+            const int64_t N_Q = q->src[0]->ne[1];
+            const int64_t N_K = k_n->src[0]->ne[1];
+            const int64_t N_V = v->src[0]->ne[1];
+            const bool shape_ok = (K == 1024 && N_Q == 2048 && N_K == 1024 && N_V == 1024);
+            if (shape_ok && k_n->src[0]->ne[0] == K && v->src[0]->ne[0] == K) {
+                int leader_role = 0;
+                int leader_idx  = s.idx[0];
+                if (s.idx[1] >= 0 && s.idx[1] < leader_idx) { leader_role = 1; leader_idx = s.idx[1]; }
+                if (s.idx[2] >= 0 && s.idx[2] < leader_idx) { leader_role = 2; leader_idx = s.idx[2]; }
+                ggml_tensor * leader = s.nodes[leader_role];
+
+                FusedEntry le{};
+                le.role   = ROLE_LEADER_QKV;
+                le.K      = K;
+                le.N_Q    = N_Q;
+                le.N_K    = N_K;
+                le.N_V    = N_V;
+                le.src1   = q->src[1];
+                le.q_node = q;
+                le.k_node = k_n;
+                le.v_node = v;
+                g_fusion_plan[leader] = le;
+
+                FusedEntry fe{};
+                fe.role = ROLE_FOLLOWER;
+                if (q     != leader) g_fusion_plan[q]   = fe;
+                if (k_n   != leader) g_fusion_plan[k_n] = fe;
+                if (v     != leader) g_fusion_plan[v]   = fe;
+                ++g_fusion_groups_built;
+            }
+        }
+
+        // Try gate/up.
+        if (g_fusion_gate_up_enabled && s.nodes[3] && s.nodes[4]) {
+            ggml_tensor * g_n = s.nodes[3];
+            ggml_tensor * u_n = s.nodes[4];
+
+            const int64_t K     = g_n->src[0]->ne[0];
+            const int64_t N_G   = g_n->src[0]->ne[1];
+            const int64_t N_U   = u_n->src[0]->ne[1];
+            const bool shape_ok = (K == 1024 && N_G == 3072 && N_U == 3072);
+            if (shape_ok && u_n->src[0]->ne[0] == K) {
+                int leader_role = 3;
+                int leader_idx  = s.idx[3];
+                if (s.idx[4] >= 0 && s.idx[4] < leader_idx) { leader_role = 4; leader_idx = s.idx[4]; }
+                ggml_tensor * leader = s.nodes[leader_role];
+
+                FusedEntry le{};
+                le.role   = ROLE_LEADER_GATE_UP;
+                le.K      = K;
+                le.N_GATE = N_G;
+                le.N_UP   = N_U;
+                le.src1   = g_n->src[1];
+                le.q_node = g_n;   // gate node in q slot
+                le.k_node = u_n;   // up   node in k slot
+                g_fusion_plan[leader] = le;
+
+                FusedEntry fe{};
+                fe.role = ROLE_FOLLOWER;
+                if (g_n != leader) g_fusion_plan[g_n] = fe;
+                if (u_n != leader) g_fusion_plan[u_n] = fe;
+                ++g_fusion_groups_built;
+            }
+        }
+    }
+}
+
+}  // namespace
+
+extern "C" void qwen3_graph_begin_hook(
+    ggml_backend_cuda_context * /*ctx*/,
+    const ggml_cgraph *         cgraph) {
+    g_cached_src1   = nullptr;
+    g_cached_src1_K = 0;
+    build_fusion_plan(cgraph);
 }
 
 // ----------------------------------------------------------------------------
@@ -454,25 +896,52 @@ bool install() {
         return false;
     }
 
-    const char * cache_env = std::getenv("QWEN3_TTS_SPECIALIZED_MMVQ_CACHE");
-    if (cache_env && cache_env[0] != '\0' && std::strcmp(cache_env, "0") != 0) {
-        g_cache_enabled = true;  // experimental, see comment above g_cache_enabled
+    if (const char * f = std::getenv("QWEN3_TTS_SPECIALIZED_MMVQ_NO_FUSION")) {
+        if (f[0] != '\0' && std::strcmp(f, "0") != 0) g_fusion_enabled = false;
+    }
+    // Multi-route fused kernel (one launch per group). Default off until
+    // numerical correctness is verified — use the safe split path otherwise.
+    if (const char * mr = std::getenv("QWEN3_TTS_SPECIALIZED_MMVQ_FUSION_MULTIROUTE")) {
+        if (mr[0] != '\0' && std::strcmp(mr, "0") != 0) g_fusion_split_only = false;
+    }
+    // QKV fusion is opt-in for experimentation (broken on this allocator).
+    if (const char * eq = std::getenv("QWEN3_TTS_SPECIALIZED_MMVQ_FUSION_QKV")) {
+        if (eq[0] != '\0' && std::strcmp(eq, "0") != 0) g_fusion_qkv_enabled = true;
+    }
+    if (const char * ng = std::getenv("QWEN3_TTS_SPECIALIZED_MMVQ_NO_FUSION_GATE_UP")) {
+        if (ng[0] != '\0' && std::strcmp(ng, "0") != 0) g_fusion_gate_up_enabled = false;
+    }
+    // Cache disable (escape hatch).
+    if (const char * nc = std::getenv("QWEN3_TTS_SPECIALIZED_MMVQ_NO_CACHE")) {
+        if (nc[0] != '\0' && std::strcmp(nc, "0") != 0) g_cache_enabled = false;
     }
 
     ggml_cuda_set_mul_mat_hook(qwen3_mul_mat_hook);
     ggml_cuda_set_graph_begin_hook(qwen3_graph_begin_hook);
     s_installed = true;
 
-    const char * verbose = std::getenv("QWEN3_TTS_SPECIALIZED_MMVQ_VERBOSE");
-    if (verbose && verbose[0] != '\0' && std::strcmp(verbose, "0") != 0) {
-        s_log_budget = 200;  // log first ~200 hook calls
+    if (const char * v = std::getenv("QWEN3_TTS_SPECIALIZED_MMVQ_VERBOSE")) {
+        if (v[0] != '\0' && std::strcmp(v, "0") != 0) s_log_budget = 200;
     }
 
+    char fusion_buf[64] = ", fusion=off";
+    if (g_fusion_enabled) {
+        std::snprintf(fusion_buf, sizeof(fusion_buf),
+                      ", fusion=%s%s%s",
+                      g_fusion_qkv_enabled     ? "qkv" : "",
+                      (g_fusion_qkv_enabled && g_fusion_gate_up_enabled) ? "+" : "",
+                      g_fusion_gate_up_enabled ? "gate-up" : "");
+        if (!g_fusion_qkv_enabled && !g_fusion_gate_up_enabled) {
+            std::snprintf(fusion_buf, sizeof(fusion_buf), ", fusion=on (no groups)");
+        }
+        if (!g_fusion_split_only) std::strncat(fusion_buf, " multi-route",
+                                               sizeof(fusion_buf) - std::strlen(fusion_buf) - 1);
+    }
     std::fprintf(stderr,
-                 "[qwen3-megakernel] Phase A specialized MMVQ installed "
-                 "(shapes 1024/2048/3072 x 1024/2048/3072%s%s)\n",
-                 g_cache_enabled ? ", cache=experimental" : "",
-                 s_log_budget > 0 ? ", verbose" : "");
+                 "[qwen3-megakernel] installed: shapes 1024/2048/3072 x 1024/2048/3072%s%s%s\n",
+                 g_cache_enabled  ? ", cache=on (src1-tensor key)" : ", cache=off",
+                 fusion_buf,
+                 s_log_budget > 0 ? ", verbose"                   : "");
     return true;
 }
 

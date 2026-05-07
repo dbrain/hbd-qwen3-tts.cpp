@@ -18,6 +18,7 @@
 // Forward declarations for the ggml types we touch — full definitions live
 // in ggml-cuda. We only need the struct names to receive opaque pointers.
 struct ggml_tensor;
+struct ggml_cgraph;
 struct ggml_backend_cuda_context;
 
 extern "C" {
@@ -33,7 +34,9 @@ typedef bool (*ggml_cuda_mul_mat_hook_fn)(
     ggml_tensor *               dst,
     cudaStream_t                stream);
 
-typedef void (*ggml_cuda_graph_begin_hook_fn)(ggml_backend_cuda_context * ctx);
+typedef void (*ggml_cuda_graph_begin_hook_fn)(
+    ggml_backend_cuda_context * ctx,
+    const ggml_cgraph *         cgraph);
 
 // Implemented in ggml-cuda.cu.
 void ggml_cuda_set_mul_mat_hook(ggml_cuda_mul_mat_hook_fn fn);
@@ -108,6 +111,35 @@ void launch_mmvq_q8_0_f32(
     const block_q8_0 * w,           // [N, K/32]
     const float *      x,           // [K]
     block_q8_1 *       x_q8_1_scratch,  // [K/32], caller-provided
+    cudaStream_t       stream);
+
+// Fused QKV: one launch produces y_q [N_Q], y_k [N_K], y_v [N_V] from a
+// shared K-dim Q8_1 staging buffer. Each block handles one output row
+// across the concatenated logical [N_Q + N_K + N_V] output. K is shared.
+//
+// All shapes (K, N_Q, N_K, N_V) compile-time. Saves 2 mmvq launches (and
+// 2 quantize_x launches, since the caller hoists x quantization) per
+// triplet vs the unfused path.
+template <int K, int N_Q, int N_K, int N_V>
+void launch_fused_qkv_q8_0_q8_1(
+    float *            y_q,
+    float *            y_k,
+    float *            y_v,
+    const block_q8_0 * w_q,
+    const block_q8_0 * w_k,
+    const block_q8_0 * w_v,
+    const block_q8_1 * x_q8_1,
+    cudaStream_t       stream);
+
+// Fused gate/up: same idea, two outputs. K is shared; N_GATE == N_UP for
+// the qwen3-tts SwiGLU shape but kept distinct for clarity.
+template <int K, int N_GATE, int N_UP>
+void launch_fused_gate_up_q8_0_q8_1(
+    float *            y_gate,
+    float *            y_up,
+    const block_q8_0 * w_gate,
+    const block_q8_0 * w_up,
+    const block_q8_1 * x_q8_1,
     cudaStream_t       stream);
 
 }  // namespace qwen3_megakernel
