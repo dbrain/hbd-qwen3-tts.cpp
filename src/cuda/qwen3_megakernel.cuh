@@ -22,12 +22,16 @@ struct ggml_backend_cuda_context;
 
 extern "C" {
 
-// Hook signature accepted by ggml-cuda.cu's dispatcher.
+// Hook signature accepted by ggml-cuda.cu's dispatcher. The stream
+// parameter is the ggml-cuda context's compute stream — must launch on
+// it (NOT stream 0) since ggml creates per-ctx streams with
+// cudaStreamNonBlocking, which don't synchronize with the legacy default.
 typedef bool (*ggml_cuda_mul_mat_hook_fn)(
     ggml_backend_cuda_context * ctx,
     const ggml_tensor *         src0,
     const ggml_tensor *         src1,
-    ggml_tensor *               dst);
+    ggml_tensor *               dst,
+    cudaStream_t                stream);
 
 // Implemented in ggml-cuda.cu.
 void ggml_cuda_set_mul_mat_hook(ggml_cuda_mul_mat_hook_fn fn);
