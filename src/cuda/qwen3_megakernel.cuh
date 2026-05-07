@@ -38,9 +38,20 @@ typedef void (*ggml_cuda_graph_begin_hook_fn)(
     ggml_backend_cuda_context * ctx,
     const ggml_cgraph *         cgraph);
 
+// Generic per-op hook. Returns true if the hook fully handled the op
+// (ggml-cuda dispatch is skipped). Used by sub-op-chain fusion: the
+// anchor op runs a fused kernel and returns true; follower ops in the
+// chain (rms_norm → mul → quantize_x; rope → set_rows; etc.) return true
+// with no kernel launch.
+typedef bool (*ggml_cuda_op_hook_fn)(
+    ggml_backend_cuda_context * ctx,
+    ggml_tensor *               dst,
+    cudaStream_t                stream);
+
 // Implemented in ggml-cuda.cu.
 void ggml_cuda_set_mul_mat_hook(ggml_cuda_mul_mat_hook_fn fn);
 void ggml_cuda_set_graph_begin_hook(ggml_cuda_graph_begin_hook_fn fn);
+void ggml_cuda_set_op_hook(ggml_cuda_op_hook_fn fn);
 
 }  // extern "C"
 
@@ -140,6 +151,40 @@ void launch_fused_gate_up_q8_0_q8_1(
     const block_q8_0 * w_gate,
     const block_q8_0 * w_up,
     const block_q8_1 * x_q8_1,
+    cudaStream_t       stream);
+
+// Fused gate-up + SiLU + mul: one launch produces the SwiGLU-activated
+// intermediate (silu(gate@x) * up@x) in a single output buffer, replacing
+// gate-mm + up-mm + silu + mul (4 launches → 1). Each block computes BOTH
+// gate-row and up-row dot products into registers, then writes
+// `silu(gate_row) * up_row` for one output column. Total work is the
+// same as the split fused-gate-up + silu + mul; we just collapse them.
+template <int K, int N_INTERMEDIATE>
+void launch_fused_gate_up_silu_q8_0_q8_1(
+    float *            y_intermediate,    // [N_INTERMEDIATE]
+    const block_q8_0 * w_gate,
+    const block_q8_0 * w_up,
+    const block_q8_1 * x_q8_1,
+    cudaStream_t       stream);
+
+// Fused (rms_norm + mul-norm-weight + quantize-x → Q8_1) — replaces 3
+// kernel launches with 1. Single block of K threads; warp-level reduction
+// for the sum-of-squares, then per-warp Q8_1 quantization. F32 norm
+// weight (the qwen3-tts norm weights load as F32; if a future GGUF stores
+// F16 norms we'll need a separate instantiation).
+//
+// K must be ≤ 1024 (single block design). Used for the per-layer
+// pre-attn-norm and pre-ffn-norm chains where the post-norm `cur`
+// is consumed only by Q/K/V or gate/up mul_mats — i.e., the F32
+// post-norm output is never read by anything else, so we can skip
+// writing it and only emit the Q8_1 staging for the downstream mul_mat
+// hook.
+template <int K>
+void launch_fused_rmsnorm_mul_quantize_q8_1(
+    const float *      x,           // [K]
+    const float *      norm_w,      // [K] — F32 norm weight
+    float              eps,
+    block_q8_1 *       y_q8_1,      // [K/32] — staging out
     cudaStream_t       stream);
 
 }  // namespace qwen3_megakernel

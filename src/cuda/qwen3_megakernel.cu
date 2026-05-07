@@ -328,6 +328,180 @@ void launch_fused_gate_up_q8_0_q8_1(
         y_gate, y_up, w_gate, w_up, x_q8_1);
 }
 
+// ----------------------------------------------------------------------------
+// Fused gate-up + SiLU + mul: one block per output column N_INTERMEDIATE,
+// computes gate_dot AND up_dot into registers, then silu(gate)*up.
+// ----------------------------------------------------------------------------
+
+template <int K, int N_INTERMEDIATE>
+__global__ void fused_gate_up_silu_q8_0_q8_1_kernel(
+    float *            __restrict__ y_intermediate,
+    const block_q8_0 * __restrict__ w_gate,
+    const block_q8_0 * __restrict__ w_up,
+    const block_q8_1 * __restrict__ x_q8_1) {
+    constexpr int K_BLOCKS    = K / 32;
+    constexpr int KB_PER_LANE = K_BLOCKS / 32;
+    static_assert(K % 32 == 0, "K must be a multiple of 32");
+    static_assert(K_BLOCKS >= 32, "K must be >= 1024");
+    static_assert(K_BLOCKS % 32 == 0, "K_BLOCKS must be multiple of warp size");
+
+    const int n = blockIdx.x;
+    if (n >= N_INTERMEDIATE) return;
+
+    const int lane = threadIdx.x;
+
+    float gate_acc = 0.0f;
+    float up_acc   = 0.0f;
+
+    #pragma unroll
+    for (int kbi = 0; kbi < KB_PER_LANE; ++kbi) {
+        const int kbx = lane + kbi * 32;
+        const block_q8_0 & wb_g = w_gate[n * K_BLOCKS + kbx];
+        const block_q8_0 & wb_u = w_up  [n * K_BLOCKS + kbx];
+        const block_q8_1 & xb   = x_q8_1[kbx];
+
+        int sumi_g = 0;
+        int sumi_u = 0;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int v_g = load_q8_0_int(wb_g.qs, j);
+            const int v_u = load_q8_0_int(wb_u.qs, j);
+            const int u   = load_q8_1_int(xb.qs, j);
+            sumi_g = __dp4a(v_g, u, sumi_g);
+            sumi_u = __dp4a(v_u, u, sumi_u);
+        }
+
+        const float d_x = __half2float(xb.d);
+        gate_acc += __half2float(wb_g.d) * d_x * (float) sumi_g;
+        up_acc   += __half2float(wb_u.d) * d_x * (float) sumi_u;
+    }
+
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        gate_acc += __shfl_xor_sync(0xffffffff, gate_acc, o);
+        up_acc   += __shfl_xor_sync(0xffffffff, up_acc,   o);
+    }
+
+    if (lane == 0) {
+        // SiLU: x * sigmoid(x) = x / (1 + exp(-x))
+        const float silu_g = gate_acc / (1.0f + expf(-gate_acc));
+        y_intermediate[n] = silu_g * up_acc;
+    }
+}
+
+template <int K, int N_INTERMEDIATE>
+void launch_fused_gate_up_silu_q8_0_q8_1(
+    float *            y_intermediate,
+    const block_q8_0 * w_gate,
+    const block_q8_0 * w_up,
+    const block_q8_1 * x_q8_1,
+    cudaStream_t       stream) {
+    fused_gate_up_silu_q8_0_q8_1_kernel<K, N_INTERMEDIATE>
+        <<<N_INTERMEDIATE, 32, 0, stream>>>(
+            y_intermediate, w_gate, w_up, x_q8_1);
+}
+
+// ----------------------------------------------------------------------------
+// Fused rms_norm + mul(norm_w) + quantize_x → Q8_1
+// ----------------------------------------------------------------------------
+//
+// Replaces the rms_norm + mul + quantize_x trio in front of every QKV /
+// gate-up fusion site with a single launch. Single block of K threads;
+// warp-level reduce for the sum-of-squares, cross-warp via smem (K/32 ≤ 32
+// ⇒ all warp-partials fit in one warp for the final reduction). After the
+// rrms scalar is broadcast through smem, each warp finishes the chain by
+// computing post = x * rrms * norm_w in registers and quantizing its
+// 32-element block into Q8_1.
+//
+// Constraint: K ≤ 1024 (one block max for the global reduction). For
+// qwen3-tts hidden=1024 this is exact-fit. The fused kernel drops the
+// F32 post-norm intermediate entirely — its only downstream consumers
+// are the Q/K/V / gate/up mul_mats, which now read the Q8_1 staging
+// directly via the cache.
+
+template <int K>
+__global__ void fused_rmsnorm_mul_quantize_q8_1_kernel(
+    const float * __restrict__ x,
+    const float * __restrict__ norm_w,
+    float                       eps,
+    block_q8_1 *  __restrict__ y) {
+    static_assert(K %  32 == 0, "K must be a multiple of 32");
+    static_assert(K <= 1024,    "single-block reduction caps K at 1024");
+    constexpr int K_BLOCKS = K / 32;
+    static_assert(K_BLOCKS <= 32, "K_BLOCKS must fit one warp for final reduction");
+
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;            // 0..K_BLOCKS-1
+    const int lane = tid & 31;
+
+    const float xv = x[tid];
+
+    // Sum of squares: warp-shuffle reduce, then cross-warp via smem.
+    float ss = xv * xv;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        ss += __shfl_xor_sync(0xffffffff, ss, o);
+    }
+
+    __shared__ float warp_ss[K_BLOCKS];
+    if (lane == 0) warp_ss[warp] = ss;
+    __syncthreads();
+
+    __shared__ float s_rrms;
+    if (warp == 0) {
+        float v = (lane < K_BLOCKS) ? warp_ss[lane] : 0.0f;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            v += __shfl_xor_sync(0xffffffff, v, o);
+        }
+        if (lane == 0) {
+            const float mean_sq = v / float(K);
+            s_rrms = rsqrtf(mean_sq + eps);
+        }
+    }
+    __syncthreads();
+
+    const float rrms = s_rrms;
+    const float w    = norm_w[tid];
+    const float post = xv * rrms * w;
+
+    // Quantize: each warp owns one Q8_1 block.
+    float amax = fabsf(post);
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
+    }
+
+    const float scale  = amax / 127.0f;
+    const float iscale = scale > 0.0f ? 1.0f / scale : 0.0f;
+
+    const int qraw     = __float2int_rn(post * iscale);
+    const int qclamped = qraw < -127 ? -127 : (qraw > 127 ? 127 : qraw);
+
+    float qsum = (float) qclamped;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        qsum += __shfl_xor_sync(0xffffffff, qsum, o);
+    }
+
+    y[warp].qs[lane] = (int8_t) qclamped;
+    if (lane == 0) {
+        y[warp].d = __float2half(scale);
+        y[warp].s = __float2half(qsum * scale);
+    }
+}
+
+template <int K>
+void launch_fused_rmsnorm_mul_quantize_q8_1(
+    const float * x,
+    const float * norm_w,
+    float         eps,
+    block_q8_1 *  y_q8_1,
+    cudaStream_t  stream) {
+    fused_rmsnorm_mul_quantize_q8_1_kernel<K><<<1, K, 0, stream>>>(
+        x, norm_w, eps, y_q8_1);
+}
+
 // Explicit instantiations for the 0.6B model. Talker and code-pred share
 // hidden=1024, intermediate=3072, n_heads=16, n_kv_heads=8, head_dim=128, so
 // QKV = (K=1024, N_Q=2048, N_K=1024, N_V=1024) and gate/up = (K=1024,
@@ -360,6 +534,13 @@ template void launch_fused_qkv_q8_0_q8_1<1024, 2048, 1024, 1024>(
 template void launch_fused_gate_up_q8_0_q8_1<1024, 3072, 3072>(
     float *, float *,
     const block_q8_0 *, const block_q8_0 *,
+    const block_q8_1 *, cudaStream_t);
+
+template void launch_fused_rmsnorm_mul_quantize_q8_1<1024>(
+    const float *, const float *, float, block_q8_1 *, cudaStream_t);
+
+template void launch_fused_gate_up_silu_q8_0_q8_1<1024, 3072>(
+    float *, const block_q8_0 *, const block_q8_0 *,
     const block_q8_1 *, cudaStream_t);
 
 // ----------------------------------------------------------------------------
@@ -457,12 +638,43 @@ struct FusedEntry {
     const ggml_tensor * q_node = nullptr;    // Q (or gate) mul_mat node
     const ggml_tensor * k_node = nullptr;    // K (or up)   mul_mat node
     const ggml_tensor * v_node = nullptr;    // V (qkv only)
+    // Gate-up + silu + mul fusion (optional — populated if a downstream
+    // silu(gate)*up chain is detected). The leader writes
+    // silu(gate)*up directly into post_silu_mul_node->data.
+    const ggml_tensor * silu_node          = nullptr;
+    const ggml_tensor * post_silu_mul_node = nullptr;
 };
 
 // Map dst tensor → fusion entry. Lifetime: one graph compute (cleared at
 // graph-begin). Lookup by raw ggml_tensor pointer.
 static std::unordered_map<const ggml_tensor *, FusedEntry> g_fusion_plan;
 static bool      g_fusion_enabled = true;
+
+// ----------------------------------------------------------------------------
+// Norm-quantize fusion (rms_norm + mul-norm-weight + quantize_x)
+// ----------------------------------------------------------------------------
+//
+// Detected per-graph: any (rms_norm → mul-with-named-norm-weight) chain
+// whose mul output feeds two-or-more Q8_0 mul_mats with the same src1 (i.e.
+// the QKV/gate-up fusion target). Anchor = the rms_norm node; follower =
+// the mul node. Op-hook fires the fused launch on the anchor, and the
+// follower no-ops; the cache (g_cached_src1) is set to the mul node so the
+// downstream QKV/gate-up leader skips its own quantize_x.
+
+struct NormQuantizeEntry {
+    const ggml_tensor * mul_node = nullptr;   // post-norm tensor; cache-key target
+    int   K   = 0;
+    float eps = 1e-5f;
+};
+
+// Anchor → entry (lookup tells op-hook to fire the fused kernel).
+static std::unordered_map<const ggml_tensor *, NormQuantizeEntry> g_norm_quantize_plan;
+// Follower set (the mul node). op-hook returns true (no-op) on lookup hit.
+static std::unordered_map<const ggml_tensor *, char>              g_norm_quantize_followers;
+static bool      g_norm_quantize_enabled = true;
+static uint64_t  g_norm_quantize_groups_built = 0;
+static uint64_t  g_norm_quantize_anchor_fires = 0;
+static uint64_t  g_norm_quantize_follower_fires = 0;
 // QKV fusion is ON. The graph-build path in tts_transformer.cpp explicitly
 // expands Q/K/V mul_mats adjacently before any consumer is built, so
 // ggml's graph allocator gives them distinct dst slots. Without that
@@ -471,6 +683,10 @@ static bool      g_fusion_enabled = true;
 // fusion that reorders the K/V launches.
 static bool      g_fusion_qkv_enabled     = true;
 static bool      g_fusion_gate_up_enabled = true;
+// Fold silu(gate) * up into the gate-up leader: each block writes
+// silu(gate@x) * up@x for one output column directly to the post-mul
+// intermediate tensor's slot. Saves silu and mul launches per layer.
+static bool      g_fusion_silu_up_enabled = true;
 // When false (default): a single multi-route kernel handles all outputs
 // from one launch (1 quantize + 1 fused kernel = 2 launches per group),
 // vs 4 launches in split mode. ~+0.04 RTF win measured on breakit.
@@ -530,6 +746,16 @@ bool is_q8_0_mul_mat_at_m1(const ggml_tensor * node) {
     return true;
 }
 
+// Recognises {attn,ffn}_norm.weight tensors. q_norm/k_norm are per-head
+// (head_dim) and use a different fusion path; intentionally excluded.
+bool is_layer_norm_weight(const ggml_tensor * t) {
+    if (!t || !t->name[0]) return false;
+    const char * n = t->name;
+    if (std::strstr(n, "attn_norm.weight")) return true;
+    if (std::strstr(n, "ffn_norm.weight"))  return true;
+    return false;
+}
+
 }  // namespace
 
 // ----------------------------------------------------------------------------
@@ -555,22 +781,30 @@ extern "C" bool qwen3_mul_mat_hook(
                 return true;
             }
 
-            // Leader: hoist quantize-x once; launch fused kernel.
+            // Leader: hoist quantize-x once; launch fused kernel. Skip
+            // quantize-x if the staging buffer is already populated for
+            // this src1 — the per-op norm-quantize fusion ran its fused
+            // launch on the same src1 just upstream and cached it.
             block_q8_1 * x_q8_1 = g_staging.get();
             if (!x_q8_1) return false;
 
-            const float * x_f32 = static_cast<const float *>(e.src1->data);
-            switch (e.K) {
-                case 1024: launch_quantize_x_q8_1<1024>(x_f32, x_q8_1, stream); break;
-                case 2048: launch_quantize_x_q8_1<2048>(x_f32, x_q8_1, stream); break;
-                case 3072: launch_quantize_x_q8_1<3072>(x_f32, x_q8_1, stream); break;
-                default:   return false;
+            const bool already_cached = g_cache_enabled
+                                     && (e.src1 == g_cached_src1)
+                                     && ((int64_t) e.K == g_cached_src1_K);
+            if (!already_cached) {
+                const float * x_f32 = static_cast<const float *>(e.src1->data);
+                switch (e.K) {
+                    case 1024: launch_quantize_x_q8_1<1024>(x_f32, x_q8_1, stream); break;
+                    case 2048: launch_quantize_x_q8_1<2048>(x_f32, x_q8_1, stream); break;
+                    case 3072: launch_quantize_x_q8_1<3072>(x_f32, x_q8_1, stream); break;
+                    default:   return false;
+                }
+                g_cached_src1   = e.src1;
+                g_cached_src1_K = e.K;
+                ++g_cache_misses;
+            } else {
+                ++g_cache_hits;
             }
-
-            // Cache invalidate: fused dispatch wrote a fresh staging buffer
-            // for src1; subsequent same-src1 hits use it via the cache path.
-            g_cached_src1   = e.src1;
-            g_cached_src1_K = e.K;
 
             // Resolve data pointers lazily — ggml's allocator fills ->data
             // during dispatch, not at graph_begin time.
@@ -643,6 +877,20 @@ extern "C" bool qwen3_mul_mat_hook(
                 return false;
             } else if (e.role == ROLE_LEADER_GATE_UP) {
                 if (e.K == 1024 && e.N_GATE == 3072 && e.N_UP == 3072) {
+                    // Fully fused gate+up+silu+mul: write the SwiGLU
+                    // intermediate (silu(gate)*up) directly into the
+                    // mul-node's allocated slot. silu and mul nodes
+                    // are op-hook followers and will no-op.
+                    if (!g_fusion_split_only && e.post_silu_mul_node) {
+                        void * y_int = e.post_silu_mul_node->data;
+                        if (!y_int) return false;
+                        launch_fused_gate_up_silu_q8_0_q8_1<1024, 3072>(
+                            static_cast<float *>(y_int),
+                            static_cast<const block_q8_0 *>(w_q),
+                            static_cast<const block_q8_0 *>(w_k),
+                            x_q8_1, stream);
+                        return true;
+                    }
                     if (g_fusion_split_only) {
                         launch_mmvq_q8_0_q8_1<1024, 3072>(
                             static_cast<float *>(y_q),
@@ -754,6 +1002,57 @@ namespace {
 // layer-block prefix, same src1). Complete groups (3-of-3 for QKV, 2-of-2
 // for gate-up) become entries; partial groups are dropped (leader pattern
 // only fires when we can fully replace the per-op work).
+// Walks the cgraph and tags every (rms_norm → mul-norm-weight) chain whose
+// post-norm output is consumed only by Q8_0 mul_mats (the QKV / gate-up
+// fusion sites) as a norm-quantize fusion site.
+void build_norm_quantize_plan(const ggml_cgraph * cgraph) {
+    g_norm_quantize_plan.clear();
+    g_norm_quantize_followers.clear();
+    if (!g_norm_quantize_enabled || !cgraph) return;
+
+    ggml_cgraph * cg_mut = const_cast<ggml_cgraph *>(cgraph);
+    const int n_nodes = ggml_graph_n_nodes(cg_mut);
+    for (int i = 0; i < n_nodes; ++i) {
+        ggml_tensor * mul_node = ggml_graph_node(cg_mut, i);
+        if (!mul_node || mul_node->op != GGML_OP_MUL) continue;
+
+        ggml_tensor * src0 = mul_node->src[0];
+        ggml_tensor * src1 = mul_node->src[1];
+        if (!src0 || !src1) continue;
+
+        // Anchor must be a rms_norm whose only consumer is this mul (we
+        // don't try to handle multi-consumer rms_norm here — the mul
+        // would still run and we'd waste the work).
+        if (src0->op != GGML_OP_RMS_NORM) continue;
+        if (!is_layer_norm_weight(src1))  continue;
+
+        // Shape check: rms_norm at K x 1 (M=1), F32, K supported.
+        ggml_tensor * x_node = src0->src[0];
+        if (!x_node) continue;
+        if (mul_node->type != GGML_TYPE_F32) continue;
+        if (src0->type    != GGML_TYPE_F32) continue;
+        if (src1->type    != GGML_TYPE_F32) continue;
+        if (x_node->type  != GGML_TYPE_F32) continue;
+
+        const int64_t K = x_node->ne[0];
+        if (mul_node->ne[1] != 1 || mul_node->ne[2] != 1 || mul_node->ne[3] != 1) continue;
+        if (K != 1024) continue;  // single-block kernel cap
+
+        // Read eps from rms_norm op_params (first F32 slot).
+        float eps = 1e-5f;
+        std::memcpy(&eps, src0->op_params, sizeof(float));
+
+        NormQuantizeEntry e{};
+        e.mul_node = mul_node;
+        e.K        = (int) K;
+        e.eps      = eps;
+        // Anchor lookup keyed on the rms_norm node ptr.
+        g_norm_quantize_plan[src0]    = e;
+        g_norm_quantize_followers[mul_node] = 1;
+        ++g_norm_quantize_groups_built;
+    }
+}
+
 void build_fusion_plan(const ggml_cgraph * cgraph) {
     g_fusion_plan.clear();
     if (!g_fusion_enabled || !cgraph) return;
@@ -874,12 +1173,48 @@ void build_fusion_plan(const ggml_cgraph * cgraph) {
                 le.src1   = g_n->src[1];
                 le.q_node = g_n;   // gate node in q slot
                 le.k_node = u_n;   // up   node in k slot
+
+                // Look for the silu(gate) and mul(silu, up) downstream.
+                // Pattern: silu->src[0] == g_n; mul->src[*] in {silu, u_n}.
+                // ggml_mul is symmetric in its two operands, so accept
+                // either order.
+                if (g_fusion_silu_up_enabled) {
+                    ggml_tensor * silu_node = nullptr;
+                    ggml_tensor * mul_node  = nullptr;
+                    for (int j = std::max(s.idx[3], s.idx[4]) + 1; j < n_nodes; ++j) {
+                        ggml_tensor * cand = ggml_graph_node(cg_mut, j);
+                        if (!cand) continue;
+                        if (cand->op == GGML_OP_UNARY
+                            && ggml_get_unary_op(cand) == GGML_UNARY_OP_SILU
+                            && cand->src[0] == g_n) {
+                            silu_node = cand;
+                            continue;
+                        }
+                        if (silu_node && cand->op == GGML_OP_MUL) {
+                            const ggml_tensor * a = cand->src[0];
+                            const ggml_tensor * b = cand->src[1];
+                            const bool match = (a == silu_node && b == u_n)
+                                            || (a == u_n      && b == silu_node);
+                            if (match) {
+                                mul_node = cand;
+                                break;
+                            }
+                        }
+                    }
+                    if (silu_node && mul_node) {
+                        le.silu_node          = silu_node;
+                        le.post_silu_mul_node = mul_node;
+                    }
+                }
+
                 g_fusion_plan[leader] = le;
 
                 FusedEntry fe{};
                 fe.role = ROLE_FOLLOWER;
                 if (g_n != leader) g_fusion_plan[g_n] = fe;
                 if (u_n != leader) g_fusion_plan[u_n] = fe;
+                if (le.silu_node)          g_fusion_plan[(ggml_tensor *) le.silu_node]          = fe;
+                if (le.post_silu_mul_node) g_fusion_plan[(ggml_tensor *) le.post_silu_mul_node] = fe;
                 ++g_fusion_groups_built;
             }
         }
@@ -894,6 +1229,74 @@ extern "C" void qwen3_graph_begin_hook(
     g_cached_src1   = nullptr;
     g_cached_src1_K = 0;
     build_fusion_plan(cgraph);
+    build_norm_quantize_plan(cgraph);
+}
+
+// ----------------------------------------------------------------------------
+// Generic per-op hook: dispatches sub-op-chain fusions
+// ----------------------------------------------------------------------------
+
+extern "C" bool qwen3_op_hook(
+    ggml_backend_cuda_context * /*ctx*/,
+    ggml_tensor *               dst,
+    cudaStream_t                stream) {
+    if (!dst) return false;
+
+    // Norm-quantize anchor lookup (the rms_norm node is the anchor).
+    if (g_norm_quantize_enabled) {
+        auto it = g_norm_quantize_plan.find(dst);
+        if (it != g_norm_quantize_plan.end()) {
+            const NormQuantizeEntry & e = it->second;
+
+            block_q8_1 * y = g_staging.get();
+            if (!y) return false;
+
+            const float * x_data = (dst->src[0]) ? static_cast<const float *>(dst->src[0]->data) : nullptr;
+            const float * w_data = (e.mul_node && e.mul_node->src[1])
+                                 ? static_cast<const float *>(e.mul_node->src[1]->data)
+                                 : nullptr;
+            if (!x_data || !w_data) return false;
+
+            switch (e.K) {
+                case 1024:
+                    launch_fused_rmsnorm_mul_quantize_q8_1<1024>(
+                        x_data, w_data, e.eps, y, stream);
+                    break;
+                default:
+                    return false;  // shouldn't reach — plan filters K
+            }
+
+            // Set cache so the downstream QKV/gate-up leader skips its
+            // own quantize_x. The cache key is the mul node — that's
+            // what the QKV/gate-up plan keyed on (the shared `cur` post-
+            // norm) when grouping their src1.
+            g_cached_src1   = e.mul_node;
+            g_cached_src1_K = e.K;
+
+            ++g_norm_quantize_anchor_fires;
+            return true;
+        }
+
+        // Follower (the mul node) — the work is already done.
+        if (g_norm_quantize_followers.count(dst)) {
+            ++g_norm_quantize_follower_fires;
+            return true;
+        }
+    }
+
+    // gate-up+silu+mul fusion — silu and mul nodes are followers in the
+    // FUSION_PLAN map (added at graph_begin). The leader (gate-mm) writes
+    // the post-silu-mul intermediate directly into mul_node->data, so
+    // running the silu/mul ops a second time would corrupt it.
+    if (g_fusion_enabled) {
+        auto it = g_fusion_plan.find(dst);
+        if (it != g_fusion_plan.end() && it->second.role == ROLE_FOLLOWER) {
+            ++g_fusion_follower_fires;
+            return true;
+        }
+    }
+
+    return false;
 }
 
 // ----------------------------------------------------------------------------
@@ -929,6 +1332,15 @@ bool install() {
     if (const char * ng = std::getenv("QWEN3_TTS_SPECIALIZED_MMVQ_NO_FUSION_GATE_UP")) {
         if (ng[0] != '\0' && std::strcmp(ng, "0") != 0) g_fusion_gate_up_enabled = false;
     }
+    // silu(gate) * up fusion (folded into gate-up leader). Default ON.
+    if (const char * ns = std::getenv("QWEN3_TTS_SPECIALIZED_MMVQ_NO_FUSION_SILU_UP")) {
+        if (ns[0] != '\0' && std::strcmp(ns, "0") != 0) g_fusion_silu_up_enabled = false;
+    }
+    // Norm-quantize fusion (rms_norm + mul-norm-w + quantize_x → Q8_1).
+    // Default ON when SPECIALIZED_MMVQ=1; kill switch is opt-out only.
+    if (const char * nn = std::getenv("QWEN3_TTS_SPECIALIZED_MMVQ_NO_FUSION_NORM_QUANT")) {
+        if (nn[0] != '\0' && std::strcmp(nn, "0") != 0) g_norm_quantize_enabled = false;
+    }
     // Cache disable (escape hatch).
     if (const char * nc = std::getenv("QWEN3_TTS_SPECIALIZED_MMVQ_NO_CACHE")) {
         if (nc[0] != '\0' && std::strcmp(nc, "0") != 0) g_cache_enabled = false;
@@ -936,13 +1348,14 @@ bool install() {
 
     ggml_cuda_set_mul_mat_hook(qwen3_mul_mat_hook);
     ggml_cuda_set_graph_begin_hook(qwen3_graph_begin_hook);
+    ggml_cuda_set_op_hook(qwen3_op_hook);
     s_installed = true;
 
     if (const char * v = std::getenv("QWEN3_TTS_SPECIALIZED_MMVQ_VERBOSE")) {
         if (v[0] != '\0' && std::strcmp(v, "0") != 0) s_log_budget = 200;
     }
 
-    char fusion_buf[64] = ", fusion=off";
+    char fusion_buf[96] = ", fusion=off";
     if (g_fusion_enabled) {
         std::snprintf(fusion_buf, sizeof(fusion_buf),
                       ", fusion=%s%s%s",
@@ -954,6 +1367,14 @@ bool install() {
         }
         if (!g_fusion_split_only) std::strncat(fusion_buf, " multi-route",
                                                sizeof(fusion_buf) - std::strlen(fusion_buf) - 1);
+        if (g_fusion_silu_up_enabled && g_fusion_gate_up_enabled) {
+            std::strncat(fusion_buf, "+silu*up",
+                         sizeof(fusion_buf) - std::strlen(fusion_buf) - 1);
+        }
+        if (g_norm_quantize_enabled) {
+            std::strncat(fusion_buf, "+norm-quant",
+                         sizeof(fusion_buf) - std::strlen(fusion_buf) - 1);
+        }
     }
     std::fprintf(stderr,
                  "[qwen3-megakernel] installed: shapes 1024/2048/3072 x 1024/2048/3072%s%s%s\n",
