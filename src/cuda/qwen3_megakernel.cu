@@ -208,11 +208,34 @@ void launch_mmvq_q8_0_f32(
     launch_mmvq_q8_0_q8_1<K, N>(y, w, x_q8_1_scratch, stream);
 }
 
-// Explicit instantiations — Phase A v0 ships only (K=1024, N=2048).
-// The other 6 shapes will be added once the v0 path is validated.
+// Explicit instantiations.
+//
+// Quantize-x: one per K. Three K values cover all known mul_mats (talker +
+// code-pred, both AR and prefill steps).
 template void launch_quantize_x_q8_1<1024>(const float *, block_q8_1 *, cudaStream_t);
-template void launch_mmvq_q8_0_q8_1<1024, 2048>(float *, const block_q8_0 *, const block_q8_1 *, cudaStream_t);
-template void launch_mmvq_q8_0_f32  <1024, 2048>(float *, const block_q8_0 *, const float *, block_q8_1 *, cudaStream_t);
+template void launch_quantize_x_q8_1<2048>(const float *, block_q8_1 *, cudaStream_t);
+template void launch_quantize_x_q8_1<3072>(const float *, block_q8_1 *, cudaStream_t);
+
+// MMVQ: K x N grid. Code-pred uses (1024, *) and (*, 1024); talker uses
+// (2048, *) and (*, 2048). intermediate=3072 brings in the wider FFN
+// projections for both. Heads (codec_head, code_pred_head) are also
+// covered when their (K, N) lands in this set — code_pred_head is
+// (1024, 2048), already here; talker codec_head depends on the model's
+// codec_vocab_size and may fall through if it's not 1024/2048/3072.
+#define INSTANTIATE_MMVQ(K_, N_) \
+    template void launch_mmvq_q8_0_q8_1<K_, N_>(float *, const block_q8_0 *, const block_q8_1 *, cudaStream_t); \
+    template void launch_mmvq_q8_0_f32  <K_, N_>(float *, const block_q8_0 *, const float *, block_q8_1 *, cudaStream_t);
+
+INSTANTIATE_MMVQ(1024, 1024)
+INSTANTIATE_MMVQ(1024, 2048)
+INSTANTIATE_MMVQ(1024, 3072)
+INSTANTIATE_MMVQ(2048, 1024)
+INSTANTIATE_MMVQ(2048, 2048)
+INSTANTIATE_MMVQ(2048, 3072)
+INSTANTIATE_MMVQ(3072, 1024)
+INSTANTIATE_MMVQ(3072, 2048)
+
+#undef INSTANTIATE_MMVQ
 
 // ----------------------------------------------------------------------------
 // Hook
@@ -264,20 +287,6 @@ struct StagingBuffer {
 // stream so a single global is fine.
 static StagingBuffer g_staging;
 
-static cudaStream_t hook_stream(ggml_backend_cuda_context * /*ctx*/) {
-    // We don't link the full ggml_backend_cuda_context layout. Use the
-    // current device's default stream — ggml's mul_mat is invoked from a
-    // path that has already set the device, and the dispatcher's compute
-    // stream is the per-context one we don't have direct access to.
-    //
-    // For correctness we synchronise on the default stream below if needed.
-    // For Phase A v0 we use stream 0 — same as the ggml-cuda compute path
-    // when no explicit stream override is in play. If this proves wrong
-    // (timing / out-of-order writes) we'll thread the stream through via a
-    // friend declaration in ggml-cuda.cu.
-    return 0;
-}
-
 // Hit-counter for boot diagnostics. The first N hits log shape + outcome;
 // after that we go silent to keep the log readable. Toggled by
 // QWEN3_TTS_SPECIALIZED_MMVQ_VERBOSE=1.
@@ -287,7 +296,8 @@ extern "C" bool qwen3_mul_mat_hook(
     ggml_backend_cuda_context * ctx,
     const ggml_tensor *         src0,
     const ggml_tensor *         src1,
-    ggml_tensor *               dst) {
+    ggml_tensor *               dst,
+    cudaStream_t                stream) {
     if (!src0 || !src1 || !dst) return false;
     if (src0->type != GGML_TYPE_Q8_0)  return false;
     if (src1->type != GGML_TYPE_F32)   return false;
@@ -312,8 +322,41 @@ extern "C" bool qwen3_mul_mat_hook(
     if (src1->nb[0] != sizeof(float))       return false;  // 4
     if (dst->nb[0]  != sizeof(float))       return false;
 
-    // Phase A v0 ships (K=1024, N=2048) only.
-    if (K != 1024 || N != 2048) {
+    // Dispatch table: only the (K, N) pairs we have explicit instantiations
+    // for are claimed. Everything else falls through to ggml.
+    auto dispatch = [&](float * y, const block_q8_0 * w, const float * x,
+                        block_q8_1 * x_q8_1, cudaStream_t stream) -> bool {
+#define TRY_SHAPE(K_, N_) \
+        if (K == K_ && N == N_) { \
+            launch_mmvq_q8_0_f32<K_, N_>(y, w, x, x_q8_1, stream); \
+            return true; \
+        }
+
+        TRY_SHAPE(1024, 1024)
+        TRY_SHAPE(1024, 2048)
+        TRY_SHAPE(1024, 3072)
+        TRY_SHAPE(2048, 1024)
+        TRY_SHAPE(2048, 2048)
+        TRY_SHAPE(2048, 3072)
+        TRY_SHAPE(3072, 1024)
+        TRY_SHAPE(3072, 2048)
+
+#undef TRY_SHAPE
+        return false;
+    };
+
+    // Probe whether the shape is in our table BEFORE allocating the staging
+    // buffer, to avoid pool churn on misses.
+    bool probe = false;
+    {
+#define PROBE_SHAPE(K_, N_) if (K == K_ && N == N_) probe = true;
+        PROBE_SHAPE(1024, 1024) PROBE_SHAPE(1024, 2048) PROBE_SHAPE(1024, 3072)
+        PROBE_SHAPE(2048, 1024) PROBE_SHAPE(2048, 2048) PROBE_SHAPE(2048, 3072)
+        PROBE_SHAPE(3072, 1024) PROBE_SHAPE(3072, 2048)
+#undef PROBE_SHAPE
+    }
+
+    if (!probe) {
         if (s_log_budget > 0) {
             std::fprintf(stderr, "[qwen3-megakernel] hook miss K=%lld N=%lld (skip)\n",
                          (long long) K, (long long) N);
@@ -328,26 +371,19 @@ extern "C" bool qwen3_mul_mat_hook(
         --s_log_budget;
     }
 
-    // Set the device, mirroring ggml-cuda's per-mul_mat behaviour. We don't
-    // touch ctx — the dispatcher already set the device when it built ctx.
-    (void) ctx;
+    (void) ctx;  // device already set by ggml-cuda dispatcher
 
     block_q8_1 * x_q8_1 = g_staging.ensure(K / 32);
     if (!x_q8_1) {
-        // Allocation failed; let ggml handle it (graceful degrade).
-        return false;
+        return false;  // graceful degrade to ggml on alloc failure
     }
 
-    cudaStream_t stream = hook_stream(ctx);
-
-    launch_mmvq_q8_0_f32<1024, 2048>(
+    return dispatch(
         static_cast<float *>(dst->data),
         static_cast<const block_q8_0 *>(src0->data),
         static_cast<const float *>(src1->data),
         x_q8_1,
         stream);
-
-    return true;
 }
 
 // ----------------------------------------------------------------------------
@@ -376,7 +412,7 @@ bool install() {
 
     std::fprintf(stderr,
                  "[qwen3-megakernel] Phase A specialized MMVQ installed "
-                 "(shapes: 1024x2048%s)\n",
+                 "(shapes: 1024/2048/3072 x 1024/2048/3072%s)\n",
                  s_log_budget > 0 ? ", verbose" : "");
     return true;
 }
