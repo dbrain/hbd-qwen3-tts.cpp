@@ -22,14 +22,46 @@
 #include "ggml.h"
 
 #include <cstdio>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
 namespace qwen3_megakernel {
+
+// Process-global mutex + talker-ctx latch protecting the megakernel
+// hooks against concurrent firing from the v9 async vocoder lever.
+//
+// The hooks are registered process-wide in ggml-cuda. With async vocoder,
+// a SEPARATE ggml-cuda backend (worker thread) also fires these hooks
+// concurrently with the talker, which:
+//   - races the unordered_map clear()/emplace()/find() in g_fusion_plan
+//     (caught: SIGSEGV in build_fusion_plan)
+//   - shares g_staging (a process-global GPU buffer) and async fused-kernel
+//     reads from it across both backends' streams (caught: CUDA illegal
+//     memory access surfacing in cudaStreamSynchronize)
+//
+// Fix: only fire the hook for the talker's ctx. graph_begin detects
+// "this cgraph is the talker's" by counting specialized Q8_0 mul_mats
+// (K∈{1024,2048,3072} × N∈{1024,2048,3072} at M=1) — only the talker
+// produces them. On a positive count, it latches g_talker_ctx = ctx
+// and rebuilds the fusion plan. On zero count it leaves both alone, so
+// the previous talker plan survives and stale-latch-after-reload self-
+// heals on the talker's next compute.
+//
+// Per-frame overhead from the mutex is sub-noise (~50 ns/lock × ~150
+// hook calls/frame × 12 fps = ~90 µs/sec).
+static std::mutex g_megakernel_mtx;
+static std::atomic<ggml_backend_cuda_context *> g_talker_ctx{nullptr};
+
+static inline bool ctx_is_talker(ggml_backend_cuda_context * ctx) {
+    return ctx != nullptr
+        && g_talker_ctx.load(std::memory_order_acquire) == ctx;
+}
 
 // ----------------------------------------------------------------------------
 // F32 → Q8_1 quantize (templated on K)
@@ -635,6 +667,18 @@ extern "C" bool qwen3_mul_mat_hook(
     cudaStream_t                stream) {
     if (!src0 || !src1 || !dst) return false;
 
+    // Only the talker's backend fires the megakernel path. The v9 async
+    // vocoder lever creates a separate ggml-cuda backend whose ctx is
+    // distinct; firing the hook there shares g_staging across two CUDA
+    // streams and triggers async memory races. Bail to ggml's default
+    // Q8_0 path — it's still fast enough for the vocoder's matmuls.
+    if (!ctx_is_talker(ctx)) return false;
+
+    // Lock for fusion-plan lookups + the leader-launch + cache update.
+    // graph_begin (the only writer of g_fusion_plan) is also locked, so
+    // concurrent dispatch within the talker's compute doesn't race.
+    std::lock_guard<std::mutex> lk(g_megakernel_mtx);
+
     // Fast path: fusion plan lookup. If this dst is part of a fused group,
     // we either launch the fused kernel (leader) or no-op (follower).
     if (g_fusion_enabled) {
@@ -1038,9 +1082,49 @@ void build_fusion_plan(const ggml_cgraph * cgraph) {
 
 }  // namespace
 
+// Decide whether this cgraph belongs to the talker's compute. Walks
+// nodes once and tests each Q8_0 mul_mat at M=1 for talker-specialized
+// (K, N) — the vocoder's matmuls are a different shape catalog
+// (dec_out_channels {768, 384, 192, 96}) and won't match. A non-zero
+// count means this is a talker compute; zero means leave the latch +
+// plan alone so a concurrent vocoder graph_begin doesn't clobber the
+// talker's in-flight state.
+namespace {
+inline bool cgraph_is_talker(const ggml_cgraph * cgraph) {
+    if (!cgraph) return false;
+    ggml_cgraph * cg_mut = const_cast<ggml_cgraph *>(cgraph);
+    const int n_nodes = ggml_graph_n_nodes(cg_mut);
+    for (int i = 0; i < n_nodes; ++i) {
+        const ggml_tensor * node = ggml_graph_node(cg_mut, i);
+        if (!is_q8_0_mul_mat_at_m1(node)) continue;
+        const int64_t K = node->src[0]->ne[0];
+        const int64_t N = node->src[0]->ne[1];
+        const bool K_ok = (K == 1024 || K == 2048 || K == 3072);
+        const bool N_ok = (N == 1024 || N == 2048 || N == 3072);
+        if (K_ok && N_ok) return true;
+    }
+    return false;
+}
+} // namespace
+
 extern "C" void qwen3_graph_begin_hook(
-    ggml_backend_cuda_context * /*ctx*/,
+    ggml_backend_cuda_context * ctx,
     const ggml_cgraph *         cgraph) {
+    std::lock_guard<std::mutex> lk(g_megakernel_mtx);
+
+    // Vocoder graphs (and any other non-talker cgraph) leave the talker's
+    // plan + latch alone — otherwise an interleaving vocoder compute
+    // would clear the plan mid-talker-AR and force every talker mul_mat
+    // to fall through to the unfused path. Only talker computes update
+    // the latch; the latch self-heals after lazy-reload (where the
+    // talker's ggml_backend_cuda_context pointer changes) on the next
+    // talker compute.
+    if (!cgraph_is_talker(cgraph)) {
+        return;
+    }
+
+    g_talker_ctx.store(ctx, std::memory_order_release);
+
     g_cached_src1   = nullptr;
     g_cached_src1_K = 0;
 
@@ -1073,12 +1157,15 @@ extern "C" void qwen3_graph_begin_hook(
 // ----------------------------------------------------------------------------
 
 extern "C" bool qwen3_op_hook(
-    ggml_backend_cuda_context * /*ctx*/,
+    ggml_backend_cuda_context * ctx,
     ggml_tensor *               dst,
     cudaStream_t                stream) {
     if (!dst) return false;
 
+    // See ctx_is_talker rationale in mul_mat_hook above.
+    if (!ctx_is_talker(ctx)) return false;
 
+    std::lock_guard<std::mutex> lk(g_megakernel_mtx);
 
     // gate-up+silu+mul fusion — silu and mul nodes are followers in the
     // FUSION_PLAN map (added at graph_begin). The leader (gate-mm) writes

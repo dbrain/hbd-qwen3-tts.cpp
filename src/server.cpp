@@ -32,6 +32,8 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <signal.h>
+#include <execinfo.h>
 
 using json = nlohmann::json;
 using namespace qwen3_tts;
@@ -587,7 +589,45 @@ static bool parse_args(int argc, char ** argv, server_params & sp) {
     return true;
 }
 
+// Signal handler that dumps a backtrace + signal info before re-raising.
+// Used to catch silent process exits (SIGSEGV, SIGABRT, SIGBUS, SIGFPE)
+// from a worker thread — without this, the abort path can swallow the
+// last fprintf and docker logs show nothing.
+extern "C" void crash_handler(int sig, siginfo_t * info, void * /*ucontext*/) {
+    void * frames[64];
+    int n = backtrace(frames, 64);
+    fprintf(stderr, "\n*** crash_handler: signal %d (%s) si_addr=%p tid=%d ***\n",
+            sig, strsignal(sig), info ? info->si_addr : nullptr, (int) gettid());
+    fflush(stderr);
+    backtrace_symbols_fd(frames, n, STDERR_FILENO);
+    fsync(STDERR_FILENO);
+    // Re-raise via default disposition so the kernel produces the right
+    // exit code (and core dump if enabled).
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void install_crash_handlers() {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = crash_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    for (int sig : {SIGSEGV, SIGABRT, SIGBUS, SIGFPE, SIGILL}) {
+        sigaction(sig, &sa, nullptr);
+    }
+}
+
 int main(int argc, char ** argv) {
+    // Unbuffered stderr so GGML_ABORT / CUDA-error messages from a worker
+    // thread reach docker logs before the abort kills the process. The
+    // default line-buffered stderr can swallow the final fprintf that
+    // identifies which op died, leaving an empty log + restart.
+    setvbuf(stderr, nullptr, _IONBF, 0);
+    setvbuf(stdout, nullptr, _IONBF, 0);
+
+    install_crash_handlers();
+
     server_params sp;
     if (!parse_args(argc, argv, sp)) {
         print_usage(argv[0]);
