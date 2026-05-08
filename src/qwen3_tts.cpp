@@ -757,18 +757,18 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
         // the host work behind the GPU work instead of blocking.
         //
         // Disable via QWEN3_TTS_NO_ASYNC_VOCODER=1.
-        // Async vocoder: keep opt-in only. With CUDA graphs ON (Phase 2
-        // default), the talker is in stream-capture mode for ~150 launches
-        // per frame. If a worker thread dispatches vocoder kernels on the
-        // SAME ggml-cuda backend's stream during that capture window, CUDA
-        // aborts with `operation not permitted when stream is capturing`.
-        // Fixing this needs the vocoder on its OWN ggml-cuda backend (own
-        // context, own streams) — the shared_backend_state cache in
-        // gguf_loader.cpp returns the same backend to both components, so
-        // their compute fires share the same stream. Until that lands, the
-        // safe default is the synchronous path.
-        static const bool s_async_vocoder = std::getenv("QWEN3_TTS_ASYNC_VOCODER") != nullptr;
-        async_voc.active = s_async_vocoder;
+        // Async vocoder default ON (v9.1+): vocoder.stream_decode runs on
+        // a worker thread on a dedicated ggml-cuda backend (own context +
+        // streams) so its compute pipelines behind the talker AR loop's
+        // host work. The dedicated backend isolates CUDA-graph capture +
+        // g_staging from the talker's backend. The megakernel hooks bail
+        // for non-talker ctx so async_voc + the megakernel don't race —
+        // see qwen3_megakernel.cu's g_talker_ctx latch.
+        //
+        // Opt OUT via QWEN3_TTS_NO_ASYNC_VOCODER=1 (e.g. for parity A/B
+        // against pre-v9.1 sync mode).
+        static const bool s_no_async_vocoder = std::getenv("QWEN3_TTS_NO_ASYNC_VOCODER") != nullptr;
+        async_voc.active = !s_no_async_vocoder;
 
         auto run_vocoder_chunk = [this, stream, &result, &stream_cb_count,
                                   &stream_cb_aborted, &async_voc, probe_every]

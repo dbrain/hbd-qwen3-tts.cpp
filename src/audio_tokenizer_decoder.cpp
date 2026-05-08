@@ -662,19 +662,23 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
         }
         fprintf(stderr, "  AudioTokenizerDecoder: forced to CPU backend (QWEN3_TTS_VOCODER_CPU=1)\n");
     } else {
-        // QWEN3_TTS_ASYNC_VOCODER=1 → request a DEDICATED ggml-cuda backend
-        // (own context + streams) so a worker thread can run stream_decode
-        // while the talker is in CUDA-graph capture mode without hitting
-        // `operation not permitted when stream is capturing`. Costs one
-        // extra ggml_backend_cuda_context (~few MiB of stream/event state)
-        // on top of the shared talker backend.
-        const bool async_vocoder = std::getenv("QWEN3_TTS_ASYNC_VOCODER") != nullptr;
+        // Default-on (v9.1+): request a DEDICATED ggml-cuda backend (own
+        // context + streams) so a worker thread can run stream_decode
+        // concurrent with the talker's CUDA-graph capture without
+        // hitting `operation not permitted when stream is capturing`,
+        // and without sharing the megakernel's g_staging across two
+        // streams. Costs one extra ggml_backend_cuda_context (~few MiB
+        // of stream/event state) on top of the shared talker backend.
+        // Opt OUT via QWEN3_TTS_NO_ASYNC_VOCODER=1 — falls back to the
+        // shared backend used pre-v9.1.
+        const bool no_async_vocoder = std::getenv("QWEN3_TTS_NO_ASYNC_VOCODER") != nullptr;
+        const bool dedicated = !no_async_vocoder;
         state_.backend = init_preferred_backend("AudioTokenizerDecoder", &error_msg_,
-                                                /*prefer_dedicated=*/ async_vocoder);
+                                                /*prefer_dedicated=*/ dedicated);
         if (!state_.backend) {
             return false;
         }
-        if (async_vocoder) {
+        if (dedicated) {
             fprintf(stderr, "  AudioTokenizerDecoder: dedicated backend (async vocoder)\n");
         }
     }
