@@ -207,11 +207,25 @@ struct tts_transformer_state {
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_sched_t sched = nullptr;
-    
+
     std::vector<uint8_t> compute_meta;
-    
+
     tts_kv_cache cache;           // Talker KV cache (28 layers)
     tts_kv_cache code_pred_cache; // Code predictor KV cache (5 layers)
+
+    // Code-pred full-AR cgraph cache (v9): the full-AR cgraph is identical
+    // across frames as long as (temperature_path, gumbel_top_k, n_ctx_kv)
+    // matches, and the model weights / KV-cache buffer pointers are stable.
+    // Caching the cgraph + ctx avoids the per-frame ~0.2 ms ggml graph build.
+    // Must use a SEPARATE compute_meta because the talker's build_step_graph
+    // re-ggml_init's over the shared state_.compute_meta between frames,
+    // which would otherwise trample the cached tensor structs.
+    std::vector<uint8_t>  cp_compute_meta;
+    struct ggml_context * cp_ctx_cached = nullptr;
+    struct ggml_cgraph  * cp_gf_cached  = nullptr;
+    bool                  cp_cache_temp_pos = false; // signature: temperature > 0?
+    int32_t               cp_cache_top_k    = 0;
+    int32_t               cp_cache_n_ctx_kv = 0;
 };
 
 // TTS Transformer class

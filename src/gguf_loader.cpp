@@ -34,17 +34,8 @@ GGUFLoader::~GGUFLoader() {
     close();
 }
 
-ggml_backend_t init_preferred_backend(const char * component_name, std::string * error_msg) {
-    if (error_msg) error_msg->clear();
-
-    std::lock_guard<std::mutex> lock(get_shared_backend_mutex());
-
-    auto & shared = get_shared_backend_state();
-    if (shared.backend) {
-        shared.ref_count++;
-        return shared.backend;
-    }
-
+static ggml_backend_t init_preferred_backend_uncached(const char * component_name,
+                                                       std::string * error_msg) {
     const char * force_cpu = std::getenv("QWEN3_TTS_FORCE_CPU");
     ggml_backend_t backend = nullptr;
     if (!(force_cpu && force_cpu[0] == '1')) {
@@ -64,6 +55,29 @@ ggml_backend_t init_preferred_backend(const char * component_name, std::string *
         const char * name = component_name ? component_name : "component";
         *error_msg = "Failed to initialize backend (IGPU/GPU/ACCEL/CPU) for " + std::string(name);
     }
+    return backend;
+}
+
+ggml_backend_t init_preferred_backend(const char * component_name, std::string * error_msg,
+                                      bool prefer_dedicated) {
+    if (error_msg) error_msg->clear();
+
+    if (prefer_dedicated) {
+        // Skip the shared cache: caller wants its own backend (separate
+        // ggml-cuda context + streams). release_preferred_backend's else
+        // branch will free the returned backend.
+        return init_preferred_backend_uncached(component_name, error_msg);
+    }
+
+    std::lock_guard<std::mutex> lock(get_shared_backend_mutex());
+
+    auto & shared = get_shared_backend_state();
+    if (shared.backend) {
+        shared.ref_count++;
+        return shared.backend;
+    }
+
+    ggml_backend_t backend = init_preferred_backend_uncached(component_name, error_msg);
 
     if (backend) {
         shared.backend = backend;

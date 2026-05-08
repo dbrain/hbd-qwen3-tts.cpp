@@ -7,12 +7,16 @@
 #include <cstring>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <fstream>
 #include <filesystem>
 #include <cstdint>
 #include <cstdlib>
 #include <algorithm>
 #include <atomic>
+#include <mutex>
+#include <queue>
+#include <thread>
 #include <type_traits>
 
 #ifdef __APPLE__
@@ -606,6 +610,40 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
     std::vector<int32_t> stream_buf;
     size_t stream_cb_count = 0;
     bool stream_cb_aborted = false;
+
+    // Async vocoder dispatch state (v9). Lives at synth() scope so the
+    // post-generate join + drain step can reach it. A struct keeps the
+    // streaming setup block tidy. Destructor signals + joins the worker
+    // unconditionally so any early synth() exit (exception, return-on-
+    // error) cannot leave a joinable std::thread alive — std::thread's
+    // destructor calls std::terminate on a joinable thread, which kills
+    // the process silently.
+    struct AsyncVocoderState {
+        struct Job {
+            std::vector<int32_t> codes;
+            int n_frames = 0;
+        };
+        std::queue<Job> q;
+        std::mutex q_mtx;
+        std::condition_variable q_cv;
+        std::atomic<bool> done{false};
+        std::atomic<bool> err{false};
+        std::string err_msg;
+        std::thread worker;
+        bool active = false;
+
+        ~AsyncVocoderState() {
+            if (worker.joinable()) {
+                {
+                    std::lock_guard<std::mutex> lk(q_mtx);
+                    done = true;
+                }
+                q_cv.notify_all();
+                worker.join();
+            }
+        }
+    };
+    AsyncVocoderState async_voc;
     if (streaming) {
         if (!decoder_loaded_) {
             int64_t t_decoder_load_start = get_time_ms();
@@ -703,9 +741,108 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
 
         stream_buf.reserve((size_t) stream->batch_size * n_cb);
         const int probe_every = probe_period();
+
+        // Async vocoder dispatch (v9): the talker AR loop pushes batched
+        // codes to a worker thread and returns immediately. Without this,
+        // every batch_size frames the talker stalls ~150 ms waiting on
+        // vocoder.stream_decode + on_pcm — ~4.7 ms/frame amortized,
+        // matching the v8 timing dump's "Other/overhead" bucket.
+        //
+        // The talker and vocoder share the same ggml CUDA backend (one
+        // refcounted shared_backend_state — see init_preferred_backend),
+        // so kernel concurrency on the GPU is limited by ggml-cuda's
+        // streams. The big win here is host-side: while vocoder kernels
+        // are still on the GPU, the talker thread builds frame N+1's
+        // cgraphs, runs sampling, dispatches embed lookups — pipelining
+        // the host work behind the GPU work instead of blocking.
+        //
+        // Disable via QWEN3_TTS_NO_ASYNC_VOCODER=1.
+        // Async vocoder: keep opt-in only. With CUDA graphs ON (Phase 2
+        // default), the talker is in stream-capture mode for ~150 launches
+        // per frame. If a worker thread dispatches vocoder kernels on the
+        // SAME ggml-cuda backend's stream during that capture window, CUDA
+        // aborts with `operation not permitted when stream is capturing`.
+        // Fixing this needs the vocoder on its OWN ggml-cuda backend (own
+        // context, own streams) — the shared_backend_state cache in
+        // gguf_loader.cpp returns the same backend to both components, so
+        // their compute fires share the same stream. Until that lands, the
+        // safe default is the synchronous path.
+        static const bool s_async_vocoder = std::getenv("QWEN3_TTS_ASYNC_VOCODER") != nullptr;
+        async_voc.active = s_async_vocoder;
+
+        auto run_vocoder_chunk = [this, stream, &result, &stream_cb_count,
+                                  &stream_cb_aborted, &async_voc, probe_every]
+                                 (AsyncVocoderState::Job && job) {
+            std::vector<float> pcm;
+            if (!audio_decoder_.stream_decode(job.codes.data(), job.n_frames, pcm)) {
+                async_voc.err_msg = "Failed to stream-decode vocoder: " +
+                                    audio_decoder_.get_error();
+                async_voc.err = true;
+                stream_cb_aborted = true;
+                return;
+            }
+            result.audio.insert(result.audio.end(), pcm.begin(), pcm.end());
+            stream_cb_count++;
+            if (!stream->on_pcm(pcm.data(), pcm.size())) {
+                async_voc.err = true;
+                stream_cb_aborted = true;
+                return;
+            }
+            if (probe_every > 0 && (int) stream_cb_count % probe_every == 0) {
+                log_vram_probe("post-chunk",
+                               (int) stream_cb_count,
+                               transformer_.get_kv_n_used(),
+                               audio_decoder_.get_stream_n_past(),
+                               transformer_, audio_decoder_);
+            }
+        };
+
+        if (async_voc.active) {
+            async_voc.worker = std::thread(
+                [&async_voc, &run_vocoder_chunk]() {
+                    // Wrap the entire worker body in try/catch: any throw out of
+                    // a std::thread lambda calls std::terminate, which kills the
+                    // process silently. on_pcm in particular can throw on a
+                    // closed httplib chunked stream (client gone). Convert any
+                    // throw into the err/err_msg signal the main thread checks
+                    // after join().
+                    try {
+                        while (true) {
+                            AsyncVocoderState::Job job;
+                            {
+                                std::unique_lock<std::mutex> lk(async_voc.q_mtx);
+                                async_voc.q_cv.wait(lk, [&] {
+                                    return !async_voc.q.empty() || async_voc.done.load();
+                                });
+                                if (async_voc.q.empty()) return; // done + drained
+                                job = std::move(async_voc.q.front());
+                                async_voc.q.pop();
+                            }
+                            run_vocoder_chunk(std::move(job));
+                            if (async_voc.err.load()) return;
+                        }
+                    } catch (const std::exception & e) {
+                        if (async_voc.err_msg.empty()) {
+                            async_voc.err_msg = std::string("vocoder worker exception: ") + e.what();
+                        }
+                        async_voc.err = true;
+                    } catch (...) {
+                        if (async_voc.err_msg.empty()) {
+                            async_voc.err_msg = "vocoder worker unknown exception";
+                        }
+                        async_voc.err = true;
+                    }
+                });
+        }
+
         transformer_.set_frame_callback(
-            [this, stream, &stream_buf, &stream_cb_count, &stream_cb_aborted, n_cb, &result, probe_every]
+            [stream, &stream_buf, &stream_cb_count, &stream_cb_aborted, n_cb,
+             &async_voc, &run_vocoder_chunk]
             (int32_t /*frame_idx*/, const int32_t * frame_codes) -> bool {
+                if (async_voc.err.load()) {
+                    stream_cb_aborted = true;
+                    return false;
+                }
                 for (int c = 0; c < n_cb; ++c) stream_buf.push_back(frame_codes[c]);
                 const int frames_buffered = (int) (stream_buf.size() / n_cb);
                 // First emit can use a smaller batch to minimise TTFB; later
@@ -714,24 +851,23 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
                                    ? stream->first_batch_size
                                    : stream->batch_size;
                 if (frames_buffered >= target) {
-                    std::vector<float> pcm;
-                    if (!audio_decoder_.stream_decode(stream_buf.data(), frames_buffered, pcm)) {
-                        stream_cb_aborted = true;
-                        return false;
-                    }
+                    AsyncVocoderState::Job job;
+                    job.codes = std::move(stream_buf);
+                    job.n_frames = frames_buffered;
                     stream_buf.clear();
-                    result.audio.insert(result.audio.end(), pcm.begin(), pcm.end());
-                    stream_cb_count++;
-                    if (!stream->on_pcm(pcm.data(), pcm.size())) {
-                        stream_cb_aborted = true;
-                        return false;
-                    }
-                    if (probe_every > 0 && (int) stream_cb_count % probe_every == 0) {
-                        log_vram_probe("post-chunk",
-                                       (int) stream_cb_count,
-                                       transformer_.get_kv_n_used(),
-                                       audio_decoder_.get_stream_n_past(),
-                                       transformer_, audio_decoder_);
+                    stream_buf.reserve((size_t) stream->batch_size * n_cb);
+                    if (async_voc.active) {
+                        {
+                            std::lock_guard<std::mutex> lk(async_voc.q_mtx);
+                            async_voc.q.push(std::move(job));
+                        }
+                        async_voc.q_cv.notify_one();
+                    } else {
+                        run_vocoder_chunk(std::move(job));
+                        if (async_voc.err.load()) {
+                            stream_cb_aborted = true;
+                            return false;
+                        }
                     }
                 }
                 return true;
@@ -797,7 +933,7 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
     }
 
     std::vector<int32_t> speech_codes;
-    if (!transformer_.generate(text_tokens.data(), (int32_t)text_tokens.size(),
+    bool generate_ok = transformer_.generate(text_tokens.data(), (int32_t)text_tokens.size(),
                                speaker_embedding, params.max_audio_tokens, speech_codes,
                                params.language_id, params.repetition_penalty,
                                params.temperature, params.top_k,
@@ -806,13 +942,34 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
                                ref_text_tokens.empty() ? nullptr : ref_text_tokens.data(),
                                (int32_t)ref_text_tokens.size(),
                                ref_codes, n_ref_frames,
-                               prefill_cache_key)) {
-        if (streaming) transformer_.set_frame_callback({});
-        result.error_msg = "Failed to generate speech codes: " + transformer_.get_error();
-        return result;
-    }
+                               prefill_cache_key);
     if (streaming) {
         transformer_.set_frame_callback({});
+        // Drain + join the async vocoder worker before any further state
+        // (result.audio, audio_decoder_'s stream KV) is touched. The worker
+        // is the only thread that mutates result.audio / stream_cb_count
+        // during streaming; joining here re-establishes the single-thread
+        // invariant for the leftover-flush block below.
+        if (async_voc.active && async_voc.worker.joinable()) {
+            {
+                std::lock_guard<std::mutex> lk(async_voc.q_mtx);
+                async_voc.done = true;
+            }
+            async_voc.q_cv.notify_all();
+            async_voc.worker.join();
+            if (async_voc.err.load()) {
+                stream_cb_aborted = true;
+                if (result.error_msg.empty() && !async_voc.err_msg.empty()) {
+                    result.error_msg = async_voc.err_msg;
+                }
+            }
+        }
+    }
+    if (!generate_ok) {
+        if (result.error_msg.empty()) {
+            result.error_msg = "Failed to generate speech codes: " + transformer_.get_error();
+        }
+        return result;
     }
     result.t_generate_ms = get_time_ms() - t_generate_start;
     result.n_prefill_tokens = transformer_.get_last_n_prefill_tokens();

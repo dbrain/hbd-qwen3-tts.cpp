@@ -662,9 +662,20 @@ bool AudioTokenizerDecoder::load_model(const std::string & model_path) {
         }
         fprintf(stderr, "  AudioTokenizerDecoder: forced to CPU backend (QWEN3_TTS_VOCODER_CPU=1)\n");
     } else {
-        state_.backend = init_preferred_backend("AudioTokenizerDecoder", &error_msg_);
+        // QWEN3_TTS_ASYNC_VOCODER=1 → request a DEDICATED ggml-cuda backend
+        // (own context + streams) so a worker thread can run stream_decode
+        // while the talker is in CUDA-graph capture mode without hitting
+        // `operation not permitted when stream is capturing`. Costs one
+        // extra ggml_backend_cuda_context (~few MiB of stream/event state)
+        // on top of the shared talker backend.
+        const bool async_vocoder = std::getenv("QWEN3_TTS_ASYNC_VOCODER") != nullptr;
+        state_.backend = init_preferred_backend("AudioTokenizerDecoder", &error_msg_,
+                                                /*prefer_dedicated=*/ async_vocoder);
         if (!state_.backend) {
             return false;
+        }
+        if (async_vocoder) {
+            fprintf(stderr, "  AudioTokenizerDecoder: dedicated backend (async vocoder)\n");
         }
     }
 

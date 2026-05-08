@@ -77,8 +77,15 @@ bool load_tensor_data_from_file(
     enum ggml_backend_dev_type preferred_backend_type
 );
 
-// Helper to initialize backend with GPU preference and CPU fallback
-ggml_backend_t init_preferred_backend(const char * component_name, std::string * error_msg);
+// Helper to initialize backend with GPU preference and CPU fallback.
+// When prefer_dedicated=true, bypasses the process-wide shared backend
+// cache and creates a fresh ggml_backend instance (its own ggml-cuda
+// context + streams). Required when a component must avoid stream-capture
+// conflicts with another component on the same device — e.g. the vocoder
+// in async-dispatch mode while the talker is in CUDA-graph capture mode.
+// release_preferred_backend handles both cached and dedicated backends.
+ggml_backend_t init_preferred_backend(const char * component_name, std::string * error_msg,
+                                      bool prefer_dedicated = false);
 void release_preferred_backend(ggml_backend_t backend);
 
 // Helper function to free model resources
