@@ -33,8 +33,11 @@ typedef bool (*ggml_cuda_mul_mat_hook_fn)(
     ggml_tensor *               dst,
     cudaStream_t                stream);
 
+typedef void (*ggml_cuda_graph_begin_hook_fn)(ggml_backend_cuda_context * ctx);
+
 // Implemented in ggml-cuda.cu.
 void ggml_cuda_set_mul_mat_hook(ggml_cuda_mul_mat_hook_fn fn);
+void ggml_cuda_set_graph_begin_hook(ggml_cuda_graph_begin_hook_fn fn);
 
 }  // extern "C"
 

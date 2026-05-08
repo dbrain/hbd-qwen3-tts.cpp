@@ -256,23 +256,19 @@ INSTANTIATE_MMVQ(3072, 2048)
 // up so all of attn_q/k/v share one quantize-x-q8_1 launch — that's a
 // meaningful reduction in launches and a candidate for v0.1.
 
-// Per-thread scratch for the Q8_1 staging buffer. Allocated lazily, kept
-// alive for the process lifetime. CUDA allocations are sticky and small
-// (max K_BLOCKS for K=3072 → 96 blocks × 36 bytes = 3.4 KiB).
+// Q8_1 staging buffer. Pre-allocated at max K=3072 (96 blocks × 36 B = 3.4 KiB)
+// on first use; never reallocated. cudaFree-on-grow would trigger UB because
+// async kernels queued on the compute stream still read from the old buffer
+// when the realloc happens.
 struct StagingBuffer {
     block_q8_1 * d_ptr   = nullptr;
     size_t       d_bytes = 0;
 
-    block_q8_1 * ensure(size_t n_blocks) {
-        const size_t need = n_blocks * sizeof(block_q8_1);
-        if (need <= d_bytes) {
-            return d_ptr;
-        }
-        if (d_ptr) {
-            cudaFree(d_ptr);
-            d_ptr = nullptr;
-            d_bytes = 0;
-        }
+    static constexpr size_t MAX_BLOCKS = 3072 / 32;  // covers K up to 3072
+
+    block_q8_1 * get() {
+        if (d_ptr) return d_ptr;
+        const size_t need = MAX_BLOCKS * sizeof(block_q8_1);
         if (cudaMalloc(&d_ptr, need) != cudaSuccess) {
             d_ptr = nullptr;
             d_bytes = 0;
@@ -286,6 +282,27 @@ struct StagingBuffer {
 // Process-wide. Mul_mat dispatch is serialised on the cuda backend's compute
 // stream so a single global is fine.
 static StagingBuffer g_staging;
+
+// Quantize-x cache. ggml's q/k/v projections all consume the same post-
+// attn-norm tensor; ffn_gate/up consume the same post-ffn-norm tensor. We
+// keep one Q8_1 staging buffer and skip the F32->Q8_1 quantize when the
+// next mul_mat's src1 has the same {data ptr, K} as the previously
+// quantized input. Cache invalidates at every graph-compute-begin
+// (qwen3_graph_begin_hook) since pool allocators may reuse the same
+// pointer for a different logical tensor across graph computes.
+//
+// Disable with QWEN3_TTS_SPECIALIZED_MMVQ_NO_CACHE=1 for A/B testing.
+// Cache infrastructure kept for future revisit but DEFAULT OFF — naive
+// "src1->data ptr match" within a single graph compute false-hits because
+// ggml's graph allocator does live-range buffer reuse: a tensor's data
+// pointer can be the same across different logical tensors within the
+// same compute, and skipping the quantize there yields stale Q8_1.
+// Re-enable via QWEN3_TTS_SPECIALIZED_MMVQ_CACHE=1 to debug further.
+static const float * g_cached_x      = nullptr;
+static int64_t       g_cached_x_K    = 0;
+static bool          g_cache_enabled = false;
+static uint64_t      g_cache_hits    = 0;
+static uint64_t      g_cache_misses  = 0;
 
 // Hit-counter for boot diagnostics. The first N hits log shape + outcome;
 // after that we go silent to keep the log readable. Toggled by
@@ -323,12 +340,14 @@ extern "C" bool qwen3_mul_mat_hook(
     if (dst->nb[0]  != sizeof(float))       return false;
 
     // Dispatch table: only the (K, N) pairs we have explicit instantiations
-    // for are claimed. Everything else falls through to ggml.
-    auto dispatch = [&](float * y, const block_q8_0 * w, const float * x,
-                        block_q8_1 * x_q8_1, cudaStream_t stream) -> bool {
+    // for are claimed. Everything else falls through to ggml. Operates on
+    // pre-quantized Q8_1 input — caller (the hook below) handles caching
+    // the quantize-x kernel across same-input mul_mats.
+    auto dispatch = [&](float * y, const block_q8_0 * w,
+                        const block_q8_1 * x_q8_1, cudaStream_t stream) -> bool {
 #define TRY_SHAPE(K_, N_) \
         if (K == K_ && N == N_) { \
-            launch_mmvq_q8_0_f32<K_, N_>(y, w, x, x_q8_1, stream); \
+            launch_mmvq_q8_0_q8_1<K_, N_>(y, w, x_q8_1, stream); \
             return true; \
         }
 
@@ -373,17 +392,50 @@ extern "C" bool qwen3_mul_mat_hook(
 
     (void) ctx;  // device already set by ggml-cuda dispatcher
 
-    block_q8_1 * x_q8_1 = g_staging.ensure(K / 32);
+    block_q8_1 * x_q8_1 = g_staging.get();
     if (!x_q8_1) {
-        return false;  // graceful degrade to ggml on alloc failure
+        return false;  // alloc failure — graceful degrade to ggml
+    }
+
+    const float *      x_f32 = static_cast<const float *>(src1->data);
+    const bool         can_reuse = g_cache_enabled
+                                && (x_f32 == g_cached_x)
+                                && (K      == g_cached_x_K);
+
+    if (!can_reuse) {
+        // Quantize x once; subsequent same-input mul_mats will skip this.
+        switch (K) {
+            case 1024: launch_quantize_x_q8_1<1024>(x_f32, x_q8_1, stream); break;
+            case 2048: launch_quantize_x_q8_1<2048>(x_f32, x_q8_1, stream); break;
+            case 3072: launch_quantize_x_q8_1<3072>(x_f32, x_q8_1, stream); break;
+            default:   return false;  // shouldn't happen — probe gates K
+        }
+        g_cached_x   = x_f32;
+        g_cached_x_K = K;
+        ++g_cache_misses;
+    } else {
+        ++g_cache_hits;
     }
 
     return dispatch(
         static_cast<float *>(dst->data),
         static_cast<const block_q8_0 *>(src0->data),
-        static_cast<const float *>(src1->data),
         x_q8_1,
         stream);
+}
+
+// ----------------------------------------------------------------------------
+// Graph-compute-begin hook
+// ----------------------------------------------------------------------------
+//
+// ggml-cuda calls this once at the top of each ggml_backend_cuda_graph_compute.
+// We invalidate the quantize-x cache here: across graph computes, the pool
+// allocator may give the same data pointer to a different logical tensor,
+// and reusing the stale Q8_1 staging buffer would give wrong outputs.
+
+extern "C" void qwen3_graph_begin_hook(ggml_backend_cuda_context * /*ctx*/) {
+    g_cached_x   = nullptr;
+    g_cached_x_K = 0;
 }
 
 // ----------------------------------------------------------------------------
@@ -402,7 +454,13 @@ bool install() {
         return false;
     }
 
+    const char * cache_env = std::getenv("QWEN3_TTS_SPECIALIZED_MMVQ_CACHE");
+    if (cache_env && cache_env[0] != '\0' && std::strcmp(cache_env, "0") != 0) {
+        g_cache_enabled = true;  // experimental, see comment above g_cache_enabled
+    }
+
     ggml_cuda_set_mul_mat_hook(qwen3_mul_mat_hook);
+    ggml_cuda_set_graph_begin_hook(qwen3_graph_begin_hook);
     s_installed = true;
 
     const char * verbose = std::getenv("QWEN3_TTS_SPECIALIZED_MMVQ_VERBOSE");
@@ -412,7 +470,8 @@ bool install() {
 
     std::fprintf(stderr,
                  "[qwen3-megakernel] Phase A specialized MMVQ installed "
-                 "(shapes: 1024/2048/3072 x 1024/2048/3072%s)\n",
+                 "(shapes 1024/2048/3072 x 1024/2048/3072%s%s)\n",
+                 g_cache_enabled ? ", cache=experimental" : "",
                  s_log_budget > 0 ? ", verbose" : "");
     return true;
 }
