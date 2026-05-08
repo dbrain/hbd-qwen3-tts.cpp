@@ -402,6 +402,147 @@ void launch_fused_gate_up_silu_q8_0_q8_1(
 }
 
 // ----------------------------------------------------------------------------
+// Per-layer post-QKV fused kernel: Q/K rms_norm + scale + RoPE + K/V set_rows
+// ----------------------------------------------------------------------------
+//
+// Single-launch replacement for the (Q-rms_norm + Q-mul + K-rms_norm +
+// K-mul + Q-rope + K-rope + K-set_rows + V-set_rows) chain. Each block
+// handles one head of one type (Q/K/V), reads its head's slice from the
+// post-QKV F32 buffers, does block-internal rms reduction, applies the
+// norm scale, does NeoX-style RoPE on (i, i+HALF) pairs via shared
+// memory, and either writes back to the F32 buffer (Q) or to the F16
+// KV cache slot at `pos` (K and V; V skips norm and rope).
+
+template <int HEAD_DIM, int N_HEADS, int N_KV_HEADS>
+__global__ void fused_qknorm_rope_setrows_f16_kernel(
+    float *       __restrict__ qcur_io,
+    const float * __restrict__ kcur_in,
+    const float * __restrict__ vcur_in,
+    const float * __restrict__ q_norm_w,
+    const float * __restrict__ k_norm_w,
+    half *        __restrict__ k_cache,
+    half *        __restrict__ v_cache,
+    const int *   __restrict__ pos_ptr,
+    float                       eps,
+    float                       theta_base) {
+    const int pos = pos_ptr[0];
+    constexpr int HALF = HEAD_DIM / 2;
+    static_assert(HEAD_DIM % 32 == 0, "HEAD_DIM must be a multiple of 32");
+    static_assert(HEAD_DIM <= 1024,   "single-block reduction caps HEAD_DIM at 1024");
+
+    const int head = blockIdx.x;
+    const int type = blockIdx.y;            // 0=Q, 1=K, 2=V
+    const int i    = threadIdx.x;            // 0..HEAD_DIM-1
+
+    if (type == 0 && head >= N_HEADS)    return;
+    if (type != 0 && head >= N_KV_HEADS) return;
+
+    // ---- V path: F32 → F16 copy into v_cache[pos][head][i].
+    if (type == 2) {
+        const float v = vcur_in[head * HEAD_DIM + i];
+        const int dst_idx = pos * (N_KV_HEADS * HEAD_DIM) + head * HEAD_DIM + i;
+        v_cache[dst_idx] = __float2half(v);
+        return;
+    }
+
+    // ---- Q/K path: rms_norm + mul(norm_w) + RoPE
+    const bool is_q = (type == 0);
+    const float * src = is_q ? (const float *) qcur_io : kcur_in;
+    const float * w_norm = is_q ? q_norm_w : k_norm_w;
+
+    const float xv = src[head * HEAD_DIM + i];
+
+    // Block reduce sum-of-squares: warp shuffle → cross-warp via smem.
+    float ss = xv * xv;
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        ss += __shfl_xor_sync(0xffffffff, ss, o);
+    }
+
+    constexpr int N_WARPS = HEAD_DIM / 32;
+    __shared__ float warp_ss[N_WARPS];
+    const int warp = i >> 5;
+    const int lane = i & 31;
+    if (lane == 0) warp_ss[warp] = ss;
+    __syncthreads();
+
+    __shared__ float s_rrms;
+    if (warp == 0) {
+        float v = (lane < N_WARPS) ? warp_ss[lane] : 0.0f;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            v += __shfl_xor_sync(0xffffffff, v, o);
+        }
+        if (lane == 0) {
+            s_rrms = rsqrtf(v / float(HEAD_DIM) + eps);
+        }
+    }
+    __syncthreads();
+
+    const float wn   = w_norm[i];
+    const float post = xv * s_rrms * wn;
+
+    // RoPE: pair (i, i+HALF). Cross via smem since the partner thread
+    // owns the other element.
+    __shared__ float post_smem[HEAD_DIM];
+    post_smem[i] = post;
+    __syncthreads();
+
+    if (i < HALF) {
+        const float x0 = post_smem[i];
+        const float x1 = post_smem[i + HALF];
+
+        const float freq  = __powf(theta_base, -float(2 * i) / float(HEAD_DIM));
+        const float angle = float(pos) * freq;
+        float       cos_a, sin_a;
+        __sincosf(angle, &sin_a, &cos_a);
+
+        const float y0 = x0 * cos_a - x1 * sin_a;
+        const float y1 = x0 * sin_a + x1 * cos_a;
+
+        if (is_q) {
+            qcur_io[head * HEAD_DIM + i]        = y0;
+            qcur_io[head * HEAD_DIM + i + HALF] = y1;
+        } else {
+            const int dst0 = pos * (N_KV_HEADS * HEAD_DIM) + head * HEAD_DIM + i;
+            const int dst1 = pos * (N_KV_HEADS * HEAD_DIM) + head * HEAD_DIM + i + HALF;
+            k_cache[dst0] = __float2half(y0);
+            k_cache[dst1] = __float2half(y1);
+        }
+    }
+}
+
+template <int HEAD_DIM, int N_HEADS, int N_KV_HEADS>
+void launch_fused_qknorm_rope_setrows_f16(
+    float *       qcur_io,
+    const float * kcur_in,
+    const float * vcur_in,
+    const float * q_norm_w,
+    const float * k_norm_w,
+    void *        k_cache_f16,
+    void *        v_cache_f16,
+    const int *   pos_ptr,
+    float         eps,
+    float         theta_base,
+    cudaStream_t  stream) {
+    constexpr int HEADS_MAX = (N_HEADS > N_KV_HEADS) ? N_HEADS : N_KV_HEADS;
+    dim3 grid(HEADS_MAX, 3, 1);
+    dim3 block(HEAD_DIM, 1, 1);
+    fused_qknorm_rope_setrows_f16_kernel<HEAD_DIM, N_HEADS, N_KV_HEADS>
+        <<<grid, block, 0, stream>>>(
+            qcur_io,
+            kcur_in,
+            vcur_in,
+            q_norm_w,
+            k_norm_w,
+            (half *) k_cache_f16,
+            (half *) v_cache_f16,
+            pos_ptr,
+            eps,
+            theta_base);
+}
+
+// ----------------------------------------------------------------------------
 // Fused rms_norm + mul(norm_w) + quantize_x → Q8_1
 // ----------------------------------------------------------------------------
 //
@@ -542,6 +683,12 @@ template void launch_fused_rmsnorm_mul_quantize_q8_1<1024>(
 template void launch_fused_gate_up_silu_q8_0_q8_1<1024, 3072>(
     float *, const block_q8_0 *, const block_q8_0 *,
     const block_q8_1 *, cudaStream_t);
+
+template void launch_fused_qknorm_rope_setrows_f16<128, 16, 8>(
+    float *, const float *, const float *,
+    const float *, const float *,
+    void *, void *,
+    const int *, float, float, cudaStream_t);
 
 // ----------------------------------------------------------------------------
 // Q8_1 staging buffer
