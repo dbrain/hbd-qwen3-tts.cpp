@@ -632,6 +632,18 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
         std::thread worker;
         bool active = false;
 
+        // Overlap accounting: sum of run_vocoder_chunk durations (= GPU/CPU
+        // work the worker actually performs) vs. the wall-clock window from
+        // first-job-enqueued to last-chunk-complete. Overlap factor =
+        // work_ms / window_ms; > 1.0 means real overlap (= win), ~ 1.0 means
+        // serialized, < 1.0 means worker idled (queue starvation).
+        std::atomic<int64_t> work_ns{0};         // sum of run_vocoder_chunk durations
+        std::atomic<int64_t> wait_ns{0};         // worker time spent blocked on q_cv (queue empty)
+        std::atomic<int>     n_chunks_run{0};
+        std::chrono::steady_clock::time_point t_first_enqueue{};
+        std::chrono::steady_clock::time_point t_last_complete{};
+        bool first_enqueue_set = false;          // protected by q_mtx
+
         ~AsyncVocoderState() {
             if (worker.joinable()) {
                 {
@@ -773,6 +785,7 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
         auto run_vocoder_chunk = [this, stream, &result, &stream_cb_count,
                                   &stream_cb_aborted, &async_voc, probe_every]
                                  (AsyncVocoderState::Job && job) {
+            const auto t_chunk_start = std::chrono::steady_clock::now();
             std::vector<float> pcm;
             if (!audio_decoder_.stream_decode(job.codes.data(), job.n_frames, pcm)) {
                 async_voc.err_msg = "Failed to stream-decode vocoder: " +
@@ -795,6 +808,12 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
                                audio_decoder_.get_stream_n_past(),
                                transformer_, audio_decoder_);
             }
+            const auto t_chunk_end = std::chrono::steady_clock::now();
+            async_voc.work_ns.fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(t_chunk_end - t_chunk_start).count(),
+                std::memory_order_relaxed);
+            async_voc.n_chunks_run.fetch_add(1, std::memory_order_relaxed);
+            async_voc.t_last_complete = t_chunk_end; // single-writer (worker thread or sync caller)
         };
 
         if (async_voc.active) {
@@ -811,9 +830,14 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
                             AsyncVocoderState::Job job;
                             {
                                 std::unique_lock<std::mutex> lk(async_voc.q_mtx);
+                                const auto t_wait_start = std::chrono::steady_clock::now();
                                 async_voc.q_cv.wait(lk, [&] {
                                     return !async_voc.q.empty() || async_voc.done.load();
                                 });
+                                async_voc.wait_ns.fetch_add(
+                                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now() - t_wait_start).count(),
+                                    std::memory_order_relaxed);
                                 if (async_voc.q.empty()) return; // done + drained
                                 job = std::move(async_voc.q.front());
                                 async_voc.q.pop();
@@ -859,10 +883,18 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
                     if (async_voc.active) {
                         {
                             std::lock_guard<std::mutex> lk(async_voc.q_mtx);
+                            if (!async_voc.first_enqueue_set) {
+                                async_voc.t_first_enqueue = std::chrono::steady_clock::now();
+                                async_voc.first_enqueue_set = true;
+                            }
                             async_voc.q.push(std::move(job));
                         }
                         async_voc.q_cv.notify_one();
                     } else {
+                        if (!async_voc.first_enqueue_set) {
+                            async_voc.t_first_enqueue = std::chrono::steady_clock::now();
+                            async_voc.first_enqueue_set = true;
+                        }
                         run_vocoder_chunk(std::move(job));
                         if (async_voc.err.load()) {
                             stream_cb_aborted = true;
@@ -1049,6 +1081,41 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
         }
         result.t_total_ms = get_time_ms() - t_total_start;
         sample_memory("synth/end");
+
+        // Streaming-path timing dump. The non-streaming print_timing block
+        // at the end of synth() never fires for streaming requests (we
+        // early-return below) — surface async-vocoder overlap + the same
+        // top-level numbers here so streaming benches don't lose visibility.
+        if (params.print_timing) {
+            const double audio_sec = result.sample_rate > 0
+                ? (double) result.audio.size() / (double) result.sample_rate : 0.0;
+            const double wall_sec = (double) result.t_total_ms / 1000.0;
+            const double realtime_factor = audio_sec > 0.0 ? wall_sec / audio_sec : 0.0;
+            const double x_realtime = wall_sec > 0.0 ? audio_sec / wall_sec : 0.0;
+            fprintf(stderr, "\nTiming (streaming):\n");
+            fprintf(stderr, "  Tokenization:    %lld ms\n", (long long)result.t_tokenize_ms);
+            fprintf(stderr, "  Speaker encode:  %lld ms\n", (long long)result.t_encode_ms);
+            fprintf(stderr, "  Code generation: %lld ms\n", (long long)result.t_generate_ms);
+            fprintf(stderr, "  Vocoder stream:  %lld ms\n", (long long)result.t_decode_ms);
+            fprintf(stderr, "  Total:           %lld ms\n", (long long)result.t_total_ms);
+            fprintf(stderr, "  Audio duration:  %.2f s\n", audio_sec);
+            fprintf(stderr, "  Throughput:      %.2fx realtime (RTF=%.3f)\n", x_realtime, realtime_factor);
+
+            const int n_chunks = async_voc.n_chunks_run.load();
+            if (n_chunks > 0 && async_voc.first_enqueue_set) {
+                const double work_ms = (double) async_voc.work_ns.load() / 1.0e6;
+                const double wait_ms = (double) async_voc.wait_ns.load() / 1.0e6;
+                const double window_ms = std::chrono::duration<double, std::milli>(
+                    async_voc.t_last_complete - async_voc.t_first_enqueue).count();
+                const double overlap = window_ms > 0.0 ? work_ms / window_ms : 0.0;
+                fprintf(stderr, "\nAsync vocoder overlap (active=%d, n_chunks=%d):\n",
+                        async_voc.active ? 1 : 0, n_chunks);
+                fprintf(stderr, "  Work:            %8.1f ms   (sum of stream_decode + on_pcm)\n", work_ms);
+                fprintf(stderr, "  Window:          %8.1f ms   (first-enqueue → last-complete)\n", window_ms);
+                fprintf(stderr, "  Worker wait:     %8.1f ms   (queue-empty stall → talker is bottleneck)\n", wait_ms);
+                fprintf(stderr, "  Overlap factor:  %8.3f      (>1.0 = concurrent with talker; ~1.0 = serial)\n", overlap);
+            }
+        }
         return result;
     }
 
@@ -1148,6 +1215,28 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
         fprintf(stderr, "  Total:           %lld ms\n", (long long)result.t_total_ms);
         fprintf(stderr, "  Audio duration:  %.2f s\n", audio_sec);
         fprintf(stderr, "  Throughput:      %.2fx realtime (RTF=%.3f)\n", x_realtime, realtime_factor);
+
+        // Async-vocoder overlap. Window = first-enqueue → last-chunk-complete.
+        // Work  = sum of stream_decode + on_pcm durations across all chunks.
+        // Overlap factor > 1.0 means real concurrency with the talker AR loop;
+        // ~ 1.0 means serialized; < 1.0 means worker stalled (queue empty).
+        // Wait time = how long the worker sat blocked on q_cv (idle) — > 0 ms
+        // here means the talker AR loop is the bottleneck and async vocoder
+        // can't earn back any more. ≈ 0 ms means vocoder is the bottleneck.
+        const int n_chunks = async_voc.n_chunks_run.load();
+        if (n_chunks > 0 && async_voc.first_enqueue_set) {
+            const double work_ms = (double) async_voc.work_ns.load() / 1.0e6;
+            const double wait_ms = (double) async_voc.wait_ns.load() / 1.0e6;
+            const double window_ms = std::chrono::duration<double, std::milli>(
+                async_voc.t_last_complete - async_voc.t_first_enqueue).count();
+            const double overlap = window_ms > 0.0 ? work_ms / window_ms : 0.0;
+            fprintf(stderr, "\nAsync vocoder overlap (active=%d, n_chunks=%d):\n",
+                    async_voc.active ? 1 : 0, n_chunks);
+            fprintf(stderr, "  Work:            %8.1f ms   (sum of stream_decode + on_pcm)\n", work_ms);
+            fprintf(stderr, "  Window:          %8.1f ms   (first-enqueue → last-complete)\n", window_ms);
+            fprintf(stderr, "  Worker wait:     %8.1f ms   (queue-empty stall → talker is bottleneck)\n", wait_ms);
+            fprintf(stderr, "  Overlap factor:  %8.3f      (>1.0 = concurrent with talker; ~1.0 = serial)\n", overlap);
+        }
         fprintf(stderr, "\nMemory:\n");
         fprintf(stderr, "  RSS start/end:   %s -> %s\n",
                 format_bytes(result.mem_rss_start_bytes).c_str(),

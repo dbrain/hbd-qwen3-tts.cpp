@@ -3489,6 +3489,13 @@ bool TTSTransformer::forward_step_sample(const float * step_embd, int32_t n_past
                             state_.ts_cache_rep_pen_active == cur_rep_pen_active &&
                             state_.ts_cache_n_ctx          == cur_n_ctx;
 
+#ifdef QWEN3_TTS_TIMING
+    if (timing_) {
+        if (use_step_cache && sig_match) timing_->talker_step_cache_hits++;
+        else if (use_step_cache)         timing_->talker_step_cache_misses++;
+    }
+#endif
+
     struct ggml_cgraph * gf = nullptr;
     if (use_step_cache) {
         if (!sig_match) {
@@ -3616,7 +3623,17 @@ bool TTSTransformer::forward_step_sample(const float * step_embd, int32_t n_past
     }
 #ifdef QWEN3_TTS_TIMING
     t1 = clk::now();
-    if (timing_) timing_->t_talker_compute_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    if (timing_) {
+        const double dt_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        timing_->t_talker_compute_ms += dt_ms;
+        timing_->talker_compute_samples_ms.push_back(dt_ms);
+        timing_->kv_n_eff_samples.push_back(kv_n_eff);
+        // ms since generate() entry, captured after talker compute. Frame
+        // index is implicit (vector position). Aligned 1:1 with the cp
+        // sample that fires immediately after this in the AR loop.
+        timing_->frame_wallclock_ms.push_back(
+            std::chrono::duration<double, std::milli>(t1 - t_gen_start_).count());
+    }
     t0 = clk::now();
 #endif
 
@@ -3955,6 +3972,12 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
                                state_.cp_cache_temp_pos == cur_temp_pos &&
                                state_.cp_cache_top_k == gumbel_top_k &&
                                state_.cp_cache_n_ctx_kv == cur_n_ctx_kv;
+#ifdef QWEN3_TTS_TIMING
+        if (timing_ && s_full_ar_cache) {
+            if (cache_hit) timing_->cp_full_ar_cache_hits++;
+            else           timing_->cp_full_ar_cache_misses++;
+        }
+#endif
         struct ggml_context * full_ar_ctx = nullptr;
         struct ggml_cgraph * gf = nullptr;
         bool owns_ctx = false;
@@ -4113,7 +4136,11 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
         }
 #ifdef QWEN3_TTS_TIMING
         t1 = clk::now();
-        if (timing_) timing_->t_code_pred_compute_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        if (timing_) {
+            const double dt_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            timing_->t_code_pred_compute_ms += dt_ms;
+            timing_->code_pred_compute_samples_ms.push_back(dt_ms);
+        }
         t0 = clk::now();
 #endif
 
@@ -4369,7 +4396,17 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
 #ifdef QWEN3_TTS_TIMING
     using clk = std::chrono::high_resolution_clock;
     tts_timing timing = {};
+    // Reserve up-front so per-call push_back is allocation-free and doesn't
+    // perturb the very thing we're measuring. max_len is the AR-loop bound
+    // (= talker frame count = code_pred call count, both 1:1 per frame).
+    if (max_len > 0) {
+        timing.talker_compute_samples_ms.reserve((size_t) max_len);
+        timing.code_pred_compute_samples_ms.reserve((size_t) max_len);
+        timing.kv_n_eff_samples.reserve((size_t) max_len);
+        timing.frame_wallclock_ms.reserve((size_t) max_len);
+    }
     auto t_gen_start = clk::now();
+    t_gen_start_ = t_gen_start;
     auto t0 = t_gen_start, t1 = t_gen_start;
     // gcc-13's -Wdangling-pointer flags this because `timing` is a stack
     // local and `timing_` is a member. We null `timing_` before generate()
@@ -4858,6 +4895,87 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     if (nf > 0) {
         fprintf(stderr, "  Throughput:         %8.1f ms/frame (%.1f frames/s)\n",
                 t.t_generate_total_ms / nf, 1000.0 * nf / t.t_generate_total_ms);
+    }
+
+    // Per-call distributions: parakeet's WHERE-IS-TIME-GOING showed a flat
+    // distribution (p50 ≈ p95 ≈ max) is the textbook signature of launch-
+    // overhead-bound work — distinguish that from compute-bound work where
+    // the tail is fat. Sums alone hide which regime we're in.
+    auto pct = [](std::vector<double> v, double q) -> double {
+        if (v.empty()) return 0.0;
+        const size_t n = v.size();
+        size_t k = (size_t) (q * (double)(n - 1));
+        if (k >= n) k = n - 1;
+        std::nth_element(v.begin(), v.begin() + k, v.end());
+        return v[k];
+    };
+    auto vmax = [](const std::vector<double> & v) -> double {
+        if (v.empty()) return 0.0;
+        double m = v[0]; for (double x : v) if (x > m) m = x; return m;
+    };
+    auto dump_dist = [&](const char * label, const std::vector<double> & v) {
+        if (v.empty()) return;
+        const double p50 = pct(v, 0.50);
+        const double p95 = pct(v, 0.95);
+        const double mx  = vmax(v);
+        double sum = 0.0; for (double x : v) sum += x;
+        const double mean = sum / (double) v.size();
+        // Flat-distribution indicator: max < 1.5 × p50 → launch-overhead-bound.
+        const char * regime = (p50 > 0.0 && mx < 1.5 * p50) ? " [flat → launch-overhead-bound]" : "";
+        fprintf(stderr, "    %-22s n=%4zu  mean=%7.3f  p50=%7.3f  p95=%7.3f  max=%7.3f ms%s\n",
+                label, v.size(), mean, p50, p95, mx, regime);
+        // First/last 5 sample preview — exposes cold-start drift and tail
+        // behaviour the percentile collapse hides.
+        const size_t edge = std::min((size_t) 5, v.size());
+        fprintf(stderr, "      first %zu: ", edge);
+        for (size_t i = 0; i < edge; ++i) fprintf(stderr, "%6.3f ", v[i]);
+        fprintf(stderr, "\n      last  %zu: ", edge);
+        for (size_t i = v.size() - edge; i < v.size(); ++i) fprintf(stderr, "%6.3f ", v[i]);
+        fprintf(stderr, "\n");
+    };
+    fprintf(stderr, "\n  Per-call distributions:\n");
+    dump_dist("Talker step compute",   t.talker_compute_samples_ms);
+    dump_dist("Code-pred full-AR",     t.code_pred_compute_samples_ms);
+
+    // Cache hit/miss accounting. Misses cost a graph rebuild + gallocr
+    // re-alloc; in steady state should be ~0 inside a kv_n_eff bucket.
+    auto dump_cache = [&](const char * label, int64_t hits, int64_t misses) {
+        const int64_t total = hits + misses;
+        if (total == 0) return;
+        const double hr = 100.0 * (double) hits / (double) total;
+        fprintf(stderr, "    %-22s hits=%5lld  miss=%5lld  hit-rate=%5.1f%%\n",
+                label, (long long) hits, (long long) misses, hr);
+    };
+    fprintf(stderr, "\n  Cgraph cache hit rates (parakeet lap-7 analogue):\n");
+    dump_cache("Talker step (v9.7)",   t.talker_step_cache_hits, t.talker_step_cache_misses);
+    dump_cache("Code-pred AR (v9.4)",  t.cp_full_ar_cache_hits,  t.cp_full_ar_cache_misses);
+
+    // Per-frame trace — opt-in via QWEN3_TTS_TRACE_PER_FRAME=1. One line per
+    // frame, prefixed [tts-trace] for easy grep. Cross-correlate against:
+    //   - kv_n_eff bucket boundaries (transitions every 256 frames at
+    //     FATTN_KQ_STRIDE) — should align with v9.7 talker step cache
+    //     misses + a measurable spike in talker_ms.
+    //   - streaming chunk-flush boundaries (every batch_size frames; default
+    //     30) — would align cp/talker spikes with vocoder dispatch.
+    //   - "CUDA graph warmup reset/complete" lines from ggml-cuda — those
+    //     have docker-log timestamps; align by wallclock_ms.
+    if (std::getenv("QWEN3_TTS_TRACE_PER_FRAME")) {
+        const size_t n_trace = std::min({
+            t.talker_compute_samples_ms.size(),
+            t.code_pred_compute_samples_ms.size(),
+            t.kv_n_eff_samples.size(),
+            t.frame_wallclock_ms.size(),
+        });
+        fprintf(stderr, "\n  Per-frame trace (n=%zu):\n", n_trace);
+        for (size_t i = 0; i < n_trace; ++i) {
+            fprintf(stderr,
+                    "[tts-trace] frame=%4zu kv_n_eff=%5d wallclock_ms=%9.3f talker_ms=%7.3f cp_ms=%7.3f\n",
+                    i,
+                    t.kv_n_eff_samples[i],
+                    t.frame_wallclock_ms[i],
+                    t.talker_compute_samples_ms[i],
+                    t.code_pred_compute_samples_ms[i]);
+        }
     }
 #endif
 

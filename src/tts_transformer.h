@@ -35,6 +35,29 @@ struct tts_timing {
     double t_talker_compute_ms = 0;       // sched_graph_compute
     double t_talker_data_ms = 0;          // tensor_set + tensor_get + reset
 
+    // Per-call samples for distribution stats (the parakeet WHERE-IS-TIME-GOING
+    // killer signal: p50 ≈ p95 → launch-overhead-bound, not compute-bound).
+    // Vectors are reserve()'d to expected n_frames so push_back is O(1) and
+    // doesn't allocate during the AR loop.
+    std::vector<double> talker_compute_samples_ms;          // per forward_step compute call
+    std::vector<double> code_pred_compute_samples_ms;       // per predict_codes_autoregressive compute call
+                                                             // (full-AR path: one call per frame covering all 14 steps)
+
+    // Per-frame trace (aligned 1:1 with the *_compute_samples_ms vectors).
+    // Captured for QWEN3_TTS_TRACE_PER_FRAME=1 cross-correlation: lets us
+    // align the fat tail in talker/cp distributions against kv_n_eff bucket
+    // transitions (every 256 frames at FATTN_KQ_STRIDE) and against
+    // streaming chunk-flush boundaries (every batch_size frames).
+    std::vector<int32_t> kv_n_eff_samples;                  // round_up(n_past+1, 256)
+    std::vector<double>  frame_wallclock_ms;                // ms since generate() entry, sampled after talker compute
+
+    // v9.7 talker step cgraph cache (kv_n_eff bucket-keyed).
+    int64_t talker_step_cache_hits = 0;
+    int64_t talker_step_cache_misses = 0;
+    // v9.4 code-pred full-AR cgraph cache.
+    int64_t cp_full_ar_cache_hits = 0;
+    int64_t cp_full_ar_cache_misses = 0;
+
     // Code predictor totals (accumulated across all frames)
     double t_code_pred_ms = 0;            // total predict_codes_autoregressive
     double t_code_pred_init_ms = 0;       // init/clear KV cache + CB0 embed lookup
@@ -686,6 +709,10 @@ private:
 
 #ifdef QWEN3_TTS_TIMING
     tts_timing * timing_ = nullptr;
+    // generate() start timestamp; forward_step uses this to record per-frame
+    // wallclock_ms (= t_now - t_gen_start_) so the trace can be aligned to
+    // streaming chunk-flush boundaries known on the synth() side.
+    std::chrono::high_resolution_clock::time_point t_gen_start_;
 #endif
 };
 
