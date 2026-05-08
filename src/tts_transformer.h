@@ -281,6 +281,32 @@ struct tts_transformer_state {
     int32_t ts_cache_top_k          = 0;
     bool    ts_cache_rep_pen_active = false;
     int32_t ts_cache_n_ctx          = 0;
+
+    // v9.8 (Stage #1 of #3b): N-step talker window cgraph cache.
+    // Same single-entry / bypass-sched layout as ts_cache_*. Active when
+    // QWEN3_TTS_TALKER_STEP_WINDOW=N (N>=2). Inside the cgraph, talker
+    // step m>=1 takes input as ggml_get_rows(model_.codec_embd,
+    // sampled_token_{m-1}) — i.e. cb0-only chaining (drops cb1..cb15 +
+    // trailing-text contributions to step_embd for inner steps). Stage 1
+    // is an empirical test for whether short-N cb0-only chaining preserves
+    // audible quality. If yes, ship as v9.8 default-on; if no, the
+    // scaffold is reusable for Stage #3 (full window with code-pred merged
+    // in, per Phase D plan).
+    //
+    // Signature mirrors ts_cache_* + adds N. Within a generate() N is
+    // fixed (env-driven), kv_n_eff is monotonic, sampling/n_ctx fixed —
+    // so at most one rebuild per kv_n_eff bucket boundary.
+    struct ggml_context * ts_win_ctx     = nullptr;
+    struct ggml_cgraph  * ts_win_gf      = nullptr;
+    ggml_gallocr_t        ts_win_galloc  = nullptr;
+    std::vector<uint8_t>  ts_win_meta;
+    int32_t ts_win_kv_n_eff       = 0;
+    int32_t ts_win_N              = 0;
+    bool    ts_win_temp_pos       = false;
+    int32_t ts_win_top_k          = 0;
+    bool    ts_win_rep_pen_active = false;
+    int32_t ts_win_n_ctx          = 0;
+    int32_t ts_win_cp_n_ctx       = 0;  // code-pred KV cache n_ctx at build (Stage #3)
 };
 
 // TTS Transformer class
@@ -377,6 +403,35 @@ public:
                              const float * gen_token_mask,
                              int32_t & sampled_token_out,
                              std::vector<float> * hidden_out = nullptr);
+
+    // v9.8 (Stage #1 of #3b): runs build_step_window_into via the same
+    // v9.7-style single-entry gallocr cache (ts_win_*). Returns N (cb0,
+    // hidden) pairs for talker steps at positions n_past_start..
+    // n_past_start+N-1.
+    //
+    // Step 0 takes `step_embd` as host-uploaded input (full 17-channel
+    // sum, host-built by caller). Steps m>=1 chain cb0-only via
+    // ggml_get_rows(codec_embd, sampled_cb0_{m-1}) inside the cgraph —
+    // dropping the cb1..cb15 + trailing-text contributions for inner
+    // steps. This is the cheap empirical test: prior frames' KV encodes
+    // their full step_embd via attention, so the talker may have enough
+    // context for the dropped channels to keep audible quality at small N.
+    //
+    // sampled_out is filled with N cb0 ids; hidden_out is sized to N
+    // entries each of length cfg.hidden_size. Updates state_.cache.n_used
+    // = n_past_start + N. Caller owns gen_token_mask buffer (single
+    // shared mask for the whole window — rep-penalty is frozen at window
+    // entry, see file-level Stage #1 notes for the gen_mask staleness
+    // trade-off at N=2 and beyond).
+    bool forward_step_window_sample(const float * step_embd,
+                                     const float * trailing_rows,
+                                     int32_t n_past_start,
+                                     int32_t N,
+                                     float temperature,
+                                     int32_t top_k,
+                                     float repetition_penalty,
+                                     const float * gen_token_mask,
+                                     std::vector<std::vector<int32_t>> & frame_codes_out);
     
     // Get hidden states from last forward pass (for code predictor)
     bool get_hidden_states(std::vector<float> & hidden) const;
@@ -553,6 +608,29 @@ private:
                                 int32_t n_past,
                                 const talker_sampling_params * sampling);
 
+    // v9.8 (Stage #1 of #3b): N-step talker window. Builds N copies of
+    // the talker step body, chained via ggml_get_rows(codec_embd,
+    // sampled_token_{m-1}) for m>=1 (cb0-only chain).
+    //
+    // Inputs (graph-level, set per call):
+    //   "inp_step_embd_0"   [hidden_size, 1]  f32 — full step_embd for step 0
+    //   "inp_pos_window"    [N]               i32 — n_past_start..n_past_start+N-1
+    //   "inp_mask_window"   [kv_n_eff, N]     f16 — column m masks [0, n_past_start+m]
+    //   "inp_gen_mask"      [V]               f32 — shared (only when rep-pen != 1)
+    //   "inp_gumbel_window" [top_k, N]        f32 — per-step slice (only when T > 0)
+    //
+    // Outputs (graph-level, per step m in [0, N)):
+    //   "sampled_token_m"   [1, 1]            i32 — cb0 sampled at step m
+    //   "hidden_states_m"   [hidden_size]     f32 — last_hidden after step m
+    //
+    // kv_n_eff = min(state_.cache.n_ctx, round_up(n_past_start + N, 256))
+    // covers all N positions in one bucket.
+    void build_step_window_into(struct ggml_context * ctx0,
+                                  struct ggml_cgraph * gf,
+                                  int32_t n_past_start,
+                                  int32_t N,
+                                  const talker_sampling_params * sampling);
+
     bool project_text_tokens(const int32_t * text_tokens, int32_t n_tokens,
                              std::vector<float> & output);
 
@@ -621,9 +699,55 @@ private:
     // Caller supplies ctx + gf so the cgraph can be cached across frames
     // (the topology depends only on temperature/top_k; data values flow
     // through the named inputs each frame).
+    //
+    // Thin wrapper around build_code_pred_full_ar_lane_into — registers
+    // graph-level inputs (inp_hidden, inp_cb0_embd, inp_pos_all,
+    // inp_mask_all, inp_gumbel_all) and calls the helper at lane=0.
+    // Behavior is byte-identical to the pre-Stage-#3 implementation.
     void build_code_pred_full_ar_graph_into(struct ggml_context * ctx0,
                                               struct ggml_cgraph * gf,
                                               float temperature, int32_t top_k);
+
+    // v9.8 Stage #3: lane-aware variant for the merged talker-window cgraph.
+    // Builds the same code-pred AR (1 prefill + 14 AR steps), but:
+    //   - Reads `hidden_2d` and `cb0_embd_2d` as INTRA-cgraph tensors
+    //     (typically the talker step's output + a get_rows on codec_embd
+    //     of the talker's sampled cb0). Caller is responsible for shaping
+    //     them as [hidden_size, 1] f32.
+    //   - Writes K/V into a LANE of the code-pred KV cache: lane m occupies
+    //     positions [m*16, m*16+15]. Implemented by ggml_view_2d-shifting
+    //     the cache base for set_rows; ROPE positions stay lane-LOCAL
+    //     (0..15) so the model behaves identically to single-lane.
+    //   - FA reads the FULL [0, kv_n_ctx) cache view; cross-lane isolation
+    //     is enforced by `mask_lane` (caller pre-builds with -INF on
+    //     other-lane positions).
+    //   - All graph-level inputs (positions, mask, Gumbel) are passed in
+    //     as already-existing tensors (typically views into window-level
+    //     inputs). The helper does NOT register any inputs of its own.
+    //
+    // Output names use printf-style format `sampled_name_fmt` with a
+    // single `%d` substitution for output_idx (0..14), e.g.
+    // "sampled_token_%d" or "sampled_lane0_cb%d". output_idx 0 = prefill
+    // = cb1; output_idx k>=1 = AR step k = cb_{k+1}.
+    // out_sampled (optional, sized 15 if non-null): receives the i32 [1,1]
+    // sampled-token tensors for output_idx 0..14 (cb1..cb15). Passing
+    // non-null lets a caller chain those tensors directly into a
+    // downstream cgraph node (e.g. the Stage #3 embed-fold's get_rows on
+    // model_.code_pred_embd[k-1]) without round-tripping through
+    // ggml_graph_get_tensor by name.
+    void build_code_pred_full_ar_lane_into(struct ggml_context * ctx0,
+                                             struct ggml_cgraph * gf,
+                                             struct ggml_tensor * hidden_2d,
+                                             struct ggml_tensor * cb0_embd_2d,
+                                             int32_t lane_idx,
+                                             int32_t kv_n_ctx,
+                                             struct ggml_tensor * pos_all,
+                                             struct ggml_tensor * mask_lane,
+                                             struct ggml_tensor * gumbel_lane,
+                                             float temperature,
+                                             int32_t top_k,
+                                             const char * sampled_name_fmt,
+                                             struct ggml_tensor ** out_sampled = nullptr);
     
     // Parse hyperparameters from GGUF
     bool parse_config(struct gguf_context * ctx);
@@ -678,6 +802,17 @@ private:
     // Sized to top_k * 15 (1 prefill + 14 AR steps) and regenerated from rng_
     // at the top of each predict_codes_autoregressive() call.
     std::vector<float> code_pred_gumbel_scratch_;
+    // v9.8: per-window scratch buffers. Talker side: win_pos_scratch_
+    // [N] i32 positions, win_mask_scratch_ [kv_n_eff * N] f16 talker mask,
+    // win_gumbel_scratch_ [top_k * N] f32 Gumbel. Code-pred side (Stage
+    // #3): win_mask_cp_scratch_ [cp_n_ctx * 14 * N] f16 per-lane mask,
+    // win_gumbel_cp_scratch_ [top_k * 15 * N] f32 Gumbel for the 15
+    // code-pred outputs of each of N lanes. Grown on demand within a synth.
+    std::vector<int32_t>     win_pos_scratch_;
+    std::vector<ggml_fp16_t> win_mask_scratch_;
+    std::vector<float>       win_gumbel_scratch_;
+    std::vector<ggml_fp16_t> win_mask_cp_scratch_;
+    std::vector<float>       win_gumbel_cp_scratch_;
     std::mt19937 rng_{std::random_device{}()};
     CoreMLCodePredictor coreml_code_predictor_;
     bool use_coreml_code_predictor_ = false;

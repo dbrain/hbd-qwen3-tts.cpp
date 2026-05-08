@@ -79,6 +79,23 @@ void TTSTransformer::unload_model() {
     state_.ts_cache_top_k          = 0;
     state_.ts_cache_rep_pen_active = false;
     state_.ts_cache_n_ctx          = 0;
+    if (state_.ts_win_ctx) {
+        ggml_free(state_.ts_win_ctx);
+        state_.ts_win_ctx = nullptr;
+    }
+    state_.ts_win_gf = nullptr;
+    if (state_.ts_win_galloc) {
+        ggml_gallocr_free(state_.ts_win_galloc);
+        state_.ts_win_galloc = nullptr;
+    }
+    state_.ts_win_meta.clear();
+    state_.ts_win_kv_n_eff       = 0;
+    state_.ts_win_N              = 0;
+    state_.ts_win_temp_pos       = false;
+    state_.ts_win_top_k          = 0;
+    state_.ts_win_rep_pen_active = false;
+    state_.ts_win_n_ctx          = 0;
+    state_.ts_win_cp_n_ctx       = 0;
     if (state_.suppress_mask_buffer) {
         ggml_backend_buffer_free(state_.suppress_mask_buffer);
         state_.suppress_mask_buffer = nullptr;
@@ -2268,6 +2285,365 @@ void TTSTransformer::build_step_graph_into(struct ggml_context * ctx0,
     }
 }
 
+// v9.8 (Stage #3 of #3b): N-step merged talker-window cgraph.
+//
+// Replaces Stage #1 (cb0-only chain — DEAD: quality breaks at N=2 because
+// the inner-step talker input loses the cb1..cb15 + trailing contributions
+// to step_embd, and the talker KV cascade from frame 2 onwards corrupts
+// the autoregressive context). Stage #3 fully merges talker + code-pred
+// + embed-fold inside the cgraph so the input to talker step m+1 is the
+// FULL 17-channel step_embd sum, computed intra-cgraph from talker_m's
+// outputs (cb0_m, hidden_m) → code-pred lane m's outputs (cb1_m..cb15_m).
+// No host roundtrip between frames within the window.
+//
+// Inputs (graph-level):
+//   "inp_step_embd_0"      [hidden_size, 1]   f32 — full step_embd for step 0
+//                                                    (host-built by caller)
+//   Talker:
+//     "inp_pos_window"     [N]                i32 — n_past_start..n_past_start+N-1
+//     "inp_mask_window"    [kv_n_eff_t, N]    f16 — column m masks [0, n_past_start+m]
+//     "inp_gen_mask"       [V]                f32 — talker rep-pen (only when active)
+//     "inp_gumbel_window"  [top_k, N]         f32 — talker Gumbel (only when T > 0)
+//   Code-pred:
+//     "inp_pos_cp"         [16]               i32 — lane-LOCAL positions (0..15);
+//                                                    same vector for every lane
+//     "inp_mask_cp"        [cp_n_ctx, 14*N]   f16 — per-lane code-pred masks;
+//                                                    column (m*14 + k) is FA mask
+//                                                    for lane m's AR step k+1
+//     "inp_gumbel_cp"      [top_k, 15*N]      f32 — code-pred Gumbel (only when T > 0);
+//                                                    column (m*15 + idx) is the
+//                                                    [top_k] slice for lane m
+//                                                    output_idx idx (0=cb1..14=cb15)
+//   Embed-fold (only when N >= 2):
+//     "inp_trailing_window" [hidden_size, N-1] f32 — trailing rows for inner steps;
+//                                                     row m is for the embed-fold
+//                                                     between talker steps m and m+1
+//
+// Outputs (graph-level, per step m in [0, N)):
+//   "sampled_talker_m"     [1, 1]             i32 — cb0 sampled by talker step m
+//   "sampled_lane{m}_cb{0..14}" [1, 1]        i32 — cb1..cb15 from lane m's code-pred
+//                                                    (output_idx 0 names "cb0",
+//                                                     model semantically cb1; idx 14
+//                                                     = "cb14" / model cb15)
+//
+// Lane KV layout: lane m occupies code-pred KV cache slots [m*16, m*16+15].
+// Caller (forward_step_window_sample) is responsible for sizing
+// state_.code_pred_cache.n_ctx >= N*16 BEFORE this builder runs.
+//
+// Cache key (in forward_step_window_sample): (kv_n_eff_t, N, temp_pos,
+// top_k, rep_pen_active, talker_n_ctx, cp_n_ctx). cp_n_ctx is included
+// because it changes the bake-in shape of all code-pred K/V views.
+//
+// Must be kept in sync with build_step_graph_into (per-layer talker body)
+// and build_code_pred_full_ar_lane_into (called once per lane).
+void TTSTransformer::build_step_window_into(struct ggml_context * ctx0,
+                                              struct ggml_cgraph * gf,
+                                              int32_t n_past_start,
+                                              int32_t N,
+                                              const talker_sampling_params * sampling) {
+    GGML_ASSERT(N >= 1);
+    GGML_ASSERT(sampling && sampling->active &&
+                "build_step_window_into requires sampling ON (chained "
+                "talker get_rows + code-pred lanes consume sampled "
+                "tensors as graph leaves)");
+
+    const auto & cfg = model_.config;
+    const int n_head = cfg.n_attention_heads;
+    const int n_kv_head = cfg.n_key_value_heads;
+    const int head_dim = cfg.head_dim;
+    const int hidden_size = cfg.hidden_size;
+    const float eps = cfg.rms_norm_eps;
+    const float rope_theta = cfg.rope_theta;
+    const int n_layer = cfg.n_layers;
+    const int n_tokens = 1;
+    constexpr int32_t kFattnKqStride = 256;
+    constexpr int kNArSteps = 14;
+    constexpr int kNOutputs = 15;  // cb1..cb15 from code-pred lane
+
+    const int32_t kv_n_eff = std::min(
+        state_.cache.n_ctx,
+        ((n_past_start + N + kFattnKqStride - 1) / kFattnKqStride) * kFattnKqStride);
+
+    const int32_t cp_n_ctx = state_.code_pred_cache.n_ctx;
+    GGML_ASSERT(cp_n_ctx >= N * 16 &&
+                "code-pred KV cache must be sized for N lanes; caller "
+                "must grow_kv_cache for code_pred_cache before launching "
+                "the window");
+
+    const float  rep_pen        = sampling->repetition_penalty;
+    const bool   has_rep_pen    = (rep_pen != 1.0f);
+    const float  T              = sampling->temperature;
+    const bool   has_temp       = (T > 0.0f);
+    const int32_t V             = cfg.codec_vocab_size;
+    const int32_t top_k         = sampling->top_k;
+    const float  KQscale        = 1.0f / sqrtf(float(head_dim));
+
+    // === Window-level inputs ===
+    struct ggml_tensor * inp_step_embd_0 = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hidden_size, 1);
+    ggml_set_name(inp_step_embd_0, "inp_step_embd_0");
+    ggml_set_input(inp_step_embd_0);
+
+    // Talker:
+    struct ggml_tensor * inp_pos_window = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, N);
+    ggml_set_name(inp_pos_window, "inp_pos_window");
+    ggml_set_input(inp_pos_window);
+
+    struct ggml_tensor * inp_mask_window = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, kv_n_eff, N);
+    ggml_set_name(inp_mask_window, "inp_mask_window");
+    ggml_set_input(inp_mask_window);
+
+    struct ggml_tensor * inp_gen_mask_shared = nullptr;
+    if (has_rep_pen) {
+        inp_gen_mask_shared = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, V);
+        ggml_set_name(inp_gen_mask_shared, "inp_gen_mask");
+        ggml_set_input(inp_gen_mask_shared);
+    }
+
+    struct ggml_tensor * inp_gumbel_window = nullptr;
+    if (has_temp) {
+        inp_gumbel_window = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, top_k, N);
+        ggml_set_name(inp_gumbel_window, "inp_gumbel_window");
+        ggml_set_input(inp_gumbel_window);
+    }
+
+    // Code-pred:
+    struct ggml_tensor * inp_pos_cp = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 16);
+    ggml_set_name(inp_pos_cp, "inp_pos_cp");
+    ggml_set_input(inp_pos_cp);
+
+    struct ggml_tensor * inp_mask_cp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, cp_n_ctx, kNArSteps * N);
+    ggml_set_name(inp_mask_cp, "inp_mask_cp");
+    ggml_set_input(inp_mask_cp);
+
+    struct ggml_tensor * inp_gumbel_cp = nullptr;
+    if (has_temp) {
+        inp_gumbel_cp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, top_k, kNOutputs * N);
+        ggml_set_name(inp_gumbel_cp, "inp_gumbel_cp");
+        ggml_set_input(inp_gumbel_cp);
+    }
+
+    // Embed-fold trailing rows: only needed for inner steps (m=0..N-2).
+    struct ggml_tensor * inp_trailing_window = nullptr;
+    if (N >= 2) {
+        inp_trailing_window = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hidden_size, N - 1);
+        ggml_set_name(inp_trailing_window, "inp_trailing_window");
+        ggml_set_input(inp_trailing_window);
+    }
+
+    // Per-lane / per-step view helpers.
+    auto pos_window_step = [&](int m) {
+        return ggml_view_1d(ctx0, inp_pos_window, 1, (size_t) m * sizeof(int32_t));
+    };
+    auto mask_window_step = [&](int m) {
+        return ggml_view_2d(ctx0, inp_mask_window, kv_n_eff, 1,
+                             (size_t) kv_n_eff * sizeof(ggml_fp16_t),
+                             (size_t) m * kv_n_eff * sizeof(ggml_fp16_t));
+    };
+    auto gumbel_window_step = [&](int m) -> struct ggml_tensor * {
+        if (!inp_gumbel_window) return nullptr;
+        return ggml_view_2d(ctx0, inp_gumbel_window, top_k, 1,
+                             (size_t) top_k * sizeof(float),
+                             (size_t) m * top_k * sizeof(float));
+    };
+    auto mask_cp_lane = [&](int m) {
+        return ggml_view_2d(ctx0, inp_mask_cp, cp_n_ctx, kNArSteps,
+                             (size_t) cp_n_ctx * sizeof(ggml_fp16_t),
+                             (size_t) m * kNArSteps * cp_n_ctx * sizeof(ggml_fp16_t));
+    };
+    auto gumbel_cp_lane = [&](int m) -> struct ggml_tensor * {
+        if (!inp_gumbel_cp) return nullptr;
+        return ggml_view_2d(ctx0, inp_gumbel_cp, top_k, kNOutputs,
+                             (size_t) top_k * sizeof(float),
+                             (size_t) m * kNOutputs * top_k * sizeof(float));
+    };
+    auto trailing_step = [&](int m) {
+        // Row m of inp_trailing_window (= [hidden_size, 1] view).
+        GGML_ASSERT(inp_trailing_window != nullptr);
+        return ggml_view_2d(ctx0, inp_trailing_window, hidden_size, 1,
+                             (size_t) hidden_size * sizeof(float),
+                             (size_t) m * hidden_size * sizeof(float));
+    };
+
+    // Talker step body — inlined N times. Returns (hidden, sampled_cb0).
+    // Keeps gen_mask + suppress_mask references inline; these graph-level
+    // tensors are shared across all N steps without name conflict.
+    auto build_one_talker_step = [&](struct ggml_tensor * step_input,
+                                       int m,
+                                       struct ggml_tensor *& out_hidden,
+                                       struct ggml_tensor *& out_sampled) {
+        struct ggml_tensor * pos_step  = pos_window_step(m);
+        struct ggml_tensor * mask_step = mask_window_step(m);
+
+        struct ggml_tensor * cur = step_input;
+        struct ggml_tensor * inpL = cur;
+
+        for (int il = 0; il < n_layer; ++il) {
+            const auto & layer = model_.layers[il];
+
+            cur = ggml_rms_norm(ctx0, inpL, eps);
+            cur = ggml_mul(ctx0, cur, layer.attn_norm);
+
+            struct ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.attn_q, cur);
+            struct ggml_tensor * Kcur = ggml_mul_mat(ctx0, layer.attn_k, cur);
+            struct ggml_tensor * Vcur = ggml_mul_mat(ctx0, layer.attn_v, cur);
+
+            // Q/K/V topo pin from build_step_graph_into.
+            ggml_build_forward_expand(gf, Qcur);
+            ggml_build_forward_expand(gf, Kcur);
+            ggml_build_forward_expand(gf, Vcur);
+
+            Qcur = ggml_reshape_3d(ctx0, Qcur, head_dim, n_head, n_tokens);
+            Kcur = ggml_reshape_3d(ctx0, Kcur, head_dim, n_kv_head, n_tokens);
+            Vcur = ggml_reshape_3d(ctx0, Vcur, head_dim, n_kv_head, n_tokens);
+
+            if (layer.attn_q_norm) {
+                Qcur = ggml_rms_norm(ctx0, Qcur, eps);
+                Qcur = ggml_mul(ctx0, Qcur, layer.attn_q_norm);
+            }
+            if (layer.attn_k_norm) {
+                Kcur = ggml_rms_norm(ctx0, Kcur, eps);
+                Kcur = ggml_mul(ctx0, Kcur, layer.attn_k_norm);
+            }
+
+            Qcur = ggml_rope_ext(ctx0, Qcur, pos_step, nullptr,
+                                 head_dim, GGML_ROPE_TYPE_NEOX, 0,
+                                 rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            Kcur = ggml_rope_ext(ctx0, Kcur, pos_step, nullptr,
+                                 head_dim, GGML_ROPE_TYPE_NEOX, 0,
+                                 rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+            struct ggml_tensor * k_cache = state_.cache.k_cache[il];
+            struct ggml_tensor * v_cache = state_.cache.v_cache[il];
+
+            struct ggml_tensor * k_cache_2d = ggml_view_2d(ctx0, k_cache, head_dim * n_kv_head, state_.cache.n_ctx, k_cache->nb[2], 0);
+            struct ggml_tensor * v_cache_2d = ggml_view_2d(ctx0, v_cache, head_dim * n_kv_head, state_.cache.n_ctx, v_cache->nb[2], 0);
+            struct ggml_tensor * Kcur_2d = ggml_view_2d(ctx0, Kcur, head_dim * n_kv_head, n_tokens, Kcur->nb[2], 0);
+            struct ggml_tensor * Vcur_2d = ggml_view_2d(ctx0, Vcur, head_dim * n_kv_head, n_tokens, Vcur->nb[2], 0);
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx0, k_cache_2d, Kcur_2d, pos_step));
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx0, v_cache_2d, Vcur_2d, pos_step));
+
+            struct ggml_tensor * K = ggml_view_3d(ctx0, k_cache,
+                head_dim, n_kv_head, kv_n_eff,
+                k_cache->nb[1], k_cache->nb[2], 0);
+            struct ggml_tensor * V = ggml_view_3d(ctx0, v_cache,
+                head_dim, n_kv_head, kv_n_eff,
+                v_cache->nb[1], v_cache->nb[2], 0);
+
+            struct ggml_tensor * Q = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
+            K = ggml_permute(ctx0, K, 0, 2, 1, 3);
+            V = ggml_permute(ctx0, V, 0, 2, 1, 3);
+
+            cur = ggml_flash_attn_ext(ctx0, Q, K, V, mask_step, KQscale, 0.0f, 0.0f);
+            cur = ggml_cont_2d(ctx0, cur, n_head * head_dim, 1);
+
+            cur = ggml_mul_mat(ctx0, layer.attn_output, cur);
+            cur = ggml_add(ctx0, cur, inpL);
+            struct ggml_tensor * inpFF = cur;
+
+            cur = ggml_rms_norm(ctx0, inpFF, eps);
+            cur = ggml_mul(ctx0, cur, layer.ffn_norm);
+
+            struct ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ffn_gate, cur);
+            struct ggml_tensor * up   = ggml_mul_mat(ctx0, layer.ffn_up, cur);
+
+            gate = ggml_silu(ctx0, gate);
+            cur = ggml_mul(ctx0, gate, up);
+            cur = ggml_mul_mat(ctx0, layer.ffn_down, cur);
+            inpL = ggml_add(ctx0, cur, inpFF);
+        }
+
+        cur = inpL;
+        cur = ggml_rms_norm(ctx0, cur, eps);
+        cur = ggml_mul(ctx0, cur, model_.output_norm);
+        out_hidden = cur;  // [hidden_size, 1] f32
+
+        struct ggml_tensor * logits = ggml_mul_mat(ctx0, model_.codec_head, out_hidden);
+        ggml_build_forward_expand(gf, logits);
+
+        // Sampling chain (mirrors build_step_graph_into exactly):
+        GGML_ASSERT(state_.suppress_mask_tensor != nullptr);
+        struct ggml_tensor * logits_1d = ggml_reshape_1d(ctx0, logits, V);
+        struct ggml_tensor * pen_logits = logits_1d;
+
+        if (has_rep_pen) {
+            struct ggml_tensor * step_l   = ggml_step(ctx0, logits_1d);
+            struct ggml_tensor * inner    = ggml_scale_bias(ctx0, step_l, 1.0f / rep_pen - rep_pen, rep_pen);
+            struct ggml_tensor * shifted  = ggml_scale_bias(ctx0, inner, 1.0f, -1.0f);
+            struct ggml_tensor * masked   = ggml_mul(ctx0, inp_gen_mask_shared, shifted);
+            struct ggml_tensor * mult     = ggml_scale_bias(ctx0, masked, 1.0f, 1.0f);
+            pen_logits = ggml_mul(ctx0, logits_1d, mult);
+        }
+
+        struct ggml_tensor * logits_sup = ggml_add(ctx0, pen_logits, state_.suppress_mask_tensor);
+        struct ggml_tensor * logits_sample = ggml_reshape_2d(ctx0, logits_sup, V, 1);
+
+        struct ggml_tensor * gumbel_step = gumbel_window_step(m);
+
+        char sampled_name[32];
+        snprintf(sampled_name, sizeof(sampled_name), "sampled_talker_%d", m);
+        out_sampled = append_gpu_sampling_view(ctx0, gf, logits_sample, T, top_k,
+                                                 gumbel_step, sampled_name);
+    };
+
+    // === Build N talker steps + N code-pred lanes + (N-1) embed-folds ===
+    struct ggml_tensor * step_input = inp_step_embd_0;
+
+    for (int m = 0; m < N; ++m) {
+        struct ggml_tensor * hidden_m  = nullptr;
+        struct ggml_tensor * cb0_m_tok = nullptr;
+        build_one_talker_step(step_input, m, hidden_m, cb0_m_tok);
+
+        // cb0 embedding lookup (intra-cgraph) — feeds code-pred lane and embed-fold.
+        struct ggml_tensor * cb0_embd_m = ggml_get_rows(ctx0, model_.codec_embd, cb0_m_tok);
+        cb0_embd_m = ggml_reshape_2d(ctx0, cb0_embd_m, hidden_size, 1);
+
+        // Code-pred lane m. Output names: "sampled_lane{m}_cb%d" with the
+        // %d substitution holding output_idx (0..14). Driver maps
+        // output_idx 0 → cb1, ..., output_idx 14 → cb15.
+        char sampled_fmt[64];
+        snprintf(sampled_fmt, sizeof(sampled_fmt), "sampled_lane%d_cb%%d", m);
+        struct ggml_tensor * lane_sampled[kNOutputs] = { nullptr };
+        build_code_pred_full_ar_lane_into(
+            ctx0, gf,
+            hidden_m, cb0_embd_m,
+            /*lane_idx=*/   m,
+            /*kv_n_ctx=*/   cp_n_ctx,
+            /*pos_all=*/    inp_pos_cp,
+            /*mask_lane=*/  mask_cp_lane(m),
+            /*gumbel_lane=*/gumbel_cp_lane(m),
+            T, top_k,
+            sampled_fmt,
+            lane_sampled);
+
+        // Embed-fold for inner steps (m=0..N-2): builds the FULL 17-channel
+        // step_embd for talker step m+1, intra-cgraph.
+        //   step_embd_{m+1} = codec_embd[cb0_m]
+        //                   + Σ_{k=1..15} code_pred_embd[k-1][cb_k_m]
+        //                   + trailing_window[m]
+        // (cb0 contribution = cb0_embd_m, already computed above.)
+        if (m < N - 1) {
+            struct ggml_tensor * acc = cb0_embd_m;  // cb0 contribution
+
+            for (int k_cb = 1; k_cb <= 15; ++k_cb) {
+                // output_idx (k_cb - 1) of lane m holds the sampled cb_{k_cb} token.
+                struct ggml_tensor * cb_token = lane_sampled[k_cb - 1];
+                GGML_ASSERT(cb_token != nullptr);
+
+                struct ggml_tensor * cb_part = ggml_get_rows(ctx0,
+                    model_.code_pred_embd[k_cb - 1], cb_token);
+                cb_part = ggml_reshape_2d(ctx0, cb_part, hidden_size, 1);
+                acc = ggml_add(ctx0, acc, cb_part);
+            }
+
+            // + trailing[m] — host-uploaded for outer-frame (n_past_start - prefill_len + 1 + m).
+            struct ggml_tensor * trailing_view = trailing_step(m);
+            acc = ggml_add(ctx0, acc, trailing_view);
+
+            step_input = acc;
+        }
+    }
+}
+
 struct ggml_cgraph * TTSTransformer::build_code_pred_graph(int32_t n_prev_codes) {
     const auto & cfg = model_.config;
 
@@ -2791,33 +3167,17 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_step_graph(int32_t /*n_past
 void TTSTransformer::build_code_pred_full_ar_graph_into(struct ggml_context * ctx0,
                                                           struct ggml_cgraph * gf,
                                                           float temperature, int32_t top_k) {
-    // Single cgraph for the entire code-pred AR loop:
-    //   prefill (2 tokens, manual attention) → 14 step subgraphs (FA over KV cache).
-    // The sampled-token tensor of step N feeds step N+1's embed lookup as a
-    // graph-level data dependency, so ggml-cuda's per-compute graph capture
-    // covers all 15 inferences without a host roundtrip between steps.
-    //
-    // Key positions:
-    //   inp_pos_all[0..1]           prefill positions  (0, 1)
-    //   inp_pos_all[2..15]          AR step positions  (= n_past at each step)
-    //   inp_mask_all[:, k] for k = 0..13  is the FA mask for AR step k+1
-    //   inp_gumbel_all[:, 0..14]    Gumbel noise per output (only when T > 0)
+    // Thin wrapper around build_code_pred_full_ar_lane_into. Registers
+    // the original graph-level inputs and dispatches the helper at lane=0.
+    // Output names "sampled_token_0".."sampled_token_14" are preserved.
+    // Behavior is byte-identical to the pre-Stage-#3 implementation.
 
     const auto & cfg = model_.config;
-    const int n_head = cfg.n_attention_heads;
-    const int n_kv_head = cfg.n_key_value_heads;
-    const int head_dim = cfg.head_dim;
     const int hidden_size = cfg.hidden_size;
-    const int cp_hidden = cfg.code_pred_hidden_size;
-    const float eps = cfg.rms_norm_eps;
-    const float rope_theta = cfg.rope_theta;
-    const int n_layer = cfg.code_pred_layers;
-    const float KQscale = 1.0f / sqrtf(float(head_dim));
     const int32_t n_ctx_kv = state_.code_pred_cache.n_ctx;
-    constexpr int kNArSteps   = 14;
-    constexpr int kNOutputs   = 15; // 1 prefill + 14 AR steps
+    constexpr int kNArSteps = 14;
+    constexpr int kNOutputs = 15;
 
-    // === Shared inputs ===
     struct ggml_tensor * inp_hidden = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hidden_size);
     ggml_set_name(inp_hidden, "inp_hidden");
     ggml_set_input(inp_hidden);
@@ -2831,8 +3191,8 @@ void TTSTransformer::build_code_pred_full_ar_graph_into(struct ggml_context * ct
     ggml_set_name(inp_pos_all, "inp_pos_all");
     ggml_set_input(inp_pos_all);
 
-    // FA masks for the 14 AR steps. Each column k is the [n_ctx] mask used
-    // by step (k+1)'s flash_attn_ext call.
+    // FA masks for the 14 AR steps. Each column k is the [n_ctx] mask
+    // used by step (k+1)'s flash_attn_ext call.
     struct ggml_tensor * inp_mask_all = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_ctx_kv, kNArSteps);
     ggml_set_name(inp_mask_all, "inp_mask_all");
     ggml_set_input(inp_mask_all);
@@ -2846,19 +3206,89 @@ void TTSTransformer::build_code_pred_full_ar_graph_into(struct ggml_context * ct
         ggml_set_input(inp_gumbel_all);
     }
 
+    struct ggml_tensor * hidden_2d = ggml_reshape_2d(ctx0, inp_hidden, hidden_size, 1);
+    struct ggml_tensor * cb0_2d    = ggml_reshape_2d(ctx0, inp_cb0_embd, hidden_size, 1);
+
+    build_code_pred_full_ar_lane_into(ctx0, gf,
+                                        hidden_2d, cb0_2d,
+                                        /*lane_idx=*/ 0,
+                                        n_ctx_kv,
+                                        inp_pos_all, inp_mask_all, inp_gumbel_all,
+                                        temperature, top_k,
+                                        "sampled_token_%d");
+}
+
+void TTSTransformer::build_code_pred_full_ar_lane_into(struct ggml_context * ctx0,
+                                                          struct ggml_cgraph * gf,
+                                                          struct ggml_tensor * hidden_2d,
+                                                          struct ggml_tensor * cb0_embd_2d,
+                                                          int32_t lane_idx,
+                                                          int32_t kv_n_ctx,
+                                                          struct ggml_tensor * pos_all,
+                                                          struct ggml_tensor * mask_lane,
+                                                          struct ggml_tensor * gumbel_lane,
+                                                          float temperature, int32_t top_k,
+                                                          const char * sampled_name_fmt,
+                                                          struct ggml_tensor ** out_sampled) {
+    // Lane-aware code-pred AR builder.
+    //
+    // KEY layout for lane m:
+    //   - K/V cache slots [m*16, m*16+15] are this lane's region.
+    //   - pos_all [16] i32 holds lane-LOCAL positions (0..15) — used for
+    //     ROPE in BOTH prefill and AR steps.
+    //   - K/V WRITES go through a view shifted by m*16 along the
+    //     position-axis (so set_rows with index k writes to absolute
+    //     slot m*16+k). FA READS use the full unshifted [0, kv_n_ctx)
+    //     view so cross-lane positions are visible — but mask_lane
+    //     -INFs them out per AR step.
+    //
+    // mask_lane shape: [kv_n_ctx, kNArSteps] f16. Column k is the FA
+    // mask for THIS LANE's AR step k+1: own-lane positions [m*16,
+    // m*16+(k+1)] are 0; everything else is -INF.
+    //
+    // Output names: snprintf(buf, "%s", sampled_name_fmt) followed by
+    // a %d substitution for output_idx 0..14. Wrapper passes
+    // "sampled_token_%d"; window builder passes "sampled_lane{m}_cb%d"
+    // (with cb numbering offset by +1 since output_idx 0 = cb1).
+
+    const auto & cfg = model_.config;
+    const int n_head = cfg.n_attention_heads;
+    const int n_kv_head = cfg.n_key_value_heads;
+    const int head_dim = cfg.head_dim;
+    const int hidden_size = cfg.hidden_size;
+    const int cp_hidden = cfg.code_pred_hidden_size;
+    const float eps = cfg.rms_norm_eps;
+    const float rope_theta = cfg.rope_theta;
+    const int n_layer = cfg.code_pred_layers;
+    const float KQscale = 1.0f / sqrtf(float(head_dim));
+    constexpr int kNArSteps = 14;
+
     auto gumbel_view_for = [&](int step_idx) -> struct ggml_tensor * {
-        if (!inp_gumbel_all) return nullptr;
-        return ggml_view_2d(ctx0, inp_gumbel_all, top_k, 1,
+        if (!gumbel_lane) return nullptr;
+        return ggml_view_2d(ctx0, gumbel_lane, top_k, 1,
                              top_k * sizeof(float),
                              (size_t) step_idx * top_k * sizeof(float));
     };
 
-    // === Prefill (n_tokens = 2, manual attention with diag_mask_inf) ===
-    struct ggml_tensor * pos_pf = ggml_view_1d(ctx0, inp_pos_all, 2, 0);
+    auto sampled_name_for = [&](int output_idx, char * buf, size_t cap) {
+        snprintf(buf, cap, sampled_name_fmt, output_idx);
+    };
 
-    struct ggml_tensor * hidden_2d = ggml_reshape_2d(ctx0, inp_hidden, hidden_size, 1);
-    struct ggml_tensor * cb0_2d    = ggml_reshape_2d(ctx0, inp_cb0_embd, hidden_size, 1);
-    struct ggml_tensor * cur = ggml_concat(ctx0, hidden_2d, cb0_2d, 1);
+    // Per-lane K/V cache view: shifted by lane_idx * 16 along the
+    // position-axis (ne[1] dim in the 2D flatten). set_rows on this view
+    // with lane-local indices writes to the correct absolute slots. The
+    // view's ne[1] is bounded by 16 (one lane's slot count) so set_rows'
+    // index range matches.
+    constexpr int kLaneSlots = 16;
+    const size_t lane_slot_offset = (size_t) lane_idx * kLaneSlots;
+    // Note: 2D set_rows views are built per-layer below using the per-layer
+    // k_cache/v_cache stride; we capture lane_idx + slot count here.
+
+    // === Prefill (n_tokens = 2, manual attention with diag_mask_inf) ===
+    // Lane-LOCAL positions for ROPE: pos_all[0..1].
+    struct ggml_tensor * pos_pf = ggml_view_1d(ctx0, pos_all, 2, 0);
+
+    struct ggml_tensor * cur = ggml_concat(ctx0, hidden_2d, cb0_embd_2d, 1);
 
     if (model_.mtp_proj_weight) {
         cur = ggml_mul_mat(ctx0, model_.mtp_proj_weight, cur);
@@ -2908,8 +3338,19 @@ void TTSTransformer::build_code_pred_full_ar_graph_into(struct ggml_context * ct
         struct ggml_tensor * k_cache = state_.code_pred_cache.k_cache[il];
         struct ggml_tensor * v_cache = state_.code_pred_cache.v_cache[il];
 
-        struct ggml_tensor * k_cache_2d = ggml_view_2d(ctx0, k_cache, head_dim * n_kv_head, n_ctx_kv, k_cache->nb[2], 0);
-        struct ggml_tensor * v_cache_2d = ggml_view_2d(ctx0, v_cache, head_dim * n_kv_head, n_ctx_kv, v_cache->nb[2], 0);
+        // Lane-shifted dst view: ne[1]=kLaneSlots (16) starting at slot
+        // lane_idx*16 in the absolute cache. set_rows with lane-LOCAL
+        // index writes to global slot lane_idx*16 + index. For lane_idx=0
+        // this collapses to the original [n_ctx_kv, 0] view (modulo
+        // ne[1]=16 vs n_ctx_kv — see note below).
+        //
+        // ne[1] = kLaneSlots (16) is enough for set_rows: indices used
+        // are lane-local in [0, 15]. The dst view doesn't need to span
+        // the full cache for set_rows; it just needs ne[1] >= max(idx)+1.
+        struct ggml_tensor * k_cache_2d = ggml_view_2d(ctx0, k_cache, head_dim * n_kv_head, kLaneSlots,
+                                                        k_cache->nb[2], lane_slot_offset * k_cache->nb[2]);
+        struct ggml_tensor * v_cache_2d = ggml_view_2d(ctx0, v_cache, head_dim * n_kv_head, kLaneSlots,
+                                                        v_cache->nb[2], lane_slot_offset * v_cache->nb[2]);
         struct ggml_tensor * Kcur_2d    = ggml_view_2d(ctx0, Kcur, head_dim * n_kv_head, 2, Kcur->nb[2], 0);
         struct ggml_tensor * Vcur_2d    = ggml_view_2d(ctx0, Vcur, head_dim * n_kv_head, 2, Vcur->nb[2], 0);
         ggml_build_forward_expand(gf, ggml_set_rows(ctx0, k_cache_2d, Kcur_2d, pos_pf));
@@ -2957,20 +3398,25 @@ void TTSTransformer::build_code_pred_full_ar_graph_into(struct ggml_context * ct
     struct ggml_tensor * logits_pf = ggml_mul_mat(ctx0, model_.code_pred_head[0], last_hidden);
     ggml_build_forward_expand(gf, logits_pf);
 
+    char sampled_name_buf[64];
+    sampled_name_for(0, sampled_name_buf, sizeof(sampled_name_buf));
     struct ggml_tensor * prev_sampled = append_gpu_sampling_view(
         ctx0, gf, logits_pf, temperature, top_k,
-        gumbel_view_for(0), "sampled_token_0");
+        gumbel_view_for(0), sampled_name_buf);
+    if (out_sampled) out_sampled[0] = prev_sampled;
 
     // === 14 AR steps (FA over KV cache, n_tokens = 1 each) ===
     for (int step = 1; step <= kNArSteps; ++step) {
-        // Position: pos_all[step + 1] (n_past = step + 1 in the original loop).
-        struct ggml_tensor * pos_st = ggml_view_1d(ctx0, inp_pos_all, 1,
+        // Position: pos_all[step + 1] — lane-LOCAL (= step+1 within own lane).
+        struct ggml_tensor * pos_st = ggml_view_1d(ctx0, pos_all, 1,
                                                     (size_t) (step + 1) * sizeof(int32_t));
 
-        // Mask: column (step - 1) of inp_mask_all.
-        struct ggml_tensor * mask_st = ggml_view_2d(ctx0, inp_mask_all, n_ctx_kv, 1,
-                                                     (size_t) n_ctx_kv * sizeof(ggml_fp16_t),
-                                                     (size_t) (step - 1) * n_ctx_kv * sizeof(ggml_fp16_t));
+        // Mask: column (step - 1) of mask_lane. mask_lane is shape
+        // [kv_n_ctx, kNArSteps] f16, with own-lane positions [m*16,
+        // m*16+(step+1)] zeroed and everything else -INF.
+        struct ggml_tensor * mask_st = ggml_view_2d(ctx0, mask_lane, kv_n_ctx, 1,
+                                                     (size_t) kv_n_ctx * sizeof(ggml_fp16_t),
+                                                     (size_t) (step - 1) * kv_n_ctx * sizeof(ggml_fp16_t));
 
         // Embed lookup feeds from previous step's sampled-token tensor.
         cur = ggml_get_rows(ctx0, model_.code_pred_embd[step - 1], prev_sampled);
@@ -3020,18 +3466,26 @@ void TTSTransformer::build_code_pred_full_ar_graph_into(struct ggml_context * ct
             struct ggml_tensor * k_cache = state_.code_pred_cache.k_cache[il];
             struct ggml_tensor * v_cache = state_.code_pred_cache.v_cache[il];
 
-            struct ggml_tensor * k_cache_2d = ggml_view_2d(ctx0, k_cache, head_dim * n_kv_head, n_ctx_kv, k_cache->nb[2], 0);
-            struct ggml_tensor * v_cache_2d = ggml_view_2d(ctx0, v_cache, head_dim * n_kv_head, n_ctx_kv, v_cache->nb[2], 0);
+            // Lane-shifted dst views for set_rows (write to slot
+            // lane_idx*16 + pos_st). FA-side views below stay full-cache.
+            struct ggml_tensor * k_cache_2d = ggml_view_2d(ctx0, k_cache, head_dim * n_kv_head, kLaneSlots,
+                                                            k_cache->nb[2], lane_slot_offset * k_cache->nb[2]);
+            struct ggml_tensor * v_cache_2d = ggml_view_2d(ctx0, v_cache, head_dim * n_kv_head, kLaneSlots,
+                                                            v_cache->nb[2], lane_slot_offset * v_cache->nb[2]);
             struct ggml_tensor * Kcur_2d    = ggml_view_2d(ctx0, Kcur, head_dim * n_kv_head, 1, Kcur->nb[2], 0);
             struct ggml_tensor * Vcur_2d    = ggml_view_2d(ctx0, Vcur, head_dim * n_kv_head, 1, Vcur->nb[2], 0);
             ggml_build_forward_expand(gf, ggml_set_rows(ctx0, k_cache_2d, Kcur_2d, pos_st));
             ggml_build_forward_expand(gf, ggml_set_rows(ctx0, v_cache_2d, Vcur_2d, pos_st));
 
+            // FA reads the FULL [0, kv_n_ctx) view. Cross-lane positions
+            // are masked out by mask_lane (they remain -INF for AR steps
+            // in this lane); within-lane positions [m*16, m*16+(step+1)]
+            // are zeroed by the host mask construction.
             struct ggml_tensor * K = ggml_view_3d(ctx0, k_cache,
-                                                   head_dim, n_kv_head, n_ctx_kv,
+                                                   head_dim, n_kv_head, kv_n_ctx,
                                                    k_cache->nb[1], k_cache->nb[2], 0);
             struct ggml_tensor * V = ggml_view_3d(ctx0, v_cache,
-                                                   head_dim, n_kv_head, n_ctx_kv,
+                                                   head_dim, n_kv_head, kv_n_ctx,
                                                    v_cache->nb[1], v_cache->nb[2], 0);
 
             struct ggml_tensor * Q = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
@@ -3063,11 +3517,11 @@ void TTSTransformer::build_code_pred_full_ar_graph_into(struct ggml_context * ct
         struct ggml_tensor * logits_st = ggml_mul_mat(ctx0, model_.code_pred_head[step], cur);
         ggml_build_forward_expand(gf, logits_st);
 
-        char sampled_name[32];
-        snprintf(sampled_name, sizeof(sampled_name), "sampled_token_%d", step);
+        sampled_name_for(step, sampled_name_buf, sizeof(sampled_name_buf));
         prev_sampled = append_gpu_sampling_view(
             ctx0, gf, logits_st, temperature, top_k,
-            gumbel_view_for(step), sampled_name);
+            gumbel_view_for(step), sampled_name_buf);
+        if (out_sampled) out_sampled[step] = prev_sampled;
     }
 }
 
@@ -3643,6 +4097,369 @@ bool TTSTransformer::forward_step_sample(const float * step_embd, int32_t n_past
 
     state_.cache.n_used = n_past + 1;
     if (!use_step_cache) ggml_backend_sched_reset(state_.sched);
+#ifdef QWEN3_TTS_TIMING
+    t1 = clk::now();
+    if (timing_) timing_->t_talker_data_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+#endif
+    return true;
+}
+
+// v9.8 (Stage #3 of #3b): N-step merged talker-window driver.
+//
+// Calls build_step_window_into through the v9.7-style single-entry
+// gallocr cache (ts_win_*), then reads back N × n_codebooks codes per
+// frame. Inside the cgraph, talker steps + code-pred lanes + embed-folds
+// are fully merged so no host roundtrip happens between window steps.
+//
+// trailing_rows: [(N-1) * hidden_size] f32 contiguous, supplying the
+// trailing-text contribution to the embed-fold input of talker step
+// m+1 (for m = 0..N-2). nullptr is allowed only when N == 1.
+//
+// frame_codes_out: caller pre-resizes outer to >= N. Inner vectors are
+// resized to cfg.n_codebooks (16) by the callee. Layout: row m holds
+// frame_codes for outer-frame (n_past_start - prefill_len + 1 + m).
+//
+// State_.code_pred_cache must be sized for N lanes (n_ctx >= N*16) AND
+// cleared (zeroed) before this call — the caller manages both.
+bool TTSTransformer::forward_step_window_sample(const float * step_embd,
+                                                  const float * trailing_rows,
+                                                  int32_t n_past_start,
+                                                  int32_t N,
+                                                  float temperature,
+                                                  int32_t top_k,
+                                                  float repetition_penalty,
+                                                  const float * gen_token_mask,
+                                                  std::vector<std::vector<int32_t>> & frame_codes_out) {
+    if (!model_.ctx) {
+        error_msg_ = "Model not loaded";
+        return false;
+    }
+    if (!step_embd) {
+        error_msg_ = "step_embd is null";
+        return false;
+    }
+    if (N < 1) {
+        error_msg_ = "N must be >= 1 in forward_step_window_sample";
+        return false;
+    }
+    if (N >= 2 && !trailing_rows) {
+        error_msg_ = "trailing_rows must be non-null when N >= 2";
+        return false;
+    }
+
+    const auto & cfg = model_.config;
+
+    // Talker KV grow.
+    if (state_.cache.n_ctx == 0) {
+        const int32_t min_ctx = std::max<int32_t>(256, n_past_start + N + 16);
+        if (!init_kv_cache(min_ctx)) {
+            return false;
+        }
+    }
+    if (n_past_start + N > state_.cache.n_ctx) {
+        if (!grow_kv_cache(n_past_start + N)) {
+            return false;
+        }
+    }
+
+    // Code-pred KV: needs N lanes × 16 slots. Init or reuse.
+    constexpr int kLaneSlots = 16;
+    const int32_t cp_n_ctx_required = N * kLaneSlots;
+    if (state_.code_pred_cache.n_ctx < cp_n_ctx_required) {
+        if (!init_code_pred_kv_cache(cp_n_ctx_required)) {
+            return false;
+        }
+    }
+
+#ifdef QWEN3_TTS_TIMING
+    using clk = std::chrono::high_resolution_clock;
+    auto t0 = clk::now(), t1 = t0;
+    t0 = clk::now();
+#endif
+
+    talker_sampling_params sp;
+    sp.active             = true;
+    sp.temperature        = temperature;
+    sp.top_k              = top_k;
+    sp.repetition_penalty = repetition_penalty;
+
+    constexpr int32_t kFattnKqStride = 256;
+    constexpr int kNArSteps = 14;
+    constexpr int kNOutputs = 15;
+    const int32_t kv_n_eff = std::min(
+        state_.cache.n_ctx,
+        ((n_past_start + N + kFattnKqStride - 1) / kFattnKqStride) * kFattnKqStride);
+
+    const bool    cur_temp_pos       = temperature > 0.0f;
+    const int32_t cur_top_k          = cur_temp_pos ? top_k : 0;
+    const bool    cur_rep_pen_active = (repetition_penalty != 1.0f);
+    const int32_t cur_n_ctx          = state_.cache.n_ctx;
+    const int32_t cur_cp_n_ctx       = state_.code_pred_cache.n_ctx;
+
+    auto drop_win_cache = [&]() {
+        if (state_.ts_win_ctx) {
+            ggml_free(state_.ts_win_ctx);
+            state_.ts_win_ctx = nullptr;
+        }
+        state_.ts_win_gf = nullptr;
+        if (state_.ts_win_galloc) {
+            ggml_gallocr_free(state_.ts_win_galloc);
+            state_.ts_win_galloc = nullptr;
+        }
+        state_.ts_win_meta.clear();
+    };
+
+    const bool sig_match = state_.ts_win_gf != nullptr &&
+                            state_.ts_win_kv_n_eff       == kv_n_eff       &&
+                            state_.ts_win_N              == N              &&
+                            state_.ts_win_temp_pos       == cur_temp_pos   &&
+                            state_.ts_win_top_k          == cur_top_k      &&
+                            state_.ts_win_rep_pen_active == cur_rep_pen_active &&
+                            state_.ts_win_n_ctx          == cur_n_ctx      &&
+                            state_.ts_win_cp_n_ctx       == cur_cp_n_ctx;
+
+    if (!sig_match) {
+        drop_win_cache();
+        // Stage #3 cgraph node count grows ~linearly with N: per step
+        // we add ~1000 talker tensors + ~3150 code-pred lane tensors +
+        // ~17 embed-fold tensors. Empirically ~4500/step + ~100 fixed.
+        // Cap at QWEN3_TTS_MAX_NODES floor so small-N never undershoots
+        // the existing global default.
+        const int32_t max_nodes_window = std::max<int32_t>(
+            QWEN3_TTS_MAX_NODES,
+            N * 4500 + 256);
+        state_.ts_win_meta.resize(ggml_tensor_overhead() * max_nodes_window + ggml_graph_overhead_custom(max_nodes_window, false));
+        struct ggml_init_params ip = {
+            /*.mem_size   =*/ state_.ts_win_meta.size(),
+            /*.mem_buffer =*/ state_.ts_win_meta.data(),
+            /*.no_alloc   =*/ true,
+        };
+        state_.ts_win_ctx = ggml_init(ip);
+        if (!state_.ts_win_ctx) {
+            error_msg_ = "Failed to init talker window cgraph context";
+            drop_win_cache();
+            return false;
+        }
+        state_.ts_win_gf = ggml_new_graph_custom(state_.ts_win_ctx, max_nodes_window, false);
+        build_step_window_into(state_.ts_win_ctx, state_.ts_win_gf, n_past_start, N, &sp);
+        state_.ts_win_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(state_.backend));
+        if (!state_.ts_win_galloc) {
+            error_msg_ = "Failed to allocate talker window gallocr";
+            drop_win_cache();
+            return false;
+        }
+        state_.ts_win_kv_n_eff       = kv_n_eff;
+        state_.ts_win_N              = N;
+        state_.ts_win_temp_pos       = cur_temp_pos;
+        state_.ts_win_top_k          = cur_top_k;
+        state_.ts_win_rep_pen_active = cur_rep_pen_active;
+        state_.ts_win_n_ctx          = cur_n_ctx;
+        state_.ts_win_cp_n_ctx       = cur_cp_n_ctx;
+    }
+
+    struct ggml_cgraph * gf = state_.ts_win_gf;
+
+#ifdef QWEN3_TTS_TIMING
+    t1 = clk::now();
+    if (timing_) timing_->t_talker_graph_build_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    t0 = clk::now();
+#endif
+
+    if (!ggml_gallocr_alloc_graph(state_.ts_win_galloc, gf)) {
+        error_msg_ = "Failed to allocate talker window graph (ts_win_galloc)";
+        drop_win_cache();
+        return false;
+    }
+#ifdef QWEN3_TTS_TIMING
+    t1 = clk::now();
+    if (timing_) timing_->t_talker_graph_alloc_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    t0 = clk::now();
+#endif
+
+    // === inputs ===
+    // Talker:
+    struct ggml_tensor * inp_step = ggml_graph_get_tensor(gf, "inp_step_embd_0");
+    if (inp_step) {
+        ggml_backend_tensor_set(inp_step, step_embd, 0, cfg.hidden_size * sizeof(float));
+    }
+
+    struct ggml_tensor * inp_pos = ggml_graph_get_tensor(gf, "inp_pos_window");
+    if (inp_pos) {
+        if ((int32_t) win_pos_scratch_.size() < N) {
+            win_pos_scratch_.resize(N);
+        }
+        for (int m = 0; m < N; ++m) {
+            win_pos_scratch_[m] = n_past_start + m;
+        }
+        ggml_backend_tensor_set(inp_pos, win_pos_scratch_.data(), 0,
+                                 (size_t) N * sizeof(int32_t));
+    }
+
+    const ggml_fp16_t neg_inf_fp16 = ggml_fp32_to_fp16(-INFINITY);
+    const ggml_fp16_t zero_fp16    = ggml_fp32_to_fp16(0.0f);
+
+    struct ggml_tensor * inp_mask = ggml_graph_get_tensor(gf, "inp_mask_window");
+    GGML_ASSERT(!inp_mask || (int32_t) inp_mask->ne[0] == kv_n_eff);
+    GGML_ASSERT(!inp_mask || (int32_t) inp_mask->ne[1] == N);
+    if (inp_mask) {
+        const size_t elems = (size_t) kv_n_eff * (size_t) N;
+        if (win_mask_scratch_.size() < elems) {
+            win_mask_scratch_.resize(elems);
+        }
+        std::fill_n(win_mask_scratch_.begin(), elems, neg_inf_fp16);
+        for (int m = 0; m < N; ++m) {
+            const int32_t valid = std::min(n_past_start + m + 1, kv_n_eff);
+            ggml_fp16_t * col = win_mask_scratch_.data() + (size_t) m * kv_n_eff;
+            for (int32_t i = 0; i < valid; ++i) {
+                col[i] = zero_fp16;
+            }
+        }
+        ggml_backend_tensor_set(inp_mask, win_mask_scratch_.data(), 0,
+                                 elems * sizeof(ggml_fp16_t));
+    }
+
+    if (cur_rep_pen_active) {
+        struct ggml_tensor * inp_gen_mask = ggml_graph_get_tensor(gf, "inp_gen_mask");
+        if (inp_gen_mask) {
+            GGML_ASSERT(gen_token_mask != nullptr);
+            ggml_backend_tensor_set(inp_gen_mask, gen_token_mask, 0,
+                                     (size_t) cfg.codec_vocab_size * sizeof(float));
+        }
+    }
+
+    if (cur_temp_pos) {
+        struct ggml_tensor * inp_gumbel = ggml_graph_get_tensor(gf, "inp_gumbel_window");
+        if (inp_gumbel) {
+            const size_t elems = (size_t) top_k * (size_t) N;
+            if (win_gumbel_scratch_.size() < elems) {
+                win_gumbel_scratch_.resize(elems);
+            }
+            std::uniform_real_distribution<float> uni(
+                std::numeric_limits<float>::min(), 1.0f);
+            for (size_t i = 0; i < elems; ++i) {
+                float u = uni(rng_);
+                win_gumbel_scratch_[i] = -std::log(-std::log(u));
+            }
+            ggml_backend_tensor_set(inp_gumbel, win_gumbel_scratch_.data(), 0,
+                                     elems * sizeof(float));
+        }
+    }
+
+    // Code-pred:
+    struct ggml_tensor * inp_pos_cp = ggml_graph_get_tensor(gf, "inp_pos_cp");
+    if (inp_pos_cp) {
+        // Lane-LOCAL positions: same vector for every lane (0, 1, ..., 15).
+        int32_t pos_cp[16];
+        for (int i = 0; i < 16; ++i) pos_cp[i] = i;
+        ggml_backend_tensor_set(inp_pos_cp, pos_cp, 0, 16 * sizeof(int32_t));
+    }
+
+    struct ggml_tensor * inp_mask_cp = ggml_graph_get_tensor(gf, "inp_mask_cp");
+    if (inp_mask_cp) {
+        // Layout: ne[0] = cp_n_ctx (rows), ne[1] = kNArSteps * N (columns).
+        // Column index = m * kNArSteps + (k - 1) for lane m's AR step k (1..14).
+        // Own-lane positions [m*16, m*16+(k+1)] → 0; everything else → -INF.
+        const size_t mask_cp_elems = (size_t) cur_cp_n_ctx * (size_t) (kNArSteps * N);
+        if (win_mask_cp_scratch_.size() < mask_cp_elems) {
+            win_mask_cp_scratch_.resize(mask_cp_elems);
+        }
+        std::fill_n(win_mask_cp_scratch_.begin(), mask_cp_elems, neg_inf_fp16);
+        for (int m = 0; m < N; ++m) {
+            const int lane_base = m * kLaneSlots;
+            for (int k = 1; k <= kNArSteps; ++k) {
+                const int col = m * kNArSteps + (k - 1);
+                ggml_fp16_t * col_ptr = win_mask_cp_scratch_.data() + (size_t) col * cur_cp_n_ctx;
+                // Valid positions for this lane at AR step k: [lane_base, lane_base + (k+1)] inclusive.
+                const int valid_end = std::min(lane_base + (k + 1) + 1, cur_cp_n_ctx);  // exclusive bound
+                for (int i = lane_base; i < valid_end; ++i) {
+                    col_ptr[i] = zero_fp16;
+                }
+            }
+        }
+        ggml_backend_tensor_set(inp_mask_cp, win_mask_cp_scratch_.data(), 0,
+                                 mask_cp_elems * sizeof(ggml_fp16_t));
+    }
+
+    if (cur_temp_pos) {
+        struct ggml_tensor * inp_gumbel_cp = ggml_graph_get_tensor(gf, "inp_gumbel_cp");
+        if (inp_gumbel_cp) {
+            const size_t elems = (size_t) top_k * (size_t) (kNOutputs * N);
+            if (win_gumbel_cp_scratch_.size() < elems) {
+                win_gumbel_cp_scratch_.resize(elems);
+            }
+            std::uniform_real_distribution<float> uni(
+                std::numeric_limits<float>::min(), 1.0f);
+            for (size_t i = 0; i < elems; ++i) {
+                float u = uni(rng_);
+                win_gumbel_cp_scratch_[i] = -std::log(-std::log(u));
+            }
+            ggml_backend_tensor_set(inp_gumbel_cp, win_gumbel_cp_scratch_.data(), 0,
+                                     elems * sizeof(float));
+        }
+    }
+
+    if (N >= 2) {
+        struct ggml_tensor * inp_trailing = ggml_graph_get_tensor(gf, "inp_trailing_window");
+        if (inp_trailing) {
+            // trailing_rows is contiguous (N-1) × hidden_size f32, supplied by caller.
+            ggml_backend_tensor_set(inp_trailing, trailing_rows, 0,
+                                     (size_t) (N - 1) * cfg.hidden_size * sizeof(float));
+        }
+    }
+
+#ifdef QWEN3_TTS_TIMING
+    t1 = clk::now();
+    if (timing_) timing_->t_talker_data_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    t0 = clk::now();
+#endif
+
+    if (ggml_backend_graph_compute(state_.backend, gf) != GGML_STATUS_SUCCESS) {
+        error_msg_ = "Failed to compute talker window graph";
+        drop_win_cache();
+        return false;
+    }
+#ifdef QWEN3_TTS_TIMING
+    t1 = clk::now();
+    if (timing_) timing_->t_talker_compute_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    t0 = clk::now();
+#endif
+
+    // === outputs ===
+    // frame_codes_out[m] holds [cb0, cb1, ..., cb15] for outer-frame m.
+    if ((int32_t) frame_codes_out.size() < N) frame_codes_out.resize(N);
+    for (int m = 0; m < N; ++m) {
+        if ((int32_t) frame_codes_out[m].size() < cfg.n_codebooks) {
+            frame_codes_out[m].resize(cfg.n_codebooks);
+        }
+    }
+
+    char name_buf[64];
+    for (int m = 0; m < N; ++m) {
+        // cb0 from talker:
+        snprintf(name_buf, sizeof(name_buf), "sampled_talker_%d", m);
+        struct ggml_tensor * cb0_t = ggml_graph_get_tensor(gf, name_buf);
+        if (!cb0_t) {
+            error_msg_ = std::string("Missing ") + name_buf + " in talker window graph";
+            return false;
+        }
+        int32_t v = 0;
+        ggml_backend_tensor_get(cb0_t, &v, 0, sizeof(int32_t));
+        frame_codes_out[m][0] = v;
+
+        // cb1..cb15 from code-pred lane m (output_idx 0..14 → cb1..cb15):
+        for (int out_idx = 0; out_idx < kNOutputs; ++out_idx) {
+            snprintf(name_buf, sizeof(name_buf), "sampled_lane%d_cb%d", m, out_idx);
+            struct ggml_tensor * cb_t = ggml_graph_get_tensor(gf, name_buf);
+            if (!cb_t) {
+                error_msg_ = std::string("Missing ") + name_buf + " in talker window graph";
+                return false;
+            }
+            ggml_backend_tensor_get(cb_t, &v, 0, sizeof(int32_t));
+            frame_codes_out[m][out_idx + 1] = v;  // out_idx 0 → cb1
+        }
+    }
+
+    state_.cache.n_used = n_past_start + N;
 #ifdef QWEN3_TTS_TIMING
     t1 = clk::now();
     if (timing_) timing_->t_talker_data_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -4605,6 +5422,26 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     int32_t pending_gpu_sample = -1;
     bool gpu_sample_ready = false;
 
+    // v9.8 (Stage #1 of #3b): N-step talker window. Active when
+    // QWEN3_TTS_TALKER_STEP_WINDOW=N (N>=2). Layered on top of
+    // use_talker_gpu_sample — window mode requires GPU sampling because
+    // chained inner steps consume on-GPU sampled_token directly via
+    // ggml_get_rows. If sampling is forced off, window mode is forced off.
+    static const int32_t s_window_n = []() {
+        const char * env = std::getenv("QWEN3_TTS_TALKER_STEP_WINDOW");
+        if (!env || !env[0]) return 1;
+        int v = atoi(env);
+        return v < 1 ? 1 : v;
+    }();
+    const bool use_window = use_talker_gpu_sample && s_window_n > 1;
+    // Stage #3: window emits N × n_codebooks codes (cb0..cb15 per frame).
+    // The driver pops one row at a time and emits without calling
+    // predict_codes_autoregressive (it's already in-graph).
+    std::vector<std::vector<int32_t>> window_frame_codes_buf;
+    std::vector<float> window_trailing_buf;  // [(wN-1) * hidden_size] f32 — built per window launch
+    size_t window_buf_idx = 0;   // next unconsumed slot
+    size_t window_buf_size = 0;  // entries from most-recent window launch
+
     int64_t t_decode_start = verbose_ ? verbose_now_ms() : 0;
     int64_t t_decode_last = t_decode_start;
 
@@ -4635,7 +5472,18 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
             fprintf(stderr, "\n");
         }
         int32_t next_token;
-        if (gpu_sample_ready) {
+        // v9.8 Stage #3: when consuming from the window buffer, ALL 16
+        // codebooks for this frame are already in the buffer (code-pred
+        // ran in-graph). Skip predict_codes_autoregressive entirely.
+        bool skip_predict_codes = false;
+        if (window_buf_idx < window_buf_size) {
+            for (int cb = 0; cb < cfg.n_codebooks; ++cb) {
+                frame_codes[cb] = window_frame_codes_buf[window_buf_idx][cb];
+            }
+            next_token = frame_codes[0];
+            window_buf_idx++;
+            skip_predict_codes = true;
+        } else if (gpu_sample_ready) {
             // Sampled by previous iter's forward_step_sample.
             next_token = pending_gpu_sample;
             gpu_sample_ready = false;
@@ -4704,26 +5552,28 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
         if (next_token == cfg.codec_eos_id) {
             break;
         }
-        
-        frame_codes[0] = next_token;
+
         generated_cb0_tokens.insert(next_token);
-        
+
+        if (!skip_predict_codes) {
+            frame_codes[0] = next_token;
 #ifdef QWEN3_TTS_TIMING
-        t0 = clk::now();
+            t0 = clk::now();
 #endif
-        std::vector<int32_t> codes_1_15;
-        if (!predict_codes_autoregressive(last_hidden_.data(), frame_codes[0], codes_1_15, temperature, top_k)) {
-            return false;
-        }
+            std::vector<int32_t> codes_1_15;
+            if (!predict_codes_autoregressive(last_hidden_.data(), frame_codes[0], codes_1_15, temperature, top_k)) {
+                return false;
+            }
 #ifdef QWEN3_TTS_TIMING
-        t1 = clk::now();
-        timing.t_code_pred_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            t1 = clk::now();
+            timing.t_code_pred_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
 #endif
-        
-        for (int cb = 1; cb < cfg.n_codebooks; ++cb) {
-            frame_codes[cb] = codes_1_15[cb - 1];
+            for (int cb = 1; cb < cfg.n_codebooks; ++cb) {
+                frame_codes[cb] = codes_1_15[cb - 1];
+            }
         }
-        
+        // Stage #3 buffer-consume path: frame_codes already populated above.
+
         for (int cb = 0; cb < cfg.n_codebooks; ++cb) {
             output.push_back(frame_codes[cb]);
         }
@@ -4743,45 +5593,127 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
             break;
         }
 
-        std::fill(step_embd.begin(), step_embd.end(), 0.0f);
+        // v9.8: in window mode, the step_embd we'd build for an inner
+        // consumed frame goes unused — the window's cgraph already chained
+        // a (degraded, cb0-only) input for the next inner step. Only build
+        // step_embd when this iter's value will actually feed the next
+        // talker call (= no buffer left to consume on next iter, OR not in
+        // window mode at all).
+        const bool need_step_embd = !use_window || window_buf_idx >= window_buf_size;
+
+        if (need_step_embd) {
+            std::fill(step_embd.begin(), step_embd.end(), 0.0f);
 
 #ifdef QWEN3_TTS_TIMING
-        t0 = clk::now();
+            t0 = clk::now();
 #endif
-        if (!lookup_single_embedding_row(model_.codec_embd, frame_codes[0], embd_row.data())) {
-            return false;
-        }
-        for (int32_t h = 0; h < cfg.hidden_size; ++h) {
-            step_embd[h] = embd_row[h];
-        }
-
-        for (int cb = 1; cb < cfg.n_codebooks; ++cb) {
-            int32_t code_token = frame_codes[cb];
-            if (!lookup_single_embedding_row(model_.code_pred_embd[cb - 1], code_token, embd_row.data())) {
+            if (!lookup_single_embedding_row(model_.codec_embd, frame_codes[0], embd_row.data())) {
                 return false;
             }
             for (int32_t h = 0; h < cfg.hidden_size; ++h) {
-                step_embd[h] += embd_row[h];
+                step_embd[h] = embd_row[h];
             }
-        }
+
+            for (int cb = 1; cb < cfg.n_codebooks; ++cb) {
+                int32_t code_token = frame_codes[cb];
+                if (!lookup_single_embedding_row(model_.code_pred_embd[cb - 1], code_token, embd_row.data())) {
+                    return false;
+                }
+                for (int32_t h = 0; h < cfg.hidden_size; ++h) {
+                    step_embd[h] += embd_row[h];
+                }
+            }
 #ifdef QWEN3_TTS_TIMING
-        t1 = clk::now();
-        timing.t_embed_lookup_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            t1 = clk::now();
+            timing.t_embed_lookup_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
 #endif
 
-        const float * trailing_row = (frame < trailing_len)
-            ? trailing_text_hidden.data() + (size_t)frame * cfg.hidden_size
-            : tts_pad_embed.data();
-        for (int32_t h = 0; h < cfg.hidden_size; ++h) {
-            step_embd[h] += trailing_row[h];
+            const float * trailing_row = (frame < trailing_len)
+                ? trailing_text_hidden.data() + (size_t)frame * cfg.hidden_size
+                : tts_pad_embed.data();
+            for (int32_t h = 0; h < cfg.hidden_size; ++h) {
+                step_embd[h] += trailing_row[h];
+            }
         }
 
 #ifdef QWEN3_TTS_TIMING
         t0 = clk::now();
 #endif
-        if (use_talker_gpu_sample) {
-            // Build the [codec_vocab_size] f32 gen-mask from the running set
-            // of previously-sampled cb0 tokens. Cheap (memset 0 + |set| stores).
+        // v9.8: in window mode, n_past advances by the launched window's
+        // wN inside forward_step_window_sample (or by 1 for a tail single
+        // step / a buffer-consume iter). Track it locally so end-of-loop
+        // doesn't double-increment.
+        bool n_past_advanced_here = false;
+        if (use_window && window_buf_idx >= window_buf_size) {
+            // Buffer drained — launch a new window (or fall back to
+            // single-step for a 1-frame tail).
+            if ((int32_t) talker_gen_mask_scratch_.size() < cfg.codec_vocab_size) {
+                talker_gen_mask_scratch_.resize(cfg.codec_vocab_size);
+            }
+            std::fill(talker_gen_mask_scratch_.begin(),
+                      talker_gen_mask_scratch_.begin() + cfg.codec_vocab_size,
+                      0.0f);
+            for (int32_t tok : generated_cb0_tokens) {
+                if (tok >= 0 && tok < cfg.codec_vocab_size) {
+                    talker_gen_mask_scratch_[tok] = 1.0f;
+                }
+            }
+
+            const int32_t remaining = max_len - frame - 1;
+            const int32_t wN = std::min<int32_t>(s_window_n, remaining);
+            if (wN >= 2) {
+                if ((int32_t) window_frame_codes_buf.size() < wN) {
+                    window_frame_codes_buf.resize(wN);
+                }
+                // Build trailing rows for inner steps of the new window.
+                // Inner step m=0..wN-2 needs trailing for outer-frame
+                // (frame + 1 + m) — that's the talker step that produces
+                // outer-frame (frame + 2 + m)'s cb0 (the second-and-later
+                // emissions of this window).
+                window_trailing_buf.resize((size_t) (wN - 1) * cfg.hidden_size);
+                for (int m = 0; m < wN - 1; ++m) {
+                    const int outer_frame_for_trailing = frame + 1 + m;
+                    const float * src = (outer_frame_for_trailing < trailing_len)
+                        ? trailing_text_hidden.data() + (size_t) outer_frame_for_trailing * cfg.hidden_size
+                        : tts_pad_embed.data();
+                    std::memcpy(window_trailing_buf.data() + (size_t) m * cfg.hidden_size,
+                                src, cfg.hidden_size * sizeof(float));
+                }
+
+                if (!forward_step_window_sample(step_embd.data(),
+                                                  window_trailing_buf.data(),
+                                                  n_past, wN,
+                                                  temperature, top_k, repetition_penalty,
+                                                  talker_gen_mask_scratch_.data(),
+                                                  window_frame_codes_buf)) {
+                    return false;
+                }
+                n_past += wN;
+                n_past_advanced_here = true;
+                window_buf_idx = 0;
+                window_buf_size = (size_t) wN;
+            } else {
+                // wN == 1: tail of synth — skip the one-shot ts_win_*
+                // rebuild, run the v9.7 single-step path instead.
+                int32_t sampled_next = -1;
+                if (!forward_step_sample(step_embd.data(), n_past,
+                                          temperature, top_k, repetition_penalty,
+                                          talker_gen_mask_scratch_.data(),
+                                          sampled_next, nullptr)) {
+                    return false;
+                }
+                pending_gpu_sample = sampled_next;
+                gpu_sample_ready = true;
+                n_past++;
+                n_past_advanced_here = true;
+            }
+        } else if (use_window) {
+            // Buffer not drained — outer iter consumes from window_buf_*
+            // next iter. n_past was pre-advanced when the window ran;
+            // do not increment again at end-of-loop.
+            n_past_advanced_here = true;
+        } else if (use_talker_gpu_sample) {
+            // v9.5 single-step GPU sampling path (unchanged).
             if ((int32_t) talker_gen_mask_scratch_.size() < cfg.codec_vocab_size) {
                 talker_gen_mask_scratch_.resize(cfg.codec_vocab_size);
             }
@@ -4812,7 +5744,9 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
         timing.t_talker_forward_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
 #endif
 
-        n_past++;
+        if (!n_past_advanced_here) {
+            n_past++;
+        }
     }
 
     last_decode_ms_ = verbose_now_ms() - t_prefill_end_ms;
