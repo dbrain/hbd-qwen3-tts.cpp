@@ -235,6 +235,15 @@ struct tts_transformer_state {
     // fallback paths), so we can drive it with a one-backend gallocr +
     // direct ggml_backend_graph_compute and skip the split/copy mutation.
     ggml_gallocr_t cp_galloc = nullptr;
+
+    // v9.5: talker GPU sampling support. Static suppress-mask tensor lives
+    // in its own ggml_context + backend buffer so it can be referenced from
+    // every per-frame step cgraph as a stable graph-level constant. Built
+    // once in load_model: zeros for [0, suppress_start) and codec_eos_id,
+    // -INF for [suppress_start, vocab_size) except eos_id.
+    struct ggml_context * suppress_mask_ctx = nullptr;
+    ggml_backend_buffer_t suppress_mask_buffer = nullptr;
+    struct ggml_tensor *  suppress_mask_tensor = nullptr;
 };
 
 // TTS Transformer class
@@ -313,6 +322,24 @@ public:
     bool forward_step(const float * step_embd, int32_t n_past,
                       std::vector<float> & output,
                       std::vector<float> * hidden_out = nullptr);
+
+    // v9.5: GPU-side talker sampling. Same forward as forward_step, but the
+    // cgraph appends a rep-penalty + suppress-mask + Gumbel-max top-K
+    // sampling chain (mirroring code-pred Phase 1). Avoids the per-frame
+    // host roundtrip of the full [codec_vocab_size] logits and the host
+    // partial_sort + softmax + discrete_distribution. Returns the sampled
+    // codebook-0 token directly (4-byte i32 read).
+    //
+    // gen_token_mask is a host-built [codec_vocab_size] f32 vector with 1.0
+    // for every previously-generated cb0 token (carries the repetition
+    // penalty target) and 0.0 elsewhere. Caller owns the buffer and must
+    // keep it alive for the duration of the call.
+    bool forward_step_sample(const float * step_embd, int32_t n_past,
+                             float temperature, int32_t top_k,
+                             float repetition_penalty,
+                             const float * gen_token_mask,
+                             int32_t & sampled_token_out,
+                             std::vector<float> * hidden_out = nullptr);
     
     // Get hidden states from last forward pass (for code predictor)
     bool get_hidden_states(std::vector<float> & hidden) const;
@@ -461,7 +488,23 @@ private:
 
     struct ggml_cgraph * build_prefill_forward_graph(int32_t n_tokens, int32_t n_past);
 
-    struct ggml_cgraph * build_step_graph(int32_t n_past);
+    // Talker sampling params for build_step_graph. When `active`, the
+    // cgraph appends rep-penalty + suppress + Gumbel-max top-K sampling on
+    // the cb0 logits and exposes a "sampled_token" [1] i32 output. Inputs
+    // to populate per-call:
+    //   "inp_gen_mask"   [V]  f32   1.0 for previously-generated cb0 tokens
+    //   "inp_gumbel"     [K]  f32   per-call Gumbel noise (only when T > 0)
+    // The static [V] suppress mask (codec_vocab tail except eos_id → -INF)
+    // is captured once at load_model into state_.suppress_mask_tensor and
+    // referenced by every step graph as a graph-level constant.
+    struct talker_sampling_params {
+        bool   active            = false;
+        float  temperature       = 0.0f;
+        int32_t top_k            = 0;
+        float  repetition_penalty = 1.0f;
+    };
+    struct ggml_cgraph * build_step_graph(int32_t n_past,
+                                          const talker_sampling_params * sampling = nullptr);
 
     bool project_text_tokens(const int32_t * text_tokens, int32_t n_tokens,
                              std::vector<float> & output);
@@ -579,6 +622,11 @@ private:
     // code-predictor step. They never overlap on the same frame, so one
     // shared buffer is enough; grow on demand, never shrink.
     std::vector<ggml_fp16_t> step_mask_scratch_;
+    // v9.5: per-frame [codec_vocab_size] f32 gen-mask scratch for the talker
+    // GPU sampling path; rebuilt each frame from the generated_cb0_tokens set.
+    std::vector<float> talker_gen_mask_scratch_;
+    // v9.5: per-call top-K Gumbel noise scratch for talker sampling.
+    std::vector<float> talker_gumbel_scratch_;
     // Per-frame Gumbel noise scratch for on-GPU code-pred sampling.
     // Sized to top_k * 15 (1 prefill + 14 AR steps) and regenerated from rng_
     // at the top of each predict_codes_autoregressive() call.
