@@ -64,6 +64,15 @@ void TTSTransformer::unload_model() {
         ggml_gallocr_free(state_.cp_galloc);
         state_.cp_galloc = nullptr;
     }
+    if (state_.suppress_mask_buffer) {
+        ggml_backend_buffer_free(state_.suppress_mask_buffer);
+        state_.suppress_mask_buffer = nullptr;
+    }
+    if (state_.suppress_mask_ctx) {
+        ggml_free(state_.suppress_mask_ctx);
+        state_.suppress_mask_ctx = nullptr;
+    }
+    state_.suppress_mask_tensor = nullptr;
     last_hidden_.clear();
     embd_row_fp16_scratch_.clear();
     prefill_kv_cache_.clear();
@@ -212,6 +221,43 @@ bool TTSTransformer::load_model(const std::string & model_path) {
     if (!state_.cp_galloc) {
         error_msg_ = "Failed to allocate code predictor full-AR gallocr";
         return false;
+    }
+
+    // v9.5: build the static [codec_vocab_size] f32 suppress mask used by
+    // the talker GPU sampling path. Mask shape mirrors the host loop in
+    // generate(): tokens [codec_vocab_size - 1024, codec_vocab_size) other
+    // than codec_eos_id are -INF, everything else 0. The cgraph adds this
+    // mask to logits before the sampling chain, with no per-frame data
+    // motion since the tensor is owned by its own backend buffer.
+    {
+        struct ggml_init_params smp = {
+            /*.mem_size   =*/ ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        state_.suppress_mask_ctx = ggml_init(smp);
+        if (!state_.suppress_mask_ctx) {
+            error_msg_ = "Failed to create suppress mask context";
+            return false;
+        }
+        state_.suppress_mask_tensor = ggml_new_tensor_1d(
+            state_.suppress_mask_ctx, GGML_TYPE_F32, model_.config.codec_vocab_size);
+        ggml_set_name(state_.suppress_mask_tensor, "talker_suppress_mask");
+        state_.suppress_mask_buffer = ggml_backend_alloc_ctx_tensors(
+            state_.suppress_mask_ctx, state_.backend);
+        if (!state_.suppress_mask_buffer) {
+            error_msg_ = "Failed to allocate suppress mask buffer";
+            return false;
+        }
+        std::vector<float> host_mask(model_.config.codec_vocab_size, 0.0f);
+        const int32_t suppress_start = model_.config.codec_vocab_size - 1024;
+        for (int32_t i = suppress_start; i < model_.config.codec_vocab_size; ++i) {
+            if (i != model_.config.codec_eos_id) {
+                host_mask[i] = -INFINITY;
+            }
+        }
+        ggml_backend_tensor_set(state_.suppress_mask_tensor, host_mask.data(),
+                                 0, host_mask.size() * sizeof(float));
     }
 
     if (!try_init_coreml_code_predictor(model_path)) {
@@ -1991,7 +2037,8 @@ struct ggml_cgraph * TTSTransformer::build_prefill_forward_graph(int32_t n_token
     return gf;
 }
 
-struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past) {
+struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past,
+                                                        const talker_sampling_params * sampling) {
     const auto & cfg = model_.config;
     const int n_head = cfg.n_attention_heads;
     const int n_kv_head = cfg.n_key_value_heads;
@@ -2110,19 +2157,19 @@ struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past) {
         struct ggml_tensor * KQ_mask = ggml_get_tensor(ctx0, "inp_mask");
         cur = ggml_flash_attn_ext(ctx0, Q, K, V, KQ_mask, KQscale, 0.0f, 0.0f);
         cur = ggml_cont_2d(ctx0, cur, n_head * head_dim, 1);
-        
+
         cur = ggml_mul_mat(ctx0, layer.attn_output, cur);
         cur = ggml_add(ctx0, cur, inpL);
         struct ggml_tensor * inpFF = cur;
-        
+
         cur = ggml_rms_norm(ctx0, inpFF, eps);
         cur = ggml_mul(ctx0, cur, layer.ffn_norm);
-        
+
         struct ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ffn_gate, cur);
         struct ggml_tensor * up = ggml_mul_mat(ctx0, layer.ffn_up, cur);
-        
+
         gate = ggml_silu(ctx0, gate);
-        
+
         cur = ggml_mul(ctx0, gate, up);
 
         cur = ggml_mul_mat(ctx0, layer.ffn_down, cur);
@@ -2142,6 +2189,57 @@ struct ggml_cgraph * TTSTransformer::build_step_graph(int32_t n_past) {
     ggml_set_output(logits);
 
     ggml_build_forward_expand(gf, logits);
+
+    // v9.5: optionally append rep-penalty + suppress + Gumbel-max top-K
+    // sampling on cb0 logits, exposing "sampled_token" [1, 1] i32 output.
+    // Skips the per-frame host roundtrip + partial_sort + softmax +
+    // discrete_distribution (~100-200 µs/frame on this CPU).
+    //
+    // Chain mirrors the host path in generate():
+    //   multiplier[V] = 1 + gen_mask * (step(logits)*(1/p - p) + p - 1)
+    //                 → sign-aware HF repetition penalty (>0 → /p, ≤0 → *p)
+    //   logits_pen   = logits * multiplier
+    //   logits_sup   = logits_pen + suppress_mask  (-INF on closed range
+    //                  except eos_id, 0 elsewhere; static graph constant)
+    //   sampled      = append_gpu_sampling_view → top_k + Gumbel-max → i32
+    //
+    // Distribution-equivalent to the host path; per-seed audio bits differ
+    // because the RNG stream is the host gumbel buffer instead of
+    // discrete_distribution's mt19937 draw (same as code-pred Phase 1).
+    if (sampling && sampling->active) {
+        const auto & cfg = model_.config;
+        const float p = sampling->repetition_penalty;
+        const int32_t V = cfg.codec_vocab_size;
+        GGML_ASSERT(state_.suppress_mask_tensor != nullptr);
+
+        struct ggml_tensor * logits_1d = ggml_reshape_1d(ctx0, logits, V);
+        struct ggml_tensor * pen_logits = logits_1d;
+
+        if (p != 1.0f) {
+            struct ggml_tensor * gen_mask = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, V);
+            ggml_set_name(gen_mask, "inp_gen_mask");
+            ggml_set_input(gen_mask);
+
+            struct ggml_tensor * step_l   = ggml_step(ctx0, logits_1d);
+            struct ggml_tensor * inner    = ggml_scale_bias(ctx0, step_l, 1.0f / p - p, p);
+            struct ggml_tensor * shifted  = ggml_scale_bias(ctx0, inner, 1.0f, -1.0f);
+            struct ggml_tensor * masked   = ggml_mul(ctx0, gen_mask, shifted);
+            struct ggml_tensor * mult     = ggml_scale_bias(ctx0, masked, 1.0f, 1.0f);
+            pen_logits = ggml_mul(ctx0, logits_1d, mult);
+        }
+
+        struct ggml_tensor * logits_sup = ggml_add(ctx0, pen_logits, state_.suppress_mask_tensor);
+        struct ggml_tensor * logits_sample = ggml_reshape_2d(ctx0, logits_sup, V, 1);
+
+        struct ggml_tensor * gumbel = nullptr;
+        if (sampling->temperature > 0.0f) {
+            gumbel = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, sampling->top_k, 1);
+            ggml_set_name(gumbel, "inp_gumbel");
+            ggml_set_input(gumbel);
+        }
+        append_gpu_sampling_view(ctx0, gf, logits_sample, sampling->temperature,
+                                  sampling->top_k, gumbel, "sampled_token");
+    }
 
     ggml_free(ctx0);
 
@@ -3280,6 +3378,163 @@ bool TTSTransformer::forward_step(const float * step_embd, int32_t n_past,
     return true;
 }
 
+bool TTSTransformer::forward_step_sample(const float * step_embd, int32_t n_past,
+                                          float temperature, int32_t top_k,
+                                          float repetition_penalty,
+                                          const float * gen_token_mask,
+                                          int32_t & sampled_token_out,
+                                          std::vector<float> * hidden_out) {
+    if (!model_.ctx) {
+        error_msg_ = "Model not loaded";
+        return false;
+    }
+    if (!step_embd) {
+        error_msg_ = "step_embd is null";
+        return false;
+    }
+
+    const auto & cfg = model_.config;
+
+    if (state_.cache.n_ctx == 0) {
+        const int32_t min_ctx = std::max<int32_t>(256, n_past + 1 + 16);
+        if (!init_kv_cache(min_ctx)) {
+            return false;
+        }
+    }
+    if (n_past + 1 > state_.cache.n_ctx) {
+        if (!grow_kv_cache(n_past + 1)) {
+            return false;
+        }
+    }
+
+#ifdef QWEN3_TTS_TIMING
+    using clk = std::chrono::high_resolution_clock;
+    auto t0 = clk::now(), t1 = t0;
+    t0 = clk::now();
+#endif
+
+    talker_sampling_params sp;
+    sp.active             = true;
+    sp.temperature        = temperature;
+    sp.top_k              = top_k;
+    sp.repetition_penalty = repetition_penalty;
+
+    struct ggml_cgraph * gf = build_step_graph(n_past, &sp);
+#ifdef QWEN3_TTS_TIMING
+    t1 = clk::now();
+    if (timing_) timing_->t_talker_graph_build_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    t0 = clk::now();
+#endif
+
+    if (!ggml_backend_sched_alloc_graph(state_.sched, gf)) {
+        error_msg_ = "Failed to allocate talker step+sample graph";
+        return false;
+    }
+#ifdef QWEN3_TTS_TIMING
+    t1 = clk::now();
+    if (timing_) timing_->t_talker_graph_alloc_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    t0 = clk::now();
+#endif
+
+    // === inputs ===
+    struct ggml_tensor * inp_step = ggml_graph_get_tensor(gf, "inp_step_embd");
+    if (inp_step) {
+        ggml_backend_tensor_set(inp_step, step_embd, 0, cfg.hidden_size * sizeof(float));
+    }
+    struct ggml_tensor * inp_pos = ggml_graph_get_tensor(gf, "inp_pos");
+    if (inp_pos) {
+        int32_t pos = n_past;
+        ggml_backend_tensor_set(inp_pos, &pos, 0, sizeof(int32_t));
+    }
+    struct ggml_tensor * inp_mask = ggml_graph_get_tensor(gf, "inp_mask");
+    const int32_t kv_n_eff = inp_mask ? (int32_t) inp_mask->ne[0] : 0;
+    if ((int32_t) step_mask_scratch_.size() < kv_n_eff) {
+        step_mask_scratch_.resize(kv_n_eff);
+    }
+    if (inp_mask) {
+        const ggml_fp16_t neg_inf_fp16 = ggml_fp32_to_fp16(-INFINITY);
+        const ggml_fp16_t zero_fp16    = ggml_fp32_to_fp16(0.0f);
+        std::fill_n(step_mask_scratch_.begin(), kv_n_eff, neg_inf_fp16);
+        for (int i = 0; i <= n_past && i < kv_n_eff; i++) {
+            step_mask_scratch_[i] = zero_fp16;
+        }
+        ggml_backend_tensor_set(inp_mask, step_mask_scratch_.data(), 0,
+                                 (size_t) kv_n_eff * sizeof(ggml_fp16_t));
+    }
+
+    if (repetition_penalty != 1.0f) {
+        struct ggml_tensor * inp_gen_mask = ggml_graph_get_tensor(gf, "inp_gen_mask");
+        if (inp_gen_mask) {
+            GGML_ASSERT(gen_token_mask != nullptr);
+            ggml_backend_tensor_set(inp_gen_mask, gen_token_mask, 0,
+                                     (size_t) cfg.codec_vocab_size * sizeof(float));
+        }
+    }
+
+    if (temperature > 0.0f) {
+        struct ggml_tensor * inp_gumbel = ggml_graph_get_tensor(gf, "inp_gumbel");
+        if (inp_gumbel) {
+            if ((int32_t) talker_gumbel_scratch_.size() < top_k) {
+                talker_gumbel_scratch_.resize(top_k);
+            }
+            // Gumbel(0,1) = -log(-log(U))   (U ~ Uniform(0,1)).
+            std::uniform_real_distribution<float> uni(
+                std::numeric_limits<float>::min(), 1.0f);
+            for (int32_t i = 0; i < top_k; ++i) {
+                float u = uni(rng_);
+                talker_gumbel_scratch_[i] = -std::log(-std::log(u));
+            }
+            ggml_backend_tensor_set(inp_gumbel, talker_gumbel_scratch_.data(),
+                                     0, (size_t) top_k * sizeof(float));
+        }
+    }
+#ifdef QWEN3_TTS_TIMING
+    t1 = clk::now();
+    if (timing_) timing_->t_talker_data_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    t0 = clk::now();
+#endif
+
+    if (ggml_backend_sched_graph_compute(state_.sched, gf) != GGML_STATUS_SUCCESS) {
+        error_msg_ = "Failed to compute talker step+sample graph";
+        ggml_backend_sched_reset(state_.sched);
+        return false;
+    }
+#ifdef QWEN3_TTS_TIMING
+    t1 = clk::now();
+    if (timing_) timing_->t_talker_compute_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    t0 = clk::now();
+#endif
+
+    // === outputs ===
+    struct ggml_tensor * hidden = ggml_graph_get_tensor(gf, "hidden_states");
+    if (hidden) {
+        last_hidden_.resize(cfg.hidden_size);
+        ggml_backend_tensor_get(hidden, last_hidden_.data(), 0,
+                                cfg.hidden_size * sizeof(float));
+        if (hidden_out) {
+            *hidden_out = last_hidden_;
+        }
+    }
+
+    struct ggml_tensor * sampled = ggml_graph_get_tensor(gf, "sampled_token");
+    if (!sampled) {
+        error_msg_ = "Failed to find sampled_token tensor in talker step+sample graph";
+        ggml_backend_sched_reset(state_.sched);
+        return false;
+    }
+    int32_t v = 0;
+    ggml_backend_tensor_get(sampled, &v, 0, sizeof(int32_t));
+    sampled_token_out = v;
+
+    state_.cache.n_used = n_past + 1;
+    ggml_backend_sched_reset(state_.sched);
+#ifdef QWEN3_TTS_TIMING
+    t1 = clk::now();
+    if (timing_) timing_->t_talker_data_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+#endif
+    return true;
+}
+
 bool TTSTransformer::forward_codec(int32_t codec_token, int32_t n_past,
                                    std::vector<float> & output) {
     std::vector<float> codec_row;
@@ -4224,6 +4479,17 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
     std::vector<float> step_embd(cfg.hidden_size, 0.0f);
     std::vector<float> embd_row(cfg.hidden_size);
 
+    // v9.5: GPU-side talker sampling. When enabled, the talker step graph
+    // emits a sampled cb0 token directly (i32) — skipping the per-frame
+    // logits roundtrip + host suppress/rep-penalty/top-K/softmax/distribution.
+    // Frame 0 still samples on host (logits come from forward_prefill); from
+    // frame 1 onward the previous iter's forward_step_sample produces this
+    // iter's cb0. Opt out via QWEN3_TTS_NO_TALKER_GPU_SAMPLE=1.
+    static const bool s_no_talker_gpu_sample = std::getenv("QWEN3_TTS_NO_TALKER_GPU_SAMPLE") != nullptr;
+    const bool use_talker_gpu_sample = !s_no_talker_gpu_sample;
+    int32_t pending_gpu_sample = -1;
+    bool gpu_sample_ready = false;
+
     int64_t t_decode_start = verbose_ ? verbose_now_ms() : 0;
     int64_t t_decode_last = t_decode_start;
 
@@ -4253,63 +4519,71 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
             for (int i = 0; i < 5; ++i) fprintf(stderr, " %d(%.3f)", sc[i].second, sc[i].first);
             fprintf(stderr, "\n");
         }
-        // Suppress tokens in [codec_vocab_size - 1024, codec_vocab_size), except codec_eos_id
-        for (int32_t i = suppress_start; i < cfg.codec_vocab_size; ++i) {
-            if (i != cfg.codec_eos_id) {
-                logits[i] = -INFINITY;
-            }
-        }
-
-        // Repetition penalty (HuggingFace style) on previously generated CB0 tokens
-        if (repetition_penalty != 1.0f) {
-            for (int32_t tok : generated_cb0_tokens) {
-                if (tok >= 0 && tok < cfg.codec_vocab_size) {
-                    if (logits[tok] > 0.0f) {
-                        logits[tok] /= repetition_penalty;
-                    } else {
-                        logits[tok] *= repetition_penalty;
-                    }
-                }
-            }
-        }
-
         int32_t next_token;
-        if (temperature <= 0.0f) {
-            next_token = argmax(logits.data(), cfg.codec_vocab_size);
+        if (gpu_sample_ready) {
+            // Sampled by previous iter's forward_step_sample.
+            next_token = pending_gpu_sample;
+            gpu_sample_ready = false;
         } else {
-            for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) {
-                logits[i] /= temperature;
+            // Host fallback path: frame 0 (logits came from forward_prefill,
+            // already on host) or QWEN3_TTS_NO_TALKER_GPU_SAMPLE=1.
+            // Suppress tokens in [codec_vocab_size - 1024, codec_vocab_size), except codec_eos_id
+            for (int32_t i = suppress_start; i < cfg.codec_vocab_size; ++i) {
+                if (i != cfg.codec_eos_id) {
+                    logits[i] = -INFINITY;
+                }
             }
 
-            if (top_k > 0 && top_k < cfg.codec_vocab_size) {
-                std::vector<std::pair<float, int32_t>> scored(cfg.codec_vocab_size);
-                for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) {
-                    scored[i] = {logits[i], i};
-                }
-                std::partial_sort(scored.begin(), scored.begin() + top_k, scored.end(),
-                    [](const std::pair<float, int32_t> & a, const std::pair<float, int32_t> & b) {
-                        return a.first > b.first;
-                    });
-                float threshold = scored[top_k - 1].first;
-                for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) {
-                    if (logits[i] < threshold) {
-                        logits[i] = -INFINITY;
+            // Repetition penalty (HuggingFace style) on previously generated CB0 tokens
+            if (repetition_penalty != 1.0f) {
+                for (int32_t tok : generated_cb0_tokens) {
+                    if (tok >= 0 && tok < cfg.codec_vocab_size) {
+                        if (logits[tok] > 0.0f) {
+                            logits[tok] /= repetition_penalty;
+                        } else {
+                            logits[tok] *= repetition_penalty;
+                        }
                     }
                 }
             }
 
-            float max_logit = *std::max_element(logits.data(), logits.data() + cfg.codec_vocab_size);
-            double sum = 0.0;
-            for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) {
-                probs[i] = expf(logits[i] - max_logit);
-                sum += probs[i];
-            }
-            for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) {
-                probs[i] = (float)(probs[i] / sum);
-            }
+            if (temperature <= 0.0f) {
+                next_token = argmax(logits.data(), cfg.codec_vocab_size);
+            } else {
+                for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) {
+                    logits[i] /= temperature;
+                }
 
-            std::discrete_distribution<int32_t> dist(probs.begin(), probs.end());
-            next_token = dist(rng_);
+                if (top_k > 0 && top_k < cfg.codec_vocab_size) {
+                    std::vector<std::pair<float, int32_t>> scored(cfg.codec_vocab_size);
+                    for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) {
+                        scored[i] = {logits[i], i};
+                    }
+                    std::partial_sort(scored.begin(), scored.begin() + top_k, scored.end(),
+                        [](const std::pair<float, int32_t> & a, const std::pair<float, int32_t> & b) {
+                            return a.first > b.first;
+                        });
+                    float threshold = scored[top_k - 1].first;
+                    for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) {
+                        if (logits[i] < threshold) {
+                            logits[i] = -INFINITY;
+                        }
+                    }
+                }
+
+                float max_logit = *std::max_element(logits.data(), logits.data() + cfg.codec_vocab_size);
+                double sum = 0.0;
+                for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) {
+                    probs[i] = expf(logits[i] - max_logit);
+                    sum += probs[i];
+                }
+                for (int32_t i = 0; i < cfg.codec_vocab_size; ++i) {
+                    probs[i] = (float)(probs[i] / sum);
+                }
+
+                std::discrete_distribution<int32_t> dist(probs.begin(), probs.end());
+                next_token = dist(rng_);
+            }
         }
         
         if (next_token == cfg.codec_eos_id) {
@@ -4390,14 +4664,39 @@ bool TTSTransformer::generate(const int32_t * text_tokens, int32_t n_tokens,
 #ifdef QWEN3_TTS_TIMING
         t0 = clk::now();
 #endif
-        if (!forward_step(step_embd.data(), n_past, logits)) {
-            return false;
+        if (use_talker_gpu_sample) {
+            // Build the [codec_vocab_size] f32 gen-mask from the running set
+            // of previously-sampled cb0 tokens. Cheap (memset 0 + |set| stores).
+            if ((int32_t) talker_gen_mask_scratch_.size() < cfg.codec_vocab_size) {
+                talker_gen_mask_scratch_.resize(cfg.codec_vocab_size);
+            }
+            std::fill(talker_gen_mask_scratch_.begin(),
+                      talker_gen_mask_scratch_.begin() + cfg.codec_vocab_size,
+                      0.0f);
+            for (int32_t tok : generated_cb0_tokens) {
+                if (tok >= 0 && tok < cfg.codec_vocab_size) {
+                    talker_gen_mask_scratch_[tok] = 1.0f;
+                }
+            }
+            int32_t sampled_next = -1;
+            if (!forward_step_sample(step_embd.data(), n_past,
+                                      temperature, top_k, repetition_penalty,
+                                      talker_gen_mask_scratch_.data(),
+                                      sampled_next, nullptr)) {
+                return false;
+            }
+            pending_gpu_sample = sampled_next;
+            gpu_sample_ready = true;
+        } else {
+            if (!forward_step(step_embd.data(), n_past, logits)) {
+                return false;
+            }
         }
 #ifdef QWEN3_TTS_TIMING
         t1 = clk::now();
         timing.t_talker_forward_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
 #endif
-        
+
         n_past++;
     }
 
