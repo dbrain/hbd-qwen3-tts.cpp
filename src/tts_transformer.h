@@ -469,7 +469,7 @@ private:
     struct ggml_cgraph * build_code_pred_prefill_graph(float temperature, int32_t top_k);
 
     // Append a GPU sampling chain to gf for tensor `logits` (shape [V, 1] f32).
-    // Returns the named "sampled_token" tensor (shape [1] i32).
+    // Returns the named sampled-token tensor (shape [1] i32).
     // - temperature <= 0 → ggml_argmax(logits).
     // - temperature  > 0 → scale(1/T) → top_k → gather → +Gumbel → argmax → gather.
     //   Caller must register a graph input named `gumbel_input_name` with
@@ -482,6 +482,29 @@ private:
                                               int32_t top_k,
                                               const char * gumbel_input_name,
                                               const char * sampled_output_name);
+
+    // Same as append_gpu_sampling but consumes an existing `gumbel` tensor
+    // (typically a view into a shared per-frame Gumbel buffer). Used by
+    // build_code_pred_full_ar_graph so all 15 sampling chains share one
+    // [top_k * 15] f32 input rather than emitting 15 separate inputs.
+    struct ggml_tensor * append_gpu_sampling_view(struct ggml_context * ctx,
+                                                   struct ggml_cgraph * gf,
+                                                   struct ggml_tensor * logits,
+                                                   float temperature,
+                                                   int32_t top_k,
+                                                   struct ggml_tensor * gumbel,
+                                                   const char * sampled_output_name);
+
+    // Phase 2: single cgraph for the entire code-pred AR loop (1 prefill +
+    // 14 AR steps, 15 codebook outputs total). Each step's sampled-token
+    // tensor feeds the next step's embed-lookup directly via graph deps,
+    // so ggml-cuda's per-compute graph capture covers the whole AR — no
+    // host roundtrip between steps. Outputs: 15 named tensors
+    // "sampled_token_0" .. "sampled_token_14" (each [1] i32). Inputs:
+    // "inp_hidden", "inp_cb0_embd", "inp_pos_all" [16] i32,
+    // "inp_mask_all" [n_ctx, 14] f16, "inp_gumbel_all" [top_k, 15] f32
+    // (only when temperature > 0).
+    struct ggml_cgraph * build_code_pred_full_ar_graph(float temperature, int32_t top_k);
     
     // Parse hyperparameters from GGUF
     bool parse_config(struct gguf_context * ctx);

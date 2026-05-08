@@ -2223,13 +2223,13 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_graph(int32_t n_prev_codes)
     return gf;
 }
 
-struct ggml_tensor * TTSTransformer::append_gpu_sampling(struct ggml_context * ctx,
-                                                           struct ggml_cgraph * gf,
-                                                           struct ggml_tensor * logits,
-                                                           float temperature,
-                                                           int32_t top_k,
-                                                           const char * gumbel_input_name,
-                                                           const char * sampled_output_name) {
+struct ggml_tensor * TTSTransformer::append_gpu_sampling_view(struct ggml_context * ctx,
+                                                                struct ggml_cgraph * gf,
+                                                                struct ggml_tensor * logits,
+                                                                float temperature,
+                                                                int32_t top_k,
+                                                                struct ggml_tensor * gumbel,
+                                                                const char * sampled_output_name) {
     // Greedy / argmax path: temperature <= 0 mirrors the host argmax fallback.
     // logits is [V, 1] (matrix), ggml_argmax returns [1] i32 = argmax along ne[0].
     if (temperature <= 0.0f) {
@@ -2239,6 +2239,8 @@ struct ggml_tensor * TTSTransformer::append_gpu_sampling(struct ggml_context * c
         ggml_build_forward_expand(gf, sampled);
         return sampled;
     }
+
+    GGML_ASSERT(gumbel != nullptr);
 
     // Gumbel-max categorical sampling restricted to top-K candidates.
     //   1. scale(logits, 1/T)                 [V, 1]
@@ -2262,12 +2264,9 @@ struct ggml_tensor * TTSTransformer::append_gpu_sampling(struct ggml_context * c
     struct ggml_tensor * topk_vals = ggml_get_rows(ctx, scaled_rows, topk_idx);      // [1, K] f32
 
     struct ggml_tensor * topk_vals_flat = ggml_reshape_2d(ctx, topk_vals, top_k, 1); // [K, 1]
+    struct ggml_tensor * gumbel_flat   = ggml_reshape_2d(ctx, gumbel,   top_k, 1);   // [K, 1]
 
-    struct ggml_tensor * gumbel = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, top_k, 1);
-    ggml_set_name(gumbel, gumbel_input_name);
-    ggml_set_input(gumbel);
-
-    struct ggml_tensor * with_noise = ggml_add(ctx, topk_vals_flat, gumbel);         // [K, 1]
+    struct ggml_tensor * with_noise = ggml_add(ctx, topk_vals_flat, gumbel_flat);    // [K, 1]
     struct ggml_tensor * rel_idx = ggml_argmax(ctx, with_noise);                     // [1] i32
 
     // Reshape top_k_idx to "1-element rows" of K entries so the final get_rows
@@ -2279,6 +2278,22 @@ struct ggml_tensor * TTSTransformer::append_gpu_sampling(struct ggml_context * c
     ggml_set_output(sampled);
     ggml_build_forward_expand(gf, sampled);
     return sampled;
+}
+
+struct ggml_tensor * TTSTransformer::append_gpu_sampling(struct ggml_context * ctx,
+                                                           struct ggml_cgraph * gf,
+                                                           struct ggml_tensor * logits,
+                                                           float temperature,
+                                                           int32_t top_k,
+                                                           const char * gumbel_input_name,
+                                                           const char * sampled_output_name) {
+    struct ggml_tensor * gumbel = nullptr;
+    if (temperature > 0.0f) {
+        gumbel = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, top_k, 1);
+        ggml_set_name(gumbel, gumbel_input_name);
+        ggml_set_input(gumbel);
+    }
+    return append_gpu_sampling_view(ctx, gf, logits, temperature, top_k, gumbel, sampled_output_name);
 }
 
 struct ggml_cgraph * TTSTransformer::build_code_pred_prefill_graph(float temperature, int32_t top_k) {
@@ -2600,6 +2615,299 @@ struct ggml_cgraph * TTSTransformer::build_code_pred_step_graph(int32_t /*n_past
 
     ggml_free(ctx0);
 
+    return gf;
+}
+
+struct ggml_cgraph * TTSTransformer::build_code_pred_full_ar_graph(float temperature, int32_t top_k) {
+    // Single cgraph for the entire code-pred AR loop:
+    //   prefill (2 tokens, manual attention) → 14 step subgraphs (FA over KV cache).
+    // The sampled-token tensor of step N feeds step N+1's embed lookup as a
+    // graph-level data dependency, so ggml-cuda's per-compute graph capture
+    // covers all 15 inferences without a host roundtrip between steps.
+    //
+    // Key positions:
+    //   inp_pos_all[0..1]           prefill positions  (0, 1)
+    //   inp_pos_all[2..15]          AR step positions  (= n_past at each step)
+    //   inp_mask_all[:, k] for k = 0..13  is the FA mask for AR step k+1
+    //   inp_gumbel_all[:, 0..14]    Gumbel noise per output (only when T > 0)
+
+    const auto & cfg = model_.config;
+    const int n_head = cfg.n_attention_heads;
+    const int n_kv_head = cfg.n_key_value_heads;
+    const int head_dim = cfg.head_dim;
+    const int hidden_size = cfg.hidden_size;
+    const int cp_hidden = cfg.code_pred_hidden_size;
+    const float eps = cfg.rms_norm_eps;
+    const float rope_theta = cfg.rope_theta;
+    const int n_layer = cfg.code_pred_layers;
+    const float KQscale = 1.0f / sqrtf(float(head_dim));
+    const int32_t n_ctx_kv = state_.code_pred_cache.n_ctx;
+    constexpr int kNArSteps   = 14;
+    constexpr int kNOutputs   = 15; // 1 prefill + 14 AR steps
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ state_.compute_meta.size(),
+        /*.mem_buffer =*/ state_.compute_meta.data(),
+        /*.no_alloc   =*/ true,
+    };
+
+    struct ggml_context * ctx0 = ggml_init(params);
+    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, QWEN3_TTS_MAX_NODES, false);
+
+    // === Shared inputs ===
+    struct ggml_tensor * inp_hidden = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hidden_size);
+    ggml_set_name(inp_hidden, "inp_hidden");
+    ggml_set_input(inp_hidden);
+
+    struct ggml_tensor * inp_cb0_embd = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, hidden_size);
+    ggml_set_name(inp_cb0_embd, "inp_cb0_embd");
+    ggml_set_input(inp_cb0_embd);
+
+    // 16 positions: 0,1 for prefill + 2..15 for the 14 AR steps.
+    struct ggml_tensor * inp_pos_all = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 16);
+    ggml_set_name(inp_pos_all, "inp_pos_all");
+    ggml_set_input(inp_pos_all);
+
+    // FA masks for the 14 AR steps. Each column k is the [n_ctx] mask used
+    // by step (k+1)'s flash_attn_ext call.
+    struct ggml_tensor * inp_mask_all = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_ctx_kv, kNArSteps);
+    ggml_set_name(inp_mask_all, "inp_mask_all");
+    ggml_set_input(inp_mask_all);
+
+    // Gumbel noise: one [top_k] column per output. Skipped entirely when
+    // temperature <= 0 (the sampling chain collapses to ggml_argmax).
+    struct ggml_tensor * inp_gumbel_all = nullptr;
+    if (temperature > 0.0f) {
+        inp_gumbel_all = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, top_k, kNOutputs);
+        ggml_set_name(inp_gumbel_all, "inp_gumbel_all");
+        ggml_set_input(inp_gumbel_all);
+    }
+
+    auto gumbel_view_for = [&](int step_idx) -> struct ggml_tensor * {
+        if (!inp_gumbel_all) return nullptr;
+        return ggml_view_2d(ctx0, inp_gumbel_all, top_k, 1,
+                             top_k * sizeof(float),
+                             (size_t) step_idx * top_k * sizeof(float));
+    };
+
+    // === Prefill (n_tokens = 2, manual attention with diag_mask_inf) ===
+    struct ggml_tensor * pos_pf = ggml_view_1d(ctx0, inp_pos_all, 2, 0);
+
+    struct ggml_tensor * hidden_2d = ggml_reshape_2d(ctx0, inp_hidden, hidden_size, 1);
+    struct ggml_tensor * cb0_2d    = ggml_reshape_2d(ctx0, inp_cb0_embd, hidden_size, 1);
+    struct ggml_tensor * cur = ggml_concat(ctx0, hidden_2d, cb0_2d, 1);
+
+    if (model_.mtp_proj_weight) {
+        cur = ggml_mul_mat(ctx0, model_.mtp_proj_weight, cur);
+        cur = ggml_add(ctx0, cur, model_.mtp_proj_bias);
+    }
+
+    struct ggml_tensor * inpL = cur;
+
+    for (int il = 0; il < n_layer; ++il) {
+        const auto & layer = model_.code_pred_layers[il];
+
+        cur = ggml_rms_norm(ctx0, inpL, eps);
+        cur = ggml_mul(ctx0, cur, layer.attn_norm);
+
+        struct ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.attn_q, cur);
+        struct ggml_tensor * Kcur = ggml_mul_mat(ctx0, layer.attn_k, cur);
+        struct ggml_tensor * Vcur = ggml_mul_mat(ctx0, layer.attn_v, cur);
+
+        // QKV topo fix from v4: keep Q/K/V mul_mats adjacent in cgraph
+        // so the allocator gives all three distinct dst slots before any
+        // consumer is built. See build_code_pred_step_graph for the full
+        // mechanism explanation.
+        ggml_build_forward_expand(gf, Qcur);
+        ggml_build_forward_expand(gf, Kcur);
+        ggml_build_forward_expand(gf, Vcur);
+
+        Qcur = ggml_reshape_3d(ctx0, Qcur, head_dim, n_head, 2);
+        Kcur = ggml_reshape_3d(ctx0, Kcur, head_dim, n_kv_head, 2);
+        Vcur = ggml_reshape_3d(ctx0, Vcur, head_dim, n_kv_head, 2);
+
+        if (layer.attn_q_norm) {
+            Qcur = ggml_rms_norm(ctx0, Qcur, eps);
+            Qcur = ggml_mul(ctx0, Qcur, layer.attn_q_norm);
+        }
+        if (layer.attn_k_norm) {
+            Kcur = ggml_rms_norm(ctx0, Kcur, eps);
+            Kcur = ggml_mul(ctx0, Kcur, layer.attn_k_norm);
+        }
+
+        Qcur = ggml_rope_ext(ctx0, Qcur, pos_pf, nullptr,
+                             head_dim, GGML_ROPE_TYPE_NEOX, 0,
+                             rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        Kcur = ggml_rope_ext(ctx0, Kcur, pos_pf, nullptr,
+                             head_dim, GGML_ROPE_TYPE_NEOX, 0,
+                             rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+        struct ggml_tensor * k_cache = state_.code_pred_cache.k_cache[il];
+        struct ggml_tensor * v_cache = state_.code_pred_cache.v_cache[il];
+
+        struct ggml_tensor * k_cache_2d = ggml_view_2d(ctx0, k_cache, head_dim * n_kv_head, n_ctx_kv, k_cache->nb[2], 0);
+        struct ggml_tensor * v_cache_2d = ggml_view_2d(ctx0, v_cache, head_dim * n_kv_head, n_ctx_kv, v_cache->nb[2], 0);
+        struct ggml_tensor * Kcur_2d    = ggml_view_2d(ctx0, Kcur, head_dim * n_kv_head, 2, Kcur->nb[2], 0);
+        struct ggml_tensor * Vcur_2d    = ggml_view_2d(ctx0, Vcur, head_dim * n_kv_head, 2, Vcur->nb[2], 0);
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, k_cache_2d, Kcur_2d, pos_pf));
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, v_cache_2d, Vcur_2d, pos_pf));
+
+        struct ggml_tensor * Q = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
+        struct ggml_tensor * K = ggml_permute(ctx0, Kcur, 0, 2, 1, 3);
+        struct ggml_tensor * V = ggml_permute(ctx0, Vcur, 0, 2, 1, 3);
+
+        struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
+        KQ = ggml_scale(ctx0, KQ, KQscale);
+        KQ = ggml_diag_mask_inf(ctx0, KQ, 0);
+        KQ = ggml_soft_max(ctx0, KQ);
+
+        V = ggml_cont(ctx0, ggml_transpose(ctx0, V));
+
+        struct ggml_tensor * KQV = ggml_mul_mat(ctx0, V, KQ);
+        KQV = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
+        cur = ggml_cont_2d(ctx0, KQV, n_head * head_dim, 2);
+
+        cur = ggml_mul_mat(ctx0, layer.attn_output, cur);
+        cur = ggml_add(ctx0, cur, inpL);
+        struct ggml_tensor * inpFF = cur;
+
+        cur = ggml_rms_norm(ctx0, inpFF, eps);
+        cur = ggml_mul(ctx0, cur, layer.ffn_norm);
+
+        struct ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ffn_gate, cur);
+        struct ggml_tensor * up   = ggml_mul_mat(ctx0, layer.ffn_up, cur);
+
+        gate = ggml_silu(ctx0, gate);
+        cur = ggml_mul(ctx0, gate, up);
+        cur = ggml_mul_mat(ctx0, layer.ffn_down, cur);
+        inpL = ggml_add(ctx0, cur, inpFF);
+    }
+
+    cur = ggml_rms_norm(ctx0, inpL, eps);
+    cur = ggml_mul(ctx0, cur, model_.code_pred_output_norm);
+
+    // Last token's hidden state (the one that produced cb0; we sample its
+    // logits to predict cb1, which the AR step graphs will refine).
+    struct ggml_tensor * last_hidden = ggml_view_2d(ctx0, cur, cp_hidden, 1,
+                                                     cur->nb[1], (int64_t) cp_hidden * sizeof(float));
+
+    struct ggml_tensor * logits_pf = ggml_mul_mat(ctx0, model_.code_pred_head[0], last_hidden);
+    ggml_build_forward_expand(gf, logits_pf);
+
+    struct ggml_tensor * prev_sampled = append_gpu_sampling_view(
+        ctx0, gf, logits_pf, temperature, top_k,
+        gumbel_view_for(0), "sampled_token_0");
+
+    // === 14 AR steps (FA over KV cache, n_tokens = 1 each) ===
+    for (int step = 1; step <= kNArSteps; ++step) {
+        // Position: pos_all[step + 1] (n_past = step + 1 in the original loop).
+        struct ggml_tensor * pos_st = ggml_view_1d(ctx0, inp_pos_all, 1,
+                                                    (size_t) (step + 1) * sizeof(int32_t));
+
+        // Mask: column (step - 1) of inp_mask_all.
+        struct ggml_tensor * mask_st = ggml_view_2d(ctx0, inp_mask_all, n_ctx_kv, 1,
+                                                     (size_t) n_ctx_kv * sizeof(ggml_fp16_t),
+                                                     (size_t) (step - 1) * n_ctx_kv * sizeof(ggml_fp16_t));
+
+        // Embed lookup feeds from previous step's sampled-token tensor.
+        cur = ggml_get_rows(ctx0, model_.code_pred_embd[step - 1], prev_sampled);
+        cur = ggml_reshape_2d(ctx0, cur, hidden_size, 1);
+
+        if (model_.mtp_proj_weight) {
+            cur = ggml_mul_mat(ctx0, model_.mtp_proj_weight, cur);
+            cur = ggml_add(ctx0, cur, model_.mtp_proj_bias);
+        }
+
+        inpL = cur;
+
+        for (int il = 0; il < n_layer; ++il) {
+            const auto & layer = model_.code_pred_layers[il];
+
+            cur = ggml_rms_norm(ctx0, inpL, eps);
+            cur = ggml_mul(ctx0, cur, layer.attn_norm);
+
+            struct ggml_tensor * Qcur = ggml_mul_mat(ctx0, layer.attn_q, cur);
+            struct ggml_tensor * Kcur = ggml_mul_mat(ctx0, layer.attn_k, cur);
+            struct ggml_tensor * Vcur = ggml_mul_mat(ctx0, layer.attn_v, cur);
+
+            ggml_build_forward_expand(gf, Qcur);
+            ggml_build_forward_expand(gf, Kcur);
+            ggml_build_forward_expand(gf, Vcur);
+
+            Qcur = ggml_reshape_3d(ctx0, Qcur, head_dim, n_head, 1);
+            Kcur = ggml_reshape_3d(ctx0, Kcur, head_dim, n_kv_head, 1);
+            Vcur = ggml_reshape_3d(ctx0, Vcur, head_dim, n_kv_head, 1);
+
+            if (layer.attn_q_norm) {
+                Qcur = ggml_rms_norm(ctx0, Qcur, eps);
+                Qcur = ggml_mul(ctx0, Qcur, layer.attn_q_norm);
+            }
+            if (layer.attn_k_norm) {
+                Kcur = ggml_rms_norm(ctx0, Kcur, eps);
+                Kcur = ggml_mul(ctx0, Kcur, layer.attn_k_norm);
+            }
+
+            Qcur = ggml_rope_ext(ctx0, Qcur, pos_st, nullptr,
+                                 head_dim, GGML_ROPE_TYPE_NEOX, 0,
+                                 rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            Kcur = ggml_rope_ext(ctx0, Kcur, pos_st, nullptr,
+                                 head_dim, GGML_ROPE_TYPE_NEOX, 0,
+                                 rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+            struct ggml_tensor * k_cache = state_.code_pred_cache.k_cache[il];
+            struct ggml_tensor * v_cache = state_.code_pred_cache.v_cache[il];
+
+            struct ggml_tensor * k_cache_2d = ggml_view_2d(ctx0, k_cache, head_dim * n_kv_head, n_ctx_kv, k_cache->nb[2], 0);
+            struct ggml_tensor * v_cache_2d = ggml_view_2d(ctx0, v_cache, head_dim * n_kv_head, n_ctx_kv, v_cache->nb[2], 0);
+            struct ggml_tensor * Kcur_2d    = ggml_view_2d(ctx0, Kcur, head_dim * n_kv_head, 1, Kcur->nb[2], 0);
+            struct ggml_tensor * Vcur_2d    = ggml_view_2d(ctx0, Vcur, head_dim * n_kv_head, 1, Vcur->nb[2], 0);
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx0, k_cache_2d, Kcur_2d, pos_st));
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx0, v_cache_2d, Vcur_2d, pos_st));
+
+            struct ggml_tensor * K = ggml_view_3d(ctx0, k_cache,
+                                                   head_dim, n_kv_head, n_ctx_kv,
+                                                   k_cache->nb[1], k_cache->nb[2], 0);
+            struct ggml_tensor * V = ggml_view_3d(ctx0, v_cache,
+                                                   head_dim, n_kv_head, n_ctx_kv,
+                                                   v_cache->nb[1], v_cache->nb[2], 0);
+
+            struct ggml_tensor * Q = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
+            K = ggml_permute(ctx0, K, 0, 2, 1, 3);
+            V = ggml_permute(ctx0, V, 0, 2, 1, 3);
+
+            cur = ggml_flash_attn_ext(ctx0, Q, K, V, mask_st, KQscale, 0.0f, 0.0f);
+            cur = ggml_cont_2d(ctx0, cur, n_head * head_dim, 1);
+
+            cur = ggml_mul_mat(ctx0, layer.attn_output, cur);
+            cur = ggml_add(ctx0, cur, inpL);
+            struct ggml_tensor * inpFF = cur;
+
+            cur = ggml_rms_norm(ctx0, inpFF, eps);
+            cur = ggml_mul(ctx0, cur, layer.ffn_norm);
+
+            struct ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ffn_gate, cur);
+            struct ggml_tensor * up   = ggml_mul_mat(ctx0, layer.ffn_up, cur);
+
+            gate = ggml_silu(ctx0, gate);
+            cur = ggml_mul(ctx0, gate, up);
+            cur = ggml_mul_mat(ctx0, layer.ffn_down, cur);
+            inpL = ggml_add(ctx0, cur, inpFF);
+        }
+
+        cur = ggml_rms_norm(ctx0, inpL, eps);
+        cur = ggml_mul(ctx0, cur, model_.code_pred_output_norm);
+
+        struct ggml_tensor * logits_st = ggml_mul_mat(ctx0, model_.code_pred_head[step], cur);
+        ggml_build_forward_expand(gf, logits_st);
+
+        char sampled_name[32];
+        snprintf(sampled_name, sizeof(sampled_name), "sampled_token_%d", step);
+        prev_sampled = append_gpu_sampling_view(
+            ctx0, gf, logits_st, temperature, top_k,
+            gumbel_view_for(step), sampled_name);
+    }
+
+    ggml_free(ctx0);
     return gf;
 }
 
@@ -3197,8 +3505,119 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
     t1 = clk::now();
     if (timing_) timing_->t_code_pred_init_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
 #endif
-    
-    // Prefill with 2 tokens [past_hidden, cb0_embd]
+
+    // Phase 2 default path: single cgraph for prefill + 14 AR steps.
+    // ggml-cuda's per-compute graph capture covers all 15 inferences in
+    // one capture, recovering the host-overhead slice (graph build/alloc/IO
+    // per step) which the v5 timing dump pinned at ~1.3 ms/frame.
+    static const bool s_no_full_ar = std::getenv("QWEN3_TTS_NO_FULL_AR_GRAPH") != nullptr;
+    if (!s_no_full_ar) {
+#ifdef QWEN3_TTS_TIMING
+        t0 = clk::now();
+#endif
+        struct ggml_cgraph * gf = build_code_pred_full_ar_graph(temperature, gumbel_top_k);
+#ifdef QWEN3_TTS_TIMING
+        t1 = clk::now();
+        if (timing_) timing_->t_code_pred_graph_build_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        t0 = clk::now();
+#endif
+        if (!ggml_backend_sched_alloc_graph(state_.sched, gf)) {
+            error_msg_ = "Failed to allocate code predictor full-AR graph";
+            return false;
+        }
+#ifdef QWEN3_TTS_TIMING
+        t1 = clk::now();
+        if (timing_) timing_->t_code_pred_graph_alloc_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        t0 = clk::now();
+#endif
+
+        const int32_t n_ctx_kv = state_.code_pred_cache.n_ctx;
+
+        struct ggml_tensor * inp_hidden_t = ggml_graph_get_tensor(gf, "inp_hidden");
+        if (inp_hidden_t) {
+            ggml_backend_tensor_set(inp_hidden_t, hidden, 0, cfg.hidden_size * sizeof(float));
+        }
+        struct ggml_tensor * inp_cb0_embd_t = ggml_graph_get_tensor(gf, "inp_cb0_embd");
+        if (inp_cb0_embd_t) {
+            ggml_backend_tensor_set(inp_cb0_embd_t, cb0_embd.data(), 0, cfg.hidden_size * sizeof(float));
+        }
+
+        struct ggml_tensor * inp_pos_all = ggml_graph_get_tensor(gf, "inp_pos_all");
+        if (inp_pos_all) {
+            int32_t positions[16];
+            for (int i = 0; i < 16; ++i) positions[i] = i; // 0,1 prefill + 2..15 AR steps
+            ggml_backend_tensor_set(inp_pos_all, positions, 0, 16 * sizeof(int32_t));
+        }
+
+        // Pre-compute all 14 step masks. Step k (1..14) attends to slots
+        // [0, n_past] = [0, k+1]; the rest are -inf. Layout: column-major
+        // [n_ctx, 14] f16, column k holds step (k+1)'s mask.
+        struct ggml_tensor * inp_mask_all = ggml_graph_get_tensor(gf, "inp_mask_all");
+        if (inp_mask_all) {
+            const ggml_fp16_t neg_inf_fp16 = ggml_fp32_to_fp16(-INFINITY);
+            const ggml_fp16_t zero_fp16    = ggml_fp32_to_fp16(0.0f);
+            std::vector<ggml_fp16_t> mask_buf((size_t) n_ctx_kv * 14, neg_inf_fp16);
+            for (int step = 1; step <= 14; ++step) {
+                const int n_past = step + 1;
+                ggml_fp16_t * col = mask_buf.data() + (size_t) (step - 1) * n_ctx_kv;
+                for (int i = 0; i <= n_past && i < n_ctx_kv; ++i) {
+                    col[i] = zero_fp16;
+                }
+            }
+            ggml_backend_tensor_set(inp_mask_all, mask_buf.data(), 0,
+                                     (size_t) n_ctx_kv * 14 * sizeof(ggml_fp16_t));
+        }
+
+        if (temperature > 0.0f) {
+            struct ggml_tensor * inp_gumbel_all = ggml_graph_get_tensor(gf, "inp_gumbel_all");
+            if (inp_gumbel_all) {
+                ggml_backend_tensor_set(inp_gumbel_all,
+                                         code_pred_gumbel_scratch_.data(),
+                                         0,
+                                         (size_t) gumbel_top_k * 15 * sizeof(float));
+            }
+        }
+#ifdef QWEN3_TTS_TIMING
+        t1 = clk::now();
+        if (timing_) timing_->t_code_pred_data_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        t0 = clk::now();
+#endif
+
+        if (ggml_backend_sched_graph_compute(state_.sched, gf) != GGML_STATUS_SUCCESS) {
+            error_msg_ = "Failed to compute code predictor full-AR graph";
+            ggml_backend_sched_reset(state_.sched);
+            return false;
+        }
+#ifdef QWEN3_TTS_TIMING
+        t1 = clk::now();
+        if (timing_) timing_->t_code_pred_compute_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        t0 = clk::now();
+#endif
+
+        for (int s = 0; s < 15; ++s) {
+            char name[32];
+            snprintf(name, sizeof(name), "sampled_token_%d", s);
+            struct ggml_tensor * sampled = ggml_graph_get_tensor(gf, name);
+            if (!sampled) {
+                error_msg_ = std::string("Failed to find ") + name + " in full-AR graph";
+                ggml_backend_sched_reset(state_.sched);
+                return false;
+            }
+            int32_t v = 0;
+            ggml_backend_tensor_get(sampled, &v, 0, sizeof(int32_t));
+            output[s] = v;
+        }
+
+        ggml_backend_sched_reset(state_.sched);
+#ifdef QWEN3_TTS_TIMING
+        t1 = clk::now();
+        if (timing_) timing_->t_code_pred_data_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+#endif
+        return true;
+    }
+
+    // Phase 1 / fallback path (per-step cgraphs): kept behind
+    // QWEN3_TTS_NO_FULL_AR_GRAPH for parity comparison + safety valve.
     {
 #ifdef QWEN3_TTS_TIMING
         auto t_pf_start = clk::now();
