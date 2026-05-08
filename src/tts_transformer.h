@@ -226,6 +226,15 @@ struct tts_transformer_state {
     bool                  cp_cache_temp_pos = false; // signature: temperature > 0?
     int32_t               cp_cache_top_k    = 0;
     int32_t               cp_cache_n_ctx_kv = 0;
+
+    // Dedicated gallocr for the cached full-AR cgraph path (v9.4). Bypasses
+    // ggml_backend_sched entirely on cache hits — sched_split_graph frees and
+    // re-inits sched->ctx every alloc_graph, so any cgraph cached across
+    // frames hits the gallocr offset-reuse trap (siglip2 graph_cache_gotcha).
+    // The full-AR cgraph runs entirely on the talker backend (no CPU
+    // fallback paths), so we can drive it with a one-backend gallocr +
+    // direct ggml_backend_graph_compute and skip the split/copy mutation.
+    ggml_gallocr_t cp_galloc = nullptr;
 };
 
 // TTS Transformer class

@@ -60,6 +60,10 @@ void TTSTransformer::unload_model() {
     state_.cp_cache_top_k = 0;
     state_.cp_cache_n_ctx_kv = 0;
     state_.cp_compute_meta.clear();
+    if (state_.cp_galloc) {
+        ggml_gallocr_free(state_.cp_galloc);
+        state_.cp_galloc = nullptr;
+    }
     last_hidden_.clear();
     embd_row_fp16_scratch_.clear();
     prefill_kv_cache_.clear();
@@ -199,6 +203,16 @@ bool TTSTransformer::load_model(const std::string & model_path) {
     // cgraph object + tensor structs are not trampled when build_step_graph
     // (talker, between code-pred frames) re-ggml_init's the shared buffer.
     state_.cp_compute_meta.resize(ggml_tensor_overhead() * QWEN3_TTS_MAX_NODES + ggml_graph_overhead_custom(QWEN3_TTS_MAX_NODES, false));
+
+    // v9.4: dedicated gallocr for the cached full-AR cgraph path. Drives
+    // the cgraph directly on state_.backend, bypassing sched_split_graph's
+    // per-call ctx wipe (which is what makes naive cgraph caching crash on
+    // call 2). See state.cp_galloc comment in the header.
+    state_.cp_galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(state_.backend));
+    if (!state_.cp_galloc) {
+        error_msg_ = "Failed to allocate code predictor full-AR gallocr";
+        return false;
+    }
 
     if (!try_init_coreml_code_predictor(model_path)) {
         return false;
@@ -3537,19 +3551,24 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
     // one capture, recovering the host-overhead slice (graph build/alloc/IO
     // per step) which the v5 timing dump pinned at ~1.3 ms/frame.
     static const bool s_no_full_ar = std::getenv("QWEN3_TTS_NO_FULL_AR_GRAPH") != nullptr;
-    // Cgraph cache: opt-in only. The cache itself works (build, alloc, compute,
-    // read-outputs all succeed on frame 1) — but the SECOND alloc on the same
-    // cached cgraph hits a fundamental gallocr bug: `code_pred_k_cache_<L>
-    // (view) (view)` SET_ROWS pre-alloc abort. The cause is documented in
-    // memory `project_siglip2_graph_cache_gotcha.md`: `sched_split_graph`
-    // frees and re-inits `sched->ctx` per alloc, so split-copy tensors are
-    // recreated at recycled buffer offsets while gallocr's `node_allocs[]`
-    // (keyed by node-position, not tensor identity) reuses last call's offset
-    // table — yielding alias overlap with our cached input tensors. Fixing
-    // this cleanly needs a gallocr fork (path 1 in the memory). Leaving the
-    // wiring in behind QWEN3_TTS_FULL_AR_CACHE=1 so the gallocr-fork bet can
-    // pick up here directly.
-    static const bool s_full_ar_cache = std::getenv("QWEN3_TTS_FULL_AR_CACHE") != nullptr;
+    // Cgraph cache (v9.4, default-on): keep the full-AR cgraph + ggml_context
+    // alive across frames. The naive ggml_backend_sched approach crashed on
+    // frame 2 because sched_split_graph frees and re-inits sched->ctx every
+    // alloc_graph, recreating split-copy tensors at recycled offsets that
+    // alias the cached gf's already-allocated tensors (siglip2 graph_cache_
+    // gotcha, abort: `code_pred_k_cache_<L> (view) (view)` SET_ROWS pre-alloc).
+    // The fix bypasses sched entirely on the cached path: a dedicated
+    // ggml_gallocr (state_.cp_galloc) drives the cgraph directly on
+    // state_.backend via ggml_backend_graph_compute. The full-AR cgraph
+    // runs entirely on the talker backend — there's no CPU fallback to
+    // schedule, so a one-backend gallocr is functionally equivalent and
+    // skips the split/copy mutation that breaks naive caching.
+    // Bench (breakit_seeds, RTX 3060, paired n=69 after GPU-spike trim):
+    // RTF avg 3.938 → 4.173, med +0.230, 95% CI [+0.206, +0.244], 64/69 wins.
+    // Saves the per-frame 0.2 ms build + 0.7 ms alloc + extra CUDA-graph
+    // reuse the stable gf→nodes pointers unlock.
+    // Opt OUT via QWEN3_TTS_NO_FULL_AR_CACHE=1.
+    static const bool s_full_ar_cache = std::getenv("QWEN3_TTS_NO_FULL_AR_CACHE") == nullptr;
     if (!s_no_full_ar) {
 #ifdef QWEN3_TTS_TIMING
         t0 = clk::now();
@@ -3613,15 +3632,30 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
         if (timing_) timing_->t_code_pred_graph_build_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
         t0 = clk::now();
 #endif
-        if (!ggml_backend_sched_alloc_graph(state_.sched, gf)) {
-            error_msg_ = "Failed to allocate code predictor full-AR graph";
-            // Drop cache + free ctx (whether owned or cached) and bail.
-            if (!owns_ctx && state_.cp_ctx_cached == full_ar_ctx) {
-                state_.cp_ctx_cached = nullptr;
-                state_.cp_gf_cached = nullptr;
+        // v9.4: cached path uses cp_galloc + direct backend compute, NOT
+        // ggml_backend_sched. Sched would split-graph + free its ctx every
+        // call, recreating split-copy tensors that overlap with the cached
+        // gf's already-allocated tensors (siglip2 graph_cache_gotcha). The
+        // full-AR cgraph runs entirely on state_.backend (no CPU fallback),
+        // so a one-backend gallocr is functionally equivalent.
+        // Non-cached path keeps the historical sched behavior.
+        const bool use_cp_galloc = s_full_ar_cache;
+        if (use_cp_galloc) {
+            if (!ggml_gallocr_alloc_graph(state_.cp_galloc, gf)) {
+                error_msg_ = "Failed to allocate code predictor full-AR graph (cp_galloc)";
+                if (!owns_ctx && state_.cp_ctx_cached == full_ar_ctx) {
+                    state_.cp_ctx_cached = nullptr;
+                    state_.cp_gf_cached = nullptr;
+                }
+                ggml_free(full_ar_ctx);
+                return false;
             }
-            ggml_free(full_ar_ctx);
-            return false;
+        } else {
+            if (!ggml_backend_sched_alloc_graph(state_.sched, gf)) {
+                error_msg_ = "Failed to allocate code predictor full-AR graph";
+                ggml_free(full_ar_ctx);
+                return false;
+            }
         }
 #ifdef QWEN3_TTS_TIMING
         t1 = clk::now();
@@ -3697,9 +3731,12 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
             }
         };
 
-        if (ggml_backend_sched_graph_compute(state_.sched, gf) != GGML_STATUS_SUCCESS) {
+        const auto compute_status = use_cp_galloc
+            ? ggml_backend_graph_compute(state_.backend, gf)
+            : ggml_backend_sched_graph_compute(state_.sched, gf);
+        if (compute_status != GGML_STATUS_SUCCESS) {
             error_msg_ = "Failed to compute code predictor full-AR graph";
-            ggml_backend_sched_reset(state_.sched);
+            if (!use_cp_galloc) ggml_backend_sched_reset(state_.sched);
             invalidate_cache_on_err();
             release_ctx();
             return false;
@@ -3716,7 +3753,7 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
             struct ggml_tensor * sampled = ggml_graph_get_tensor(gf, name);
             if (!sampled) {
                 error_msg_ = std::string("Failed to find ") + name + " in full-AR graph";
-                ggml_backend_sched_reset(state_.sched);
+                if (!use_cp_galloc) ggml_backend_sched_reset(state_.sched);
                 invalidate_cache_on_err();
                 release_ctx();
                 return false;
@@ -3726,7 +3763,7 @@ bool TTSTransformer::predict_codes_autoregressive(const float * hidden, int32_t 
             output[s] = v;
         }
 
-        ggml_backend_sched_reset(state_.sched);
+        if (!use_cp_galloc) ggml_backend_sched_reset(state_.sched);
         release_ctx();
 #ifdef QWEN3_TTS_TIMING
         t1 = clk::now();
