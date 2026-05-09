@@ -8,6 +8,12 @@
 > - "V2 48 kHz vocoder" ended up being clippy - even using the python impl (i.e. not just this project), do not recommend unless you care enough to understand the "why" there.
 > - Q4_K_M is another speed boost and VRAM savings, and TBH I can't decide if it's worse quality or if the numbers are clouding my brain. The pacing of the speech maybe "feels" weird? I guess a bit more uncanny valley than Q8.
 > - TL;DR TL;DR "Works for me, too embarassing to upstream because I'm not going to be 'that guy' who PRs something he does not understand short of laughing at 'megakernel' sticking in claudes brain". Here be dragons.
+>
+> Unclear from claude noise below features: 
+> - You can use VoiceDesign AND clone using an extracted Base speaker encoder with this, VoiceDesign is usually instruct only, Base is usually clone only. This has worked well for me, but I'm assuming there's a reason why Qwen3-TTS didn't make this default.
+> - Instruct/cloned voices can be persisted in a way that is quick to load and potentially keeps the voice more "samey" across runs, note: if you switch quants the persisted versions need to be replaced.
+> - Added noise I care about (unload to 0 VRAM/load) - I'm cheap and an idiot so balance services so my 12GB VRAM goes a long way
+> - Streamining supports mp3/ogg/aac on top of wav - and .. I haven't tested it in a long time but streaming made RTF worse - so if you don't care you may see better numbers (you know, if it still works)
 
 Self-hosted [Qwen3-TTS](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign) inference server in C++ via GGML — fork of [khimaros/qwen3-tts.cpp](https://github.com/khimaros/qwen3-tts.cpp), itself forked from [predict-woo/qwen3-tts.cpp](https://github.com/predict-woo/qwen3-tts.cpp). Tuned for low-VRAM single-GPU homelab hosting: voice cloning, streaming PCM, persistent voice cache, lazy-load + idle-unload, OpenAI-compatible HTTP API.
 
