@@ -40,6 +40,12 @@ enum class WorkerFrame : uint32_t {
     SYNTH_DONE   = 0x23,  // W→P  end-of-stream + usage stats (P2)
     SYNTH_ERR    = 0x2F,  // W→P  {"error": str}
     ABORT_REQ    = 0x30,  // P→W  {"req_id": u32}    (P2)
+    EXTRACT_EMBED_REQ  = 0x50, // P→W  {"filepath": str}  (voice rego)
+    EXTRACT_EMBED_RESP = 0x51, // W→P  {"ok": bool, "error": str, "n_floats": int} + raw f32
+    ENCODE_CODES_REQ   = 0x52, // P→W  {"n_samples": int} + raw f32 samples
+    ENCODE_CODES_RESP  = 0x53, // W→P  {"ok": bool, "error": str, "n_frames": int} + raw i32 codes
+    SAVE_WARMUP_REQ    = 0x54, // P→W  {"voice_id", "prefill_key", "ref_hash", "path", "model_id"}
+    SAVE_WARMUP_RESP   = 0x55, // W→P  {"ok": bool, "error": str}
     PING         = 0x40,  // either {"t_send_ns": u64}
     PONG         = 0x41,  // either {"t_send_ns": u64, "t_recv_ns": u64}
     SHUTDOWN     = 0xFF,  // P→W   ask worker to exit cleanly

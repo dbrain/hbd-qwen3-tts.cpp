@@ -7,6 +7,7 @@
 #include <csignal>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <nlohmann/json.hpp>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -263,10 +264,12 @@ void WorkerSession::shutdown() {
 
 bool WorkerSession::send_load_req_locked(const WorkerLoadConfig & cfg) {
     json req = {
-        {"model",           cfg.model},
-        {"vocoder",         cfg.vocoder},
-        {"speaker_encoder", cfg.speaker_encoder},
-        {"lazy_load",       cfg.lazy_load},
+        {"model",             cfg.model},
+        {"vocoder",           cfg.vocoder},
+        {"speaker_encoder",   cfg.speaker_encoder},
+        {"voice_archive_dir", cfg.voice_archive_dir},
+        {"model_id",          cfg.model_id},
+        {"lazy_load",         cfg.lazy_load},
     };
     IpcError e = send_frame(fd_, WorkerFrame::LOAD_REQ, 0, req.dump());
     if (e != IpcError::OK) {
@@ -304,7 +307,9 @@ bool WorkerSession::send_load_req_locked(const WorkerLoadConfig & cfg) {
 bool WorkerSession::ensure_loaded(const WorkerLoadConfig & cfg) {
     std::lock_guard<std::mutex> lock(io_mutex_);
 
-    // If config matches and worker is alive, we're good.
+    // If config matches and worker is alive, we're good. voice_archive_dir
+    // and model_id aren't part of the cache key — they only affect the
+    // worker's startup warmup scan, which is idempotent on respawn.
     if (pid_ > 0 && loaded_ok_
         && loaded_cfg_.model == cfg.model
         && loaded_cfg_.vocoder == cfg.vocoder
@@ -517,6 +522,174 @@ tts_result WorkerSession::synthesize_streaming(
                            std::move(on_pcm));
 }
 
+bool WorkerSession::extract_speaker_embedding(const std::string & wav_path,
+                                              std::vector<float> & out_embedding) {
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    if (pid_ <= 0 || fd_ < 0 || !loaded_ok_) {
+        last_error_ = "worker not ready (call ensure_loaded first)";
+        return false;
+    }
+    json req = { {"filepath", wav_path} };
+    uint32_t req_id = next_req_id_.fetch_add(1);
+    IpcError e = send_frame(fd_, WorkerFrame::EXTRACT_EMBED_REQ, req_id, req.dump());
+    if (e != IpcError::OK) {
+        last_error_ = std::string("EXTRACT_EMBED_REQ send: ") + ipc_error_str(e);
+        kill_worker_locked();
+        return false;
+    }
+    FrameHeader hdr{};
+    std::vector<uint8_t> p;
+    e = recv_frame(fd_, &hdr, &p);
+    if (e != IpcError::OK) {
+        last_error_ = std::string("EXTRACT_EMBED_RESP recv: ") + ipc_error_str(e);
+        kill_worker_locked();
+        return false;
+    }
+    if (hdr.type != static_cast<uint32_t>(WorkerFrame::EXTRACT_EMBED_RESP)) {
+        last_error_ = std::string("expected EXTRACT_EMBED_RESP, got 0x")
+                    + std::to_string(hdr.type);
+        kill_worker_locked();
+        return false;
+    }
+    std::string meta_str;
+    if (!unpack_audio_payload(p, &meta_str, &out_embedding)) {
+        last_error_ = "EXTRACT_EMBED_RESP unpack failed";
+        kill_worker_locked();
+        return false;
+    }
+    json meta;
+    try { meta = json::parse(meta_str); }
+    catch (const std::exception & ex) {
+        last_error_ = std::string("EXTRACT_EMBED_RESP meta parse: ") + ex.what();
+        return false;
+    }
+    if (!meta.value("ok", false)) {
+        last_error_ = std::string("worker extract failed: ")
+                    + meta.value("error", std::string{"(no msg)"});
+        out_embedding.clear();
+        return false;
+    }
+    return true;
+}
+
+bool WorkerSession::encode_speech_codes(const float * samples, int32_t n_samples,
+                                        std::vector<int32_t> & out_codes,
+                                        int32_t & out_n_ref_frames) {
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    if (pid_ <= 0 || fd_ < 0 || !loaded_ok_) {
+        last_error_ = "worker not ready";
+        return false;
+    }
+    json meta = { {"n_samples", n_samples} };
+    auto payload = pack_audio_payload(meta.dump(), samples, (size_t) n_samples);
+    uint32_t req_id = next_req_id_.fetch_add(1);
+    IpcError e = send_frame(fd_, WorkerFrame::ENCODE_CODES_REQ, req_id, payload);
+    if (e != IpcError::OK) {
+        last_error_ = std::string("ENCODE_CODES_REQ send: ") + ipc_error_str(e);
+        kill_worker_locked();
+        return false;
+    }
+    FrameHeader hdr{};
+    std::vector<uint8_t> p;
+    e = recv_frame(fd_, &hdr, &p);
+    if (e != IpcError::OK) {
+        last_error_ = std::string("ENCODE_CODES_RESP recv: ") + ipc_error_str(e);
+        kill_worker_locked();
+        return false;
+    }
+    if (hdr.type != static_cast<uint32_t>(WorkerFrame::ENCODE_CODES_RESP)) {
+        last_error_ = std::string("expected ENCODE_CODES_RESP, got 0x")
+                    + std::to_string(hdr.type);
+        kill_worker_locked();
+        return false;
+    }
+    // Payload layout: [u32 json_len][json][i32 codes...]
+    if (p.size() < sizeof(uint32_t)) {
+        last_error_ = "ENCODE_CODES_RESP too small";
+        return false;
+    }
+    uint32_t mlen = 0;
+    std::memcpy(&mlen, p.data(), sizeof(mlen));
+    if (sizeof(mlen) + mlen > p.size()) {
+        last_error_ = "ENCODE_CODES_RESP json_len exceeds payload";
+        return false;
+    }
+    json rmeta;
+    try {
+        rmeta = json::parse(p.data() + sizeof(mlen), p.data() + sizeof(mlen) + mlen);
+    } catch (const std::exception & ex) {
+        last_error_ = std::string("ENCODE_CODES_RESP meta parse: ") + ex.what();
+        return false;
+    }
+    if (!rmeta.value("ok", false)) {
+        last_error_ = std::string("worker encode failed: ")
+                    + rmeta.value("error", std::string{"(no msg)"});
+        return false;
+    }
+    out_n_ref_frames = rmeta.value("n_frames", 0);
+    size_t code_bytes = p.size() - sizeof(mlen) - mlen;
+    if (code_bytes % sizeof(int32_t) != 0) {
+        last_error_ = "ENCODE_CODES_RESP misaligned codes payload";
+        return false;
+    }
+    out_codes.resize(code_bytes / sizeof(int32_t));
+    if (code_bytes) {
+        std::memcpy(out_codes.data(),
+                    p.data() + sizeof(mlen) + mlen,
+                    code_bytes);
+    }
+    return true;
+}
+
+bool WorkerSession::save_voice_warmup(const std::string & voice_id,
+                                      uint64_t prefill_cache_key,
+                                      uint64_t ref_codes_hash,
+                                      const std::string & path,
+                                      const std::string & model_id) {
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    if (pid_ <= 0 || fd_ < 0 || !loaded_ok_) {
+        last_error_ = "worker not ready";
+        return false;
+    }
+    json req = {
+        {"voice_id",    voice_id},
+        {"prefill_key", prefill_cache_key},
+        {"ref_hash",    ref_codes_hash},
+        {"path",        path},
+        {"model_id",    model_id},
+    };
+    uint32_t req_id = next_req_id_.fetch_add(1);
+    IpcError e = send_frame(fd_, WorkerFrame::SAVE_WARMUP_REQ, req_id, req.dump());
+    if (e != IpcError::OK) {
+        last_error_ = std::string("SAVE_WARMUP_REQ send: ") + ipc_error_str(e);
+        kill_worker_locked();
+        return false;
+    }
+    FrameHeader hdr{};
+    std::vector<uint8_t> p;
+    e = recv_frame(fd_, &hdr, &p);
+    if (e != IpcError::OK) {
+        last_error_ = std::string("SAVE_WARMUP_RESP recv: ") + ipc_error_str(e);
+        kill_worker_locked();
+        return false;
+    }
+    if (hdr.type != static_cast<uint32_t>(WorkerFrame::SAVE_WARMUP_RESP)) {
+        last_error_ = std::string("expected SAVE_WARMUP_RESP, got 0x")
+                    + std::to_string(hdr.type);
+        kill_worker_locked();
+        return false;
+    }
+    json resp;
+    try { resp = json::parse(std::string(p.begin(), p.end())); }
+    catch (const std::exception & ex) {
+        last_error_ = std::string("SAVE_WARMUP_RESP parse: ") + ex.what();
+        return false;
+    }
+    bool ok = resp.value("ok", false);
+    if (!ok) last_error_ = resp.value("error", std::string{"(no msg)"});
+    return ok;
+}
+
 // ───────────────────────── run_worker_loop (child) ─────────────────────
 
 int run_worker_loop(int fd) {
@@ -578,12 +751,16 @@ int run_worker_loop(int fd) {
                 json req;
                 std::string err_msg;
                 bool ok = false;
+                std::string voice_archive_dir;
+                std::string model_id;
                 try {
                     req = json::parse(std::string(payload.begin(), payload.end()));
-                    std::string model      = req.value("model",           std::string{});
-                    std::string vocoder    = req.value("vocoder",         std::string{});
-                    std::string spk_enc    = req.value("speaker_encoder", std::string{});
-                    bool        lazy_load  = req.value("lazy_load",       false);
+                    std::string model     = req.value("model",             std::string{});
+                    std::string vocoder   = req.value("vocoder",           std::string{});
+                    std::string spk_enc   = req.value("speaker_encoder",   std::string{});
+                    voice_archive_dir     = req.value("voice_archive_dir", std::string{});
+                    model_id              = req.value("model_id",          std::string{});
+                    bool        lazy_load = req.value("lazy_load",         false);
 
                     if (lazy_load) {
                         tts.set_model_paths(model, vocoder, spk_enc);
@@ -595,11 +772,34 @@ int run_worker_loop(int fd) {
                 } catch (const std::exception & ex) {
                     err_msg = std::string("LOAD_REQ parse failed: ") + ex.what();
                 }
+
+                // After successful load, scan voice_archive_dir for *.warmup
+                // and inject into the model's prefill cache. This is what
+                // gives us cross-restart warmup hits in worker mode.
+                int loaded_warmups = 0;
+                if (ok && tts.is_loaded() && !voice_archive_dir.empty()) {
+                    try {
+                        for (const auto & entry : std::filesystem::directory_iterator(voice_archive_dir)) {
+                            if (!entry.is_directory()) continue;
+                            const auto wp = entry.path() / "voice.warmup";
+                            if (!std::filesystem::exists(wp)) continue;
+                            if (tts.load_voice_warmup(wp.string(), model_id)) {
+                                loaded_warmups++;
+                            }
+                        }
+                    } catch (const std::exception & ex) {
+                        fprintf(stderr, "worker: voice-warmup scan: %s\n", ex.what());
+                    }
+                    fprintf(stderr, "worker: loaded %d voice.warmup blob(s) from %s\n",
+                            loaded_warmups, voice_archive_dir.c_str());
+                }
+
                 int sr = (ok && tts.is_loaded()) ? tts.get_sample_rate() : 0;
                 json resp = {
-                    {"ok",          ok},
-                    {"error",       err_msg},
-                    {"sample_rate", sr},
+                    {"ok",             ok},
+                    {"error",          err_msg},
+                    {"sample_rate",    sr},
+                    {"loaded_warmups", loaded_warmups},
                 };
                 if (send_frame(fd, WorkerFrame::LOAD_RESP, hdr.req_id,
                                resp.dump()) != IpcError::OK) {
@@ -705,6 +905,100 @@ int run_worker_loop(int fd) {
                         fprintf(stderr, "worker: SYNTH_DONE send failed\n");
                         return 5;
                     }
+                }
+                break;
+            }
+            case WorkerFrame::EXTRACT_EMBED_REQ: {
+                std::string fp;
+                std::vector<float> embedding;
+                std::string err_msg;
+                bool ok = false;
+                try {
+                    json req = json::parse(std::string(payload.begin(), payload.end()));
+                    fp = req.value("filepath", std::string{});
+                } catch (const std::exception & ex) {
+                    err_msg = std::string("EXTRACT_EMBED_REQ parse: ") + ex.what();
+                }
+                if (err_msg.empty()) {
+                    if (!tts.is_loaded() && !tts.reload_model()) {
+                        err_msg = std::string("worker reload_model: ") + tts.get_error();
+                    } else {
+                        ok = tts.extract_speaker_embedding(fp, embedding);
+                        if (!ok) err_msg = tts.get_error();
+                    }
+                }
+                json meta = { {"ok", ok}, {"error", err_msg},
+                              {"n_floats", (int) embedding.size()} };
+                auto resp = pack_audio_payload(meta.dump(),
+                                               embedding.data(), embedding.size());
+                if (send_frame(fd, WorkerFrame::EXTRACT_EMBED_RESP, hdr.req_id, resp)
+                    != IpcError::OK) {
+                    fprintf(stderr, "worker: EXTRACT_EMBED_RESP send failed\n");
+                    return 6;
+                }
+                break;
+            }
+            case WorkerFrame::ENCODE_CODES_REQ: {
+                std::string err_msg;
+                bool ok = false;
+                std::vector<int32_t> codes;
+                int32_t n_frames = 0;
+                std::string in_meta_str;
+                std::vector<float> samples;
+                if (!unpack_audio_payload(payload, &in_meta_str, &samples)) {
+                    err_msg = "ENCODE_CODES_REQ unpack failed";
+                } else if (!tts.is_loaded() && !tts.reload_model()) {
+                    err_msg = std::string("worker reload_model: ") + tts.get_error();
+                } else {
+                    ok = tts.encode_speech_codes(samples.data(),
+                                                 (int32_t) samples.size(),
+                                                 codes, n_frames);
+                    if (!ok) err_msg = tts.get_error();
+                }
+                json meta = { {"ok", ok}, {"error", err_msg},
+                              {"n_frames", n_frames} };
+                std::string ms = meta.dump();
+                uint32_t mlen = (uint32_t) ms.size();
+                size_t code_bytes = codes.size() * sizeof(int32_t);
+                std::vector<uint8_t> resp(sizeof(mlen) + ms.size() + code_bytes);
+                std::memcpy(resp.data(), &mlen, sizeof(mlen));
+                std::memcpy(resp.data() + sizeof(mlen), ms.data(), ms.size());
+                if (code_bytes) {
+                    std::memcpy(resp.data() + sizeof(mlen) + ms.size(),
+                                codes.data(), code_bytes);
+                }
+                if (send_frame(fd, WorkerFrame::ENCODE_CODES_RESP, hdr.req_id, resp)
+                    != IpcError::OK) {
+                    fprintf(stderr, "worker: ENCODE_CODES_RESP send failed\n");
+                    return 7;
+                }
+                break;
+            }
+            case WorkerFrame::SAVE_WARMUP_REQ: {
+                std::string err_msg;
+                bool ok = false;
+                try {
+                    json req = json::parse(std::string(payload.begin(), payload.end()));
+                    std::string voice_id     = req.value("voice_id",    std::string{});
+                    uint64_t prefill_key     = req.value("prefill_key", (uint64_t) 0);
+                    uint64_t ref_hash        = req.value("ref_hash",    (uint64_t) 0);
+                    std::string path         = req.value("path",        std::string{});
+                    std::string model_id     = req.value("model_id",    std::string{});
+                    if (path.empty() || prefill_key == 0) {
+                        err_msg = "SAVE_WARMUP_REQ missing path or prefill_key";
+                    } else {
+                        ok = tts.save_voice_warmup(voice_id, prefill_key, ref_hash,
+                                                   path, model_id);
+                        if (!ok) err_msg = tts.get_error();
+                    }
+                } catch (const std::exception & ex) {
+                    err_msg = std::string("SAVE_WARMUP_REQ parse: ") + ex.what();
+                }
+                json resp = { {"ok", ok}, {"error", err_msg} };
+                if (send_frame(fd, WorkerFrame::SAVE_WARMUP_RESP, hdr.req_id, resp.dump())
+                    != IpcError::OK) {
+                    fprintf(stderr, "worker: SAVE_WARMUP_RESP send failed\n");
+                    return 8;
                 }
                 break;
             }

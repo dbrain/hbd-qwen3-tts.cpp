@@ -708,23 +708,9 @@ int main(int argc, char ** argv) {
         // working. Parent's tts.is_loaded() stays false, so the
         // ensure_loaded() helper below skips the in-process load.
         tts.set_model_paths(sp.model, sp.vocoder, sp.speaker_encoder);
-        // Eager warm-up of the worker so the first synth doesn't pay the
-        // ~1.2s model-load cost. Skip when LAZY_LOAD=1 — that env explicitly
-        // asks for the deferred-load behaviour.
-        if (!lazy_load) {
-            qwen3_tts::WorkerLoadConfig cfg;
-            cfg.model           = sp.model;
-            cfg.vocoder         = sp.vocoder;
-            cfg.speaker_encoder = sp.speaker_encoder;
-            cfg.lazy_load       = false;
-            if (!worker_session->ensure_loaded(cfg)) {
-                fprintf(stderr, "fatal: worker model load failed: %s\n",
-                        worker_session->last_error().c_str());
-                return 1;
-            }
-            fprintf(stderr, "worker-isolation: worker pid=%d loaded model OK\n",
-                    (int) worker_session->pid());
-        }
+        // Eager warm-up is deferred to after model_id + voice_archive_dir
+        // are computed (so the worker can scan + load *.warmup files on
+        // its first LOAD_REQ — that's our cross-restart warmup hit path).
     } else if (lazy_load) {
         tts.set_model_paths(sp.model, sp.vocoder, sp.speaker_encoder);
         fprintf(stderr, "lazy-load: model paths cached, deferring GPU load until first request\n");
@@ -827,13 +813,43 @@ int main(int argc, char ** argv) {
                 // 700-800 ms cold-path TTFA on Q4 voice clones across
                 // server restarts. A missing or stale-tag file is silently
                 // ignored — the next synth rebuilds from scratch.
-                const auto warmup_path = entry.path() / "voice.warmup";
-                if (std::filesystem::exists(warmup_path)) {
-                    tts.load_voice_warmup(warmup_path.string(), model_id);
+                // In worker-isolation mode this is a no-op (parent's tts is
+                // not loaded); the worker scans the same dir on LOAD_REQ.
+                if (!worker_session) {
+                    const auto warmup_path = entry.path() / "voice.warmup";
+                    if (std::filesystem::exists(warmup_path)) {
+                        tts.load_voice_warmup(warmup_path.string(), model_id);
+                    }
                 }
             }
             fprintf(stderr, "voice archive: %d loaded, %d deferred\n", loaded, deferred);
         }
+    }
+
+    // Helper to build a complete WorkerLoadConfig — every call site after
+    // this point must use it so voice_archive_dir + model_id propagate to
+    // the worker (it scans the dir for voice.warmup blobs after model load).
+    auto make_worker_cfg = [&]() {
+        qwen3_tts::WorkerLoadConfig cfg;
+        cfg.model              = sp.model;
+        cfg.vocoder            = sp.vocoder;
+        cfg.speaker_encoder    = sp.speaker_encoder;
+        cfg.voice_archive_dir  = voice_archive_dir;
+        cfg.model_id           = model_id;
+        cfg.lazy_load          = false;
+        return cfg;
+    };
+
+    // Worker-isolation eager warm-up. Deferred from the early init block
+    // so cfg carries voice_archive_dir/model_id for the warmup-scan path.
+    if (worker_session && !lazy_load) {
+        if (!worker_session->ensure_loaded(make_worker_cfg())) {
+            fprintf(stderr, "fatal: worker model load failed: %s\n",
+                    worker_session->last_error().c_str());
+            return 1;
+        }
+        fprintf(stderr, "worker-isolation: worker pid=%d loaded model OK\n",
+                (int) worker_session->pid());
     }
 
     // idle-unload watchdog: when QWEN3_TTS_IDLE_UNLOAD_SECONDS > 0, a
@@ -947,18 +963,14 @@ int main(int argc, char ** argv) {
     // --- POST /v1/admin/load --- reload model files using paths captured
     // by the prior load. No-op if already loaded.
     svr.Post("/v1/admin/load",
-        [&tts, &synth_mutex, &worker_session, &sp](const httplib::Request &, httplib::Response & res) {
+        [&tts, &synth_mutex, &worker_session, &sp, &make_worker_cfg](const httplib::Request &, httplib::Response & res) {
         std::lock_guard<std::mutex> lock(synth_mutex);
         bool was_loaded = false;
         bool ok = false;
         std::string err_msg;
         if (worker_session) {
             was_loaded = worker_session->is_alive();
-            qwen3_tts::WorkerLoadConfig cfg;
-            cfg.model           = sp.model;
-            cfg.vocoder         = sp.vocoder;
-            cfg.speaker_encoder = sp.speaker_encoder;
-            ok = worker_session->ensure_loaded(cfg);
+            ok = worker_session->ensure_loaded(make_worker_cfg());
             if (!ok) err_msg = worker_session->last_error();
         } else {
             was_loaded = tts.is_loaded();
@@ -1020,10 +1032,29 @@ int main(int argc, char ** argv) {
     // --- POST /v1/audio/voices --- create custom voice from reference audio
     svr.Post("/v1/audio/voices",
         [&tts, &synth_mutex, &voices, &voices_mutex,
-         &voice_archive_dir, &model_id, &ensure_loaded_locked](const httplib::Request & req, httplib::Response & res) {
+         &voice_archive_dir, &model_id, &ensure_loaded_locked,
+         &worker_session, &make_worker_cfg](const httplib::Request & req, httplib::Response & res) {
+
+        // worker-isolation: ensure worker is alive + loaded before any GPU
+        // call. has_speaker_encoder() and the in-process tts queries below
+        // require the parent's tts to be loaded; in worker mode the parent
+        // never loads, so we route the speaker-encoder check through the
+        // worker (which has the model). For now, gate `has_speaker_encoder`
+        // on the model variant — the only models without it are the
+        // VoiceDesign no-clone ones, and in iter we always run Base/+SE.
+        if (worker_session) {
+            if (!worker_session->ensure_loaded(make_worker_cfg())) {
+                res.status = 503;
+                json err = {{"error", {{"message", "worker load failed: "
+                                            + worker_session->last_error()},
+                                        {"type", "server_error"}}}};
+                res.set_content(err.dump(), "application/json");
+                return;
+            }
+        }
 
         // runtime audio cloning needs the speaker encoder, which only ships in the Base variant
-        if (!tts.has_speaker_encoder()) {
+        if (!worker_session && !tts.has_speaker_encoder()) {
             res.status = 400;
             json err = {{"error", {
                 {"message", "this model variant (" + tts.get_model_type() +
@@ -1122,22 +1153,28 @@ int main(int argc, char ** argv) {
         }
         if (!used_cached_embed) {
             std::lock_guard<std::mutex> lock(synth_mutex);
-            if (!ensure_loaded_locked()) {
-                unlink(tmppath);
-                res.status = 503;
-                json err = {{"error", {{"message", "model reload failed: " + tts.get_error()},
-                                        {"type", "server_error"}}}};
-                res.set_content(err.dump(), "application/json");
-                return;
+            if (worker_session) {
+                ok = worker_session->extract_speaker_embedding(tmppath, embedding);
+            } else {
+                if (!ensure_loaded_locked()) {
+                    unlink(tmppath);
+                    res.status = 503;
+                    json err = {{"error", {{"message", "model reload failed: " + tts.get_error()},
+                                            {"type", "server_error"}}}};
+                    res.set_content(err.dump(), "application/json");
+                    return;
+                }
+                ok = tts.extract_speaker_embedding(tmppath, embedding);
             }
-            ok = tts.extract_speaker_embedding(tmppath, embedding);
         }
 
         if (!ok && ref_text.empty()) {
             unlink(tmppath);
             res.status = 400;
+            const std::string err_msg = worker_session ? worker_session->last_error()
+                                                       : tts.get_error();
             json err = {{"error", {
-                {"message", "failed to extract speaker embedding: " + tts.get_error()},
+                {"message", "failed to extract speaker embedding: " + err_msg},
                 {"type", "invalid_request_error"},
             }}};
             res.set_content(err.dump(), "application/json");
@@ -1185,23 +1222,31 @@ int main(int argc, char ** argv) {
                 bool codec_ok;
                 {
                     std::lock_guard<std::mutex> lock(synth_mutex);
-                    if (!ensure_loaded_locked()) {
-                        unlink(tmppath);
-                        res.status = 503;
-                        json err = {{"error", {{"message", "model reload failed: " + tts.get_error()},
-                                                {"type", "server_error"}}}};
-                        res.set_content(err.dump(), "application/json");
-                        return;
+                    if (worker_session) {
+                        codec_ok = worker_session->encode_speech_codes(samples.data(),
+                                                                       (int32_t) samples.size(),
+                                                                       ref_codes, n_ref_frames);
+                    } else {
+                        if (!ensure_loaded_locked()) {
+                            unlink(tmppath);
+                            res.status = 503;
+                            json err = {{"error", {{"message", "model reload failed: " + tts.get_error()},
+                                                    {"type", "server_error"}}}};
+                            res.set_content(err.dump(), "application/json");
+                            return;
+                        }
+                        codec_ok = tts.encode_speech_codes(samples.data(),
+                                                            (int32_t)samples.size(),
+                                                            ref_codes, n_ref_frames);
                     }
-                    codec_ok = tts.encode_speech_codes(samples.data(),
-                                                        (int32_t)samples.size(),
-                                                        ref_codes, n_ref_frames);
                 }
                 if (!codec_ok) {
                     unlink(tmppath);
                     res.status = 500;
+                    const std::string err_msg = worker_session ? worker_session->last_error()
+                                                               : tts.get_error();
                     json err = {{"error", {
-                        {"message", "failed to encode speech codes: " + tts.get_error()},
+                        {"message", "failed to encode speech codes: " + err_msg},
                         {"type", "server_error"},
                     }}};
                     res.set_content(err.dump(), "application/json");
@@ -1326,7 +1371,8 @@ int main(int argc, char ** argv) {
     svr.Post("/v1/audio/speech",
         [&tts, &synth_mutex, &sp, &voices, &voices_mutex,
          &voice_archive_dir, &model_id, &ensure_loaded_locked,
-         &in_flight_synths, &note_activity, &worker_session](const httplib::Request & req, httplib::Response & res) {
+         &in_flight_synths, &note_activity, &worker_session,
+         &make_worker_cfg](const httplib::Request & req, httplib::Response & res) {
 
         // parse request body
         json body;
@@ -1609,7 +1655,7 @@ int main(int argc, char ** argv) {
                  in_flight = &in_flight_synths,
                  &note_activity,
                  &ensure_loaded_locked,
-                 &worker_session, &sp]
+                 &worker_session, &make_worker_cfg]
                 (size_t /*offset*/, httplib::DataSink & sink) mutable -> bool {
                     // Guard the in-flight counter for the entire synth so
                     // idle-unload doesn't release the model out from under
@@ -1618,11 +1664,7 @@ int main(int argc, char ** argv) {
                     InFlightGuard guard(*in_flight, note_activity);
                     std::lock_guard<std::mutex> lock(*synth_mutex);
                     if (worker_session) {
-                        qwen3_tts::WorkerLoadConfig cfg;
-                        cfg.model           = sp.model;
-                        cfg.vocoder         = sp.vocoder;
-                        cfg.speaker_encoder = sp.speaker_encoder;
-                        if (!worker_session->ensure_loaded(cfg)) {
+                        if (!worker_session->ensure_loaded(make_worker_cfg())) {
                             sink.done();
                             return false;
                         }
@@ -1756,16 +1798,18 @@ int main(int argc, char ** argv) {
                     // is the first successful synth for this voice (file
                     // doesn't already exist). Best-effort — failure here
                     // can't affect the response that already went out.
-                    // Skipped in worker-isolation mode: the parent's tts
-                    // isn't loaded so it has no prefill snapshot to dump;
-                    // P3 wires this through the worker via a dedicated
-                    // SAVE_WARMUP frame.
-                    if (!worker_session && result.success && !warmup_path.empty() &&
+                    if (result.success && !warmup_path.empty() &&
                         result.prefill_cache_key != 0 &&
                         !std::filesystem::exists(warmup_path)) {
-                        this_tts->save_voice_warmup(voice,
-                            result.prefill_cache_key, result.ref_codes_hash,
-                            warmup_path, model_id);
+                        if (worker_session) {
+                            worker_session->save_voice_warmup(voice,
+                                result.prefill_cache_key, result.ref_codes_hash,
+                                warmup_path, model_id);
+                        } else {
+                            this_tts->save_voice_warmup(voice,
+                                result.prefill_cache_key, result.ref_codes_hash,
+                                warmup_path, model_id);
+                        }
                     }
                     return false;
                 });
@@ -1781,11 +1825,7 @@ int main(int argc, char ** argv) {
             InFlightGuard guard(in_flight_synths, note_activity);
             std::lock_guard<std::mutex> lock(synth_mutex);
             if (worker_session) {
-                qwen3_tts::WorkerLoadConfig cfg;
-                cfg.model           = sp.model;
-                cfg.vocoder         = sp.vocoder;
-                cfg.speaker_encoder = sp.speaker_encoder;
-                if (!worker_session->ensure_loaded(cfg)) {
+                if (!worker_session->ensure_loaded(make_worker_cfg())) {
                     res.status = 503;
                     json err = {{"error", {{"message", "worker load failed: "
                                                 + worker_session->last_error()},
@@ -1849,13 +1889,17 @@ int main(int argc, char ** argv) {
 
         // Persist the voice's caches to disk on first synth (mirrors the
         // streaming path). Best-effort, file-existence-guarded so we
-        // don't rewrite the same blob on every subsequent synth. Skipped
-        // in worker-isolation mode for the same reason as the streaming
-        // branch — parent's tts has no prefill snapshot. P3 fixes this.
-        if (!worker_session && !warmup_path.empty() && result.prefill_cache_key != 0 &&
+        // don't rewrite the same blob on every subsequent synth.
+        if (!warmup_path.empty() && result.prefill_cache_key != 0 &&
             !std::filesystem::exists(warmup_path)) {
-            tts.save_voice_warmup(voice, result.prefill_cache_key,
-                                  result.ref_codes_hash, warmup_path, model_id);
+            if (worker_session) {
+                worker_session->save_voice_warmup(voice, result.prefill_cache_key,
+                                                  result.ref_codes_hash,
+                                                  warmup_path, model_id);
+            } else {
+                tts.save_voice_warmup(voice, result.prefill_cache_key,
+                                      result.ref_codes_hash, warmup_path, model_id);
+            }
         }
 
         // Helper: encode the full result.audio into the chosen response_format.

@@ -24,9 +24,11 @@ namespace qwen3_tts {
 // Subset of server_params the worker needs to load the model. Kept as
 // a flat POD so JSON serialization stays trivial.
 struct WorkerLoadConfig {
-    std::string model;          // talker GGUF
-    std::string vocoder;        // vocoder GGUF
-    std::string speaker_encoder;// optional speaker-encoder GGUF
+    std::string model;             // talker GGUF
+    std::string vocoder;           // vocoder GGUF
+    std::string speaker_encoder;   // optional speaker-encoder GGUF
+    std::string voice_archive_dir; // /app/voice-archive — worker scans for *.warmup
+    std::string model_id;          // for warmup model_id-tag matching
     bool        lazy_load = false; // worker defers load_model_files() until first synth
 };
 
@@ -107,6 +109,29 @@ public:
         const tts_params & params,
         int32_t stream_batch_size, int32_t stream_first_batch_size,
         StreamCallback on_pcm);
+
+    // P3 — voice registration via worker. Both methods serialize on
+    // io_mutex_ like the synth path. Failure modes: IPC error → kill +
+    // respawn-on-next-call (returns false). last_error() carries detail.
+    //
+    // extract_speaker_embedding takes a filesystem path readable by
+    // the worker (safe in our case: parent + worker share container fs,
+    // tmpfile under /tmp lives in both views).
+    bool extract_speaker_embedding(const std::string & wav_path,
+                                   std::vector<float> & out_embedding);
+
+    bool encode_speech_codes(const float * samples, int32_t n_samples,
+                             std::vector<int32_t> & out_codes,
+                             int32_t & out_n_ref_frames);
+
+    // P3 — fire-and-forget warmup blob persistence. Worker calls
+    // tts.save_voice_warmup() on its in-memory prefill snapshot. Best-
+    // effort; failure is logged but doesn't propagate to the user.
+    bool save_voice_warmup(const std::string & voice_id,
+                           uint64_t prefill_cache_key,
+                           uint64_t ref_codes_hash,
+                           const std::string & path,
+                           const std::string & model_id);
 
 private:
     // Send LOAD_REQ, wait for LOAD_RESP. Caller must hold io_mutex_.
