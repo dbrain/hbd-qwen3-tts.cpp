@@ -1608,7 +1608,8 @@ int main(int argc, char ** argv) {
                  voice = voice, warmup_path = warmup_path, model_id = model_id,
                  in_flight = &in_flight_synths,
                  &note_activity,
-                 &ensure_loaded_locked]
+                 &ensure_loaded_locked,
+                 &worker_session, &sp]
                 (size_t /*offset*/, httplib::DataSink & sink) mutable -> bool {
                     // Guard the in-flight counter for the entire synth so
                     // idle-unload doesn't release the model out from under
@@ -1616,7 +1617,16 @@ int main(int argc, char ** argv) {
                     // end so the idle window restarts after the synth.
                     InFlightGuard guard(*in_flight, note_activity);
                     std::lock_guard<std::mutex> lock(*synth_mutex);
-                    if (!ensure_loaded_locked()) {
+                    if (worker_session) {
+                        qwen3_tts::WorkerLoadConfig cfg;
+                        cfg.model           = sp.model;
+                        cfg.vocoder         = sp.vocoder;
+                        cfg.speaker_encoder = sp.speaker_encoder;
+                        if (!worker_session->ensure_loaded(cfg)) {
+                            sink.done();
+                            return false;
+                        }
+                    } else if (!ensure_loaded_locked()) {
                         sink.done();
                         return false;
                     }
@@ -1626,7 +1636,9 @@ int main(int argc, char ** argv) {
                     // Read sample_rate AFTER ensure_loaded so the lazy-load /
                     // first-request path sees the real vocoder rate (48 kHz on
                     // V2) rather than the audio_decoder_config default (24 kHz).
-                    const int wav_sample_rate = this_tts->get_sample_rate();
+                    const int wav_sample_rate = worker_session
+                        ? worker_session->sample_rate()
+                        : this_tts->get_sample_rate();
 
                     // mp3 / ogg-opus: per-response RAII encoder. Constructed
                     // after ensure_loaded so wav_sample_rate is the real
@@ -1685,7 +1697,29 @@ int main(int argc, char ** argv) {
                     };
 
                     tts_result result;
-                    if (!voice_ref_codes.empty()) {
+                    if (worker_session) {
+                        // worker-isolation P2: stream PCM chunks back via
+                        // worker_session_, sopts.on_pcm is the same parent-side
+                        // emit_bytes wrapper as the in-process path. The worker
+                        // installs its own AUDIO_FRAME-emitting on_pcm in its
+                        // own streaming_opts.
+                        if (!voice_ref_codes.empty()) {
+                            result = worker_session->synthesize_with_embedding_streaming(
+                                input, voice_embedding.data(), (int32_t)voice_embedding.size(),
+                                params, stream_batch_size, stream_first_batch_size,
+                                voice_ref_codes.data(), (int32_t) voice_ref_codes.size(),
+                                voice_n_ref_frames, sopts.on_pcm);
+                        } else if (!voice_embedding.empty()) {
+                            result = worker_session->synthesize_with_embedding_streaming(
+                                input, voice_embedding.data(), (int32_t)voice_embedding.size(),
+                                params, stream_batch_size, stream_first_batch_size,
+                                nullptr, 0, 0, sopts.on_pcm);
+                        } else {
+                            result = worker_session->synthesize_streaming(
+                                input, params, stream_batch_size, stream_first_batch_size,
+                                sopts.on_pcm);
+                        }
+                    } else if (!voice_ref_codes.empty()) {
                         result = this_tts->synthesize_with_embedding(
                             input, voice_embedding.data(), (int32_t)voice_embedding.size(),
                             params, voice_ref_codes.data(), voice_n_ref_frames, &sopts);
@@ -1722,7 +1756,11 @@ int main(int argc, char ** argv) {
                     // is the first successful synth for this voice (file
                     // doesn't already exist). Best-effort — failure here
                     // can't affect the response that already went out.
-                    if (result.success && !warmup_path.empty() &&
+                    // Skipped in worker-isolation mode: the parent's tts
+                    // isn't loaded so it has no prefill snapshot to dump;
+                    // P3 wires this through the worker via a dedicated
+                    // SAVE_WARMUP frame.
+                    if (!worker_session && result.success && !warmup_path.empty() &&
                         result.prefill_cache_key != 0 &&
                         !std::filesystem::exists(warmup_path)) {
                         this_tts->save_voice_warmup(voice,
@@ -1811,8 +1849,10 @@ int main(int argc, char ** argv) {
 
         // Persist the voice's caches to disk on first synth (mirrors the
         // streaming path). Best-effort, file-existence-guarded so we
-        // don't rewrite the same blob on every subsequent synth.
-        if (!warmup_path.empty() && result.prefill_cache_key != 0 &&
+        // don't rewrite the same blob on every subsequent synth. Skipped
+        // in worker-isolation mode for the same reason as the streaming
+        // branch — parent's tts has no prefill snapshot. P3 fixes this.
+        if (!worker_session && !warmup_path.empty() && result.prefill_cache_key != 0 &&
             !std::filesystem::exists(warmup_path)) {
             tts.save_voice_warmup(voice, result.prefill_cache_key,
                                   result.ref_codes_hash, warmup_path, model_id);

@@ -53,6 +53,11 @@ public:
     pid_t pid() const     { return pid_; }
     const std::string & last_error() const { return last_error_; }
 
+    // Vocoder output sample rate, populated from LOAD_RESP. The parent
+    // doesn't have a Qwen3TTS instance to query directly. Returns 0 if
+    // the worker hasn't loaded yet.
+    int sample_rate() const { return sample_rate_; }
+
     // Synthesize via the worker. Mirrors Qwen3TTS::synthesize{,_with_embedding}
     // signatures so the HTTP handler call site is a 1-line swap.
     //
@@ -75,6 +80,34 @@ public:
         int32_t n_ref_codes = 0,
         int32_t n_ref_frames = 0);
 
+    // P2 — streaming synth dispatch. Worker installs a streaming_opts
+    // with an on_pcm that sends AUDIO_FRAME chunks back; parent's
+    // `on_pcm` callback receives them and forwards to the HTTP sink.
+    // The aggregate audio is NOT accumulated in the returned tts_result
+    // (`audio` is empty); the caller streams via `on_pcm` and uses the
+    // returned tts_result purely for metadata + cache keys.
+    //
+    // If `on_pcm` returns false (e.g. HTTP client disconnect → sink
+    // write fails), this method keeps draining frames from the worker
+    // until SYNTH_DONE/SYNTH_ERR — the worker's send_frame back-pressures
+    // through the socket; we don't want to leak a half-consumed stream.
+    using StreamCallback = std::function<bool(const float * pcm, size_t n_samples)>;
+
+    tts_result synthesize_with_embedding_streaming(
+        const std::string & text,
+        const float * embedding, int32_t embedding_size,
+        const tts_params & params,
+        int32_t stream_batch_size, int32_t stream_first_batch_size,
+        const int32_t * ref_codes, int32_t n_ref_codes,
+        int32_t n_ref_frames,
+        StreamCallback on_pcm);
+
+    tts_result synthesize_streaming(
+        const std::string & text,
+        const tts_params & params,
+        int32_t stream_batch_size, int32_t stream_first_batch_size,
+        StreamCallback on_pcm);
+
 private:
     // Send LOAD_REQ, wait for LOAD_RESP. Caller must hold io_mutex_.
     bool send_load_req_locked(const WorkerLoadConfig & cfg);
@@ -87,7 +120,10 @@ private:
         const float * embedding, int32_t embedding_size,
         const tts_params & params,
         const int32_t * ref_codes, int32_t n_ref_codes,
-        int32_t n_ref_frames);
+        int32_t n_ref_frames,
+        int32_t stream_batch_size,
+        int32_t stream_first_batch_size,
+        StreamCallback on_pcm);
 
     // SIGKILL + waitpid. Caller must hold io_mutex_.
     void kill_worker_locked();
@@ -99,6 +135,7 @@ private:
 
     pid_t                      pid_ = -1;
     int                        fd_  = -1;
+    int                        sample_rate_ = 0;
     mutable std::mutex         io_mutex_;
     std::string                last_error_;
     std::atomic<uint32_t>      next_req_id_{1};

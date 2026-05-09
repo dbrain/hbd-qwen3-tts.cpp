@@ -98,13 +98,17 @@ static std::vector<uint8_t> pack_synth_payload(
         const float * embedding, int32_t embedding_size,
         const tts_params & params,
         const int32_t * ref_codes, int32_t n_ref_codes,
-        int32_t n_ref_frames) {
+        int32_t n_ref_frames,
+        int32_t stream_batch_size,
+        int32_t stream_first_batch_size) {
     json meta = {
-        {"text",             text},
-        {"embedding_size",   embedding_size},
-        {"n_ref_codes",      n_ref_codes},
-        {"n_ref_frames",     n_ref_frames},
-        {"params",           params_to_json(params)},
+        {"text",                     text},
+        {"embedding_size",           embedding_size},
+        {"n_ref_codes",              n_ref_codes},
+        {"n_ref_frames",             n_ref_frames},
+        {"stream_batch_size",        stream_batch_size},
+        {"stream_first_batch_size",  stream_first_batch_size},
+        {"params",                   params_to_json(params)},
     };
     std::string meta_str = meta.dump();
     uint32_t mlen = static_cast<uint32_t>(meta_str.size());
@@ -131,6 +135,8 @@ static bool unpack_synth_payload(
         std::vector<float> * out_embedding,
         std::vector<int32_t> * out_ref_codes,
         int32_t * out_n_ref_frames,
+        int32_t * out_stream_batch_size,
+        int32_t * out_stream_first_batch_size,
         tts_params * out_params,
         std::string * err) {
     if (payload.size() < sizeof(uint32_t)) {
@@ -153,9 +159,11 @@ static bool unpack_synth_payload(
     }
     *out_text   = meta.value("text", std::string{});
     *out_params = params_from_json(meta.value("params", json::object()));
-    int32_t emb_size    = meta.value("embedding_size", 0);
-    int32_t n_ref_codes = meta.value("n_ref_codes",    0);
-    *out_n_ref_frames   = meta.value("n_ref_frames",   0);
+    int32_t emb_size              = meta.value("embedding_size",          0);
+    int32_t n_ref_codes           = meta.value("n_ref_codes",             0);
+    *out_n_ref_frames             = meta.value("n_ref_frames",            0);
+    *out_stream_batch_size        = meta.value("stream_batch_size",       0);
+    *out_stream_first_batch_size  = meta.value("stream_first_batch_size", 0);
     size_t expected = sizeof(mlen) + mlen
                     + (size_t) emb_size    * sizeof(float)
                     + (size_t) n_ref_codes * sizeof(int32_t);
@@ -286,6 +294,7 @@ bool WorkerSession::send_load_req_locked(const WorkerLoadConfig & cfg) {
                     + resp.value("error", std::string{"(no msg)"});
         return false;
     }
+    sample_rate_ = resp.value("sample_rate", 0);
     return true;
 }
 
@@ -336,7 +345,10 @@ tts_result WorkerSession::do_synth_locked(
         const float * embedding, int32_t embedding_size,
         const tts_params & params,
         const int32_t * ref_codes, int32_t n_ref_codes,
-        int32_t n_ref_frames) {
+        int32_t n_ref_frames,
+        int32_t stream_batch_size,
+        int32_t stream_first_batch_size,
+        StreamCallback on_pcm) {
     tts_result fail;
     fail.success = false;
 
@@ -345,9 +357,13 @@ tts_result WorkerSession::do_synth_locked(
         return fail;
     }
 
+    const bool streaming = (stream_batch_size > 0);
+
     auto payload = pack_synth_payload(text, embedding, embedding_size,
                                       params, ref_codes, n_ref_codes,
-                                      n_ref_frames);
+                                      n_ref_frames,
+                                      streaming ? stream_batch_size : 0,
+                                      streaming ? stream_first_batch_size : 0);
     uint32_t req_id = next_req_id_.fetch_add(1);
     IpcError e = send_frame(fd_, WorkerFrame::SYNTH_REQ, req_id, payload);
     if (e != IpcError::OK) {
@@ -356,44 +372,106 @@ tts_result WorkerSession::do_synth_locked(
         return fail;
     }
 
-    FrameHeader hdr{};
-    std::vector<uint8_t> resp_payload;
-    e = recv_frame(fd_, &hdr, &resp_payload);
-    if (e != IpcError::OK) {
-        fail.error_msg = std::string("SYNTH_RESP recv failed: ") + ipc_error_str(e);
-        kill_worker_locked();
-        return fail;
-    }
-    if (hdr.type == static_cast<uint32_t>(WorkerFrame::SYNTH_ERR)) {
-        try {
-            json j = json::parse(std::string(resp_payload.begin(), resp_payload.end()));
-            fail.error_msg = j.value("error", std::string{"unknown worker error"});
-        } catch (...) {
-            fail.error_msg = "worker reported error (unparseable)";
+    if (!streaming) {
+        // Non-streaming: one SYNTH_RESP frame contains the whole audio.
+        FrameHeader hdr{};
+        std::vector<uint8_t> resp_payload;
+        e = recv_frame(fd_, &hdr, &resp_payload);
+        if (e != IpcError::OK) {
+            fail.error_msg = std::string("SYNTH_RESP recv failed: ") + ipc_error_str(e);
+            kill_worker_locked();
+            return fail;
         }
-        return fail;
-    }
-    if (hdr.type != static_cast<uint32_t>(WorkerFrame::SYNTH_RESP)) {
-        fail.error_msg = std::string("expected SYNTH_RESP, got type=0x")
-                       + std::to_string(hdr.type);
-        kill_worker_locked();
-        return fail;
+        if (hdr.type == static_cast<uint32_t>(WorkerFrame::SYNTH_ERR)) {
+            try {
+                json j = json::parse(std::string(resp_payload.begin(), resp_payload.end()));
+                fail.error_msg = j.value("error", std::string{"unknown worker error"});
+            } catch (...) {
+                fail.error_msg = "worker reported error (unparseable)";
+            }
+            return fail;
+        }
+        if (hdr.type != static_cast<uint32_t>(WorkerFrame::SYNTH_RESP)) {
+            fail.error_msg = std::string("expected SYNTH_RESP, got type=0x")
+                           + std::to_string(hdr.type);
+            kill_worker_locked();
+            return fail;
+        }
+        tts_result out;
+        std::string err;
+        if (!unpack_synth_resp(resp_payload, &out, &err)) {
+            fail.error_msg = std::string("SYNTH_RESP unpack: ") + err;
+            kill_worker_locked();
+            return fail;
+        }
+        return out;
     }
 
+    // Streaming: loop AUDIO_FRAME → on_pcm; SYNTH_DONE → return; SYNTH_ERR → fail.
+    // We always drain to SYNTH_DONE / SYNTH_ERR even after on_pcm returns
+    // false (HTTP client disconnect) — otherwise the worker's send_frame
+    // back-pressures on a full kernel buffer and we leak a half-stream.
+    bool client_alive = true;
     tts_result out;
-    std::string err;
-    if (!unpack_synth_resp(resp_payload, &out, &err)) {
-        fail.error_msg = std::string("SYNTH_RESP unpack: ") + err;
-        kill_worker_locked();
-        return fail;
+    while (true) {
+        FrameHeader hdr{};
+        std::vector<uint8_t> p;
+        e = recv_frame(fd_, &hdr, &p);
+        if (e != IpcError::OK) {
+            fail.error_msg = std::string("AUDIO_FRAME recv failed: ") + ipc_error_str(e);
+            kill_worker_locked();
+            return fail;
+        }
+        if (hdr.type == static_cast<uint32_t>(WorkerFrame::AUDIO_FRAME)) {
+            std::string meta_str;
+            std::vector<float> samples;
+            if (!unpack_audio_payload(p, &meta_str, &samples)) {
+                fail.error_msg = "AUDIO_FRAME unpack failed";
+                kill_worker_locked();
+                return fail;
+            }
+            if (client_alive && on_pcm) {
+                if (!on_pcm(samples.data(), samples.size())) {
+                    client_alive = false;
+                    // keep draining
+                }
+            }
+            continue;
+        }
+        if (hdr.type == static_cast<uint32_t>(WorkerFrame::SYNTH_DONE)) {
+            // SYNTH_DONE payload is JSON metadata; no audio bytes.
+            try {
+                json j = json::parse(std::string(p.begin(), p.end()));
+                result_metadata_from_json(j, out);
+            } catch (const std::exception & ex) {
+                fail.error_msg = std::string("SYNTH_DONE meta parse: ") + ex.what();
+                kill_worker_locked();
+                return fail;
+            }
+            // audio stays empty — caller streamed via on_pcm.
+            return out;
+        }
+        if (hdr.type == static_cast<uint32_t>(WorkerFrame::SYNTH_ERR)) {
+            try {
+                json j = json::parse(std::string(p.begin(), p.end()));
+                fail.error_msg = j.value("error", std::string{"unknown worker error"});
+            } catch (...) {
+                fail.error_msg = "worker reported error (unparseable)";
+            }
+            return fail;
+        }
+        // Unknown frame — skip and continue.
+        fprintf(stderr, "worker-session: unexpected frame type=0x%x during stream\n", hdr.type);
     }
-    return out;
 }
 
 tts_result WorkerSession::synthesize(const std::string & text,
                                      const tts_params & params) {
     std::lock_guard<std::mutex> lock(io_mutex_);
-    return do_synth_locked(text, nullptr, 0, params, nullptr, 0, 0);
+    return do_synth_locked(text, nullptr, 0, params,
+                           nullptr, 0, 0,
+                           /*stream_batch_size=*/0, /*stream_first_batch_size=*/0,
+                           /*on_pcm=*/{});
 }
 
 tts_result WorkerSession::synthesize_with_embedding(
@@ -404,7 +482,36 @@ tts_result WorkerSession::synthesize_with_embedding(
         int32_t n_ref_frames) {
     std::lock_guard<std::mutex> lock(io_mutex_);
     return do_synth_locked(text, embedding, embedding_size, params,
-                           ref_codes, n_ref_codes, n_ref_frames);
+                           ref_codes, n_ref_codes, n_ref_frames,
+                           /*stream_batch_size=*/0, /*stream_first_batch_size=*/0,
+                           /*on_pcm=*/{});
+}
+
+tts_result WorkerSession::synthesize_with_embedding_streaming(
+        const std::string & text,
+        const float * embedding, int32_t embedding_size,
+        const tts_params & params,
+        int32_t stream_batch_size, int32_t stream_first_batch_size,
+        const int32_t * ref_codes, int32_t n_ref_codes,
+        int32_t n_ref_frames,
+        StreamCallback on_pcm) {
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    return do_synth_locked(text, embedding, embedding_size, params,
+                           ref_codes, n_ref_codes, n_ref_frames,
+                           stream_batch_size, stream_first_batch_size,
+                           std::move(on_pcm));
+}
+
+tts_result WorkerSession::synthesize_streaming(
+        const std::string & text,
+        const tts_params & params,
+        int32_t stream_batch_size, int32_t stream_first_batch_size,
+        StreamCallback on_pcm) {
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    return do_synth_locked(text, nullptr, 0, params,
+                           nullptr, 0, 0,
+                           stream_batch_size, stream_first_batch_size,
+                           std::move(on_pcm));
 }
 
 // ───────────────────────── run_worker_loop (child) ─────────────────────
@@ -470,7 +577,12 @@ int run_worker_loop(int fd) {
                 } catch (const std::exception & ex) {
                     err_msg = std::string("LOAD_REQ parse failed: ") + ex.what();
                 }
-                json resp = { {"ok", ok}, {"error", err_msg} };
+                int sr = (ok && tts.is_loaded()) ? tts.get_sample_rate() : 0;
+                json resp = {
+                    {"ok",          ok},
+                    {"error",       err_msg},
+                    {"sample_rate", sr},
+                };
                 if (send_frame(fd, WorkerFrame::LOAD_RESP, hdr.req_id,
                                resp.dump()) != IpcError::OK) {
                     fprintf(stderr, "worker: LOAD_RESP send failed\n");
@@ -482,12 +594,16 @@ int run_worker_loop(int fd) {
                 std::string text;
                 std::vector<float>   embedding;
                 std::vector<int32_t> ref_codes;
-                int32_t n_ref_frames = 0;
+                int32_t n_ref_frames           = 0;
+                int32_t stream_batch_size      = 0;
+                int32_t stream_first_batch_size = 0;
                 tts_params params;
                 std::string err;
 
                 if (!unpack_synth_payload(payload, &text, &embedding, &ref_codes,
-                                          &n_ref_frames, &params, &err)) {
+                                          &n_ref_frames, &stream_batch_size,
+                                          &stream_first_batch_size,
+                                          &params, &err)) {
                     json e = { {"error", err} };
                     send_frame(fd, WorkerFrame::SYNTH_ERR, hdr.req_id, e.dump());
                     break;
@@ -503,24 +619,74 @@ int run_worker_loop(int fd) {
                     }
                 }
 
+                const bool streaming = (stream_batch_size > 0);
+                streaming_opts sopts;
+                std::atomic<bool> ipc_ok{ true };
+                if (streaming) {
+                    sopts.batch_size       = stream_batch_size;
+                    sopts.first_batch_size = stream_first_batch_size;
+                    const uint32_t cb_req_id = hdr.req_id;
+                    sopts.on_pcm = [fd, cb_req_id, &ipc_ok]
+                                   (const float * pcm, size_t n) -> bool {
+                        if (!ipc_ok.load()) return false;
+                        // AUDIO_FRAME payload uses pack_audio_payload's
+                        // [u32 json_len][json][f32 samples] format. Empty json
+                        // — chunk metadata is positional (req_id in header,
+                        // sample count derivable from byte length).
+                        auto buf = pack_audio_payload(std::string{},
+                                                     pcm, n);
+                        IpcError e2 = send_frame(fd, WorkerFrame::AUDIO_FRAME,
+                                                 cb_req_id, buf);
+                        if (e2 != IpcError::OK) {
+                            fprintf(stderr, "worker: AUDIO_FRAME send failed: %s\n",
+                                    ipc_error_str(e2));
+                            ipc_ok.store(false);
+                            return false;
+                        }
+                        return true;
+                    };
+                }
+
                 tts_result result;
                 if (!ref_codes.empty()) {
                     result = tts.synthesize_with_embedding(
                         text, embedding.data(), (int32_t) embedding.size(),
-                        params, ref_codes.data(), n_ref_frames);
+                        params, ref_codes.data(), n_ref_frames,
+                        streaming ? &sopts : nullptr);
                 } else if (!embedding.empty()) {
                     result = tts.synthesize_with_embedding(
                         text, embedding.data(), (int32_t) embedding.size(),
-                        params);
+                        params, nullptr, 0,
+                        streaming ? &sopts : nullptr);
                 } else {
-                    result = tts.synthesize(text, params);
+                    result = tts.synthesize(text, params,
+                                            streaming ? &sopts : nullptr);
                 }
 
-                auto resp = pack_synth_resp(result);
-                if (send_frame(fd, WorkerFrame::SYNTH_RESP, hdr.req_id, resp)
-                    != IpcError::OK) {
-                    fprintf(stderr, "worker: SYNTH_RESP send failed\n");
-                    return 5;
+                if (!streaming) {
+                    auto resp = pack_synth_resp(result);
+                    if (send_frame(fd, WorkerFrame::SYNTH_RESP, hdr.req_id, resp)
+                        != IpcError::OK) {
+                        fprintf(stderr, "worker: SYNTH_RESP send failed\n");
+                        return 5;
+                    }
+                } else {
+                    // Streaming: send SYNTH_DONE with metadata only (no audio
+                    // bytes — those streamed already as AUDIO_FRAMEs).
+                    if (!ipc_ok.load() && !result.success) {
+                        // both IPC and synth failed — best-effort error frame
+                        json e = { {"error",
+                                    std::string("worker synth failed: ")
+                                    + result.error_msg} };
+                        send_frame(fd, WorkerFrame::SYNTH_ERR, hdr.req_id, e.dump());
+                        break;
+                    }
+                    json meta = result_metadata_to_json(result);
+                    if (send_frame(fd, WorkerFrame::SYNTH_DONE, hdr.req_id,
+                                   meta.dump()) != IpcError::OK) {
+                        fprintf(stderr, "worker: SYNTH_DONE send failed\n");
+                        return 5;
+                    }
                 }
                 break;
             }
