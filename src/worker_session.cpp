@@ -10,6 +10,9 @@
 #include <nlohmann/json.hpp>
 #include <sys/wait.h>
 #include <unistd.h>
+#if defined(__linux__)
+#  include <sys/prctl.h>
+#endif
 
 using nlohmann::json;
 
@@ -520,7 +523,22 @@ int run_worker_loop(int fd) {
     // Same unbuffered-stderr discipline as main() for crash handler logs.
     setvbuf(stderr, nullptr, _IONBF, 0);
 
-    fprintf(stderr, "worker[%d]: alive on fd=%d\n", (int) getpid(), fd);
+    // Linux PR_SET_PDEATHSIG: ask the kernel to send SIGTERM if our parent
+    // dies. Belt-and-braces against an orphaned worker holding 2.6 GiB of
+    // VRAM after the parent process exits abnormally. (We can't follow up
+    // with the usual `if (getppid() == 1) bail` race-mitigation: in a
+    // container the parent IS pid 1, so that check would fire on every
+    // boot.) If parent really did die in the fork/exec gap, the next
+    // recv_frame returns EofClean and we exit normally.
+#if defined(__linux__)
+    if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0) {
+        fprintf(stderr, "worker: prctl(PR_SET_PDEATHSIG) failed: %s (continuing)\n",
+                strerror(errno));
+    }
+#endif
+
+    fprintf(stderr, "worker[%d]: alive on fd=%d ppid=%d\n",
+            (int) getpid(), fd, (int) getppid());
 
     // HELLO with our pid so the parent has a sanity-check.
     json hello = {

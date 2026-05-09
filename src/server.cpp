@@ -1971,6 +1971,7 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "idle-unload: model will be released after %d s of inactivity\n",
                 idle_unload_seconds);
         std::thread([&tts, &synth_mutex, &last_activity_ms, &in_flight_synths,
+                     &worker_session,
                      idle_unload_seconds, now_ms]() {
             const int64_t threshold_ms = (int64_t) idle_unload_seconds * 1000;
             const int     check_s     = std::max(1, idle_unload_seconds / 5);
@@ -1988,10 +1989,20 @@ int main(int argc, char ** argv) {
                 // our checks and the lock acquisition.
                 if (in_flight_synths.load() > 0) continue;
                 if (now_ms() - last_activity_ms.load() < threshold_ms) continue;
-                if (!tts.is_loaded()) continue;
-                fprintf(stderr, "idle-unload: %lld s since last activity, releasing model\n",
-                        (long long) ((now_ms() - last_activity_ms.load()) / 1000));
-                tts.unload_model();
+                // worker-isolation: kill the subprocess. In-process: unload weights.
+                // Either way the goal is "no qwen3-tts CUDA context after this".
+                if (worker_session) {
+                    if (!worker_session->is_alive()) continue;
+                    fprintf(stderr, "idle-unload: %lld s since last activity, killing worker pid=%d\n",
+                            (long long) ((now_ms() - last_activity_ms.load()) / 1000),
+                            (int) worker_session->pid());
+                    worker_session->shutdown();
+                } else {
+                    if (!tts.is_loaded()) continue;
+                    fprintf(stderr, "idle-unload: %lld s since last activity, releasing model\n",
+                            (long long) ((now_ms() - last_activity_ms.load()) / 1000));
+                    tts.unload_model();
+                }
             }
         }).detach();
     }
