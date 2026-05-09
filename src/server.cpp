@@ -1758,7 +1758,8 @@ int main(int argc, char ** argv) {
                 if (!voice_ref_codes.empty()) {
                     result = worker_session->synthesize_with_embedding(
                         input, voice_embedding.data(), (int32_t) voice_embedding.size(),
-                        params, voice_ref_codes.data(), voice_n_ref_frames);
+                        params, voice_ref_codes.data(),
+                        (int32_t) voice_ref_codes.size(), voice_n_ref_frames);
                 } else if (!voice_embedding.empty()) {
                     result = worker_session->synthesize_with_embedding(
                         input, voice_embedding.data(), (int32_t) voice_embedding.size(),

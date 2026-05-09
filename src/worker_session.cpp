@@ -90,24 +90,26 @@ static void result_metadata_from_json(const json & j, tts_result & r) {
 }
 
 // SYNTH_REQ payload layout: JSON header followed by raw blobs.
-//   [u32 json_len][json bytes][float32 embedding[emb_size]][int32 ref_codes[n_ref_frames]]
-// embedding_size and n_ref_frames live in the JSON so the worker knows how to
-// slice the trailing bytes.
+//   [u32 json_len][json bytes][float32 embedding[emb_size]][int32 ref_codes[n_ref_codes]]
+// JSON carries embedding_size, n_ref_codes (= n_frames * n_codebooks total int32s),
+// and n_ref_frames (timestep count used by the synth API).
 static std::vector<uint8_t> pack_synth_payload(
         const std::string & text,
         const float * embedding, int32_t embedding_size,
         const tts_params & params,
-        const int32_t * ref_codes, int32_t n_ref_frames) {
+        const int32_t * ref_codes, int32_t n_ref_codes,
+        int32_t n_ref_frames) {
     json meta = {
         {"text",             text},
         {"embedding_size",   embedding_size},
+        {"n_ref_codes",      n_ref_codes},
         {"n_ref_frames",     n_ref_frames},
         {"params",           params_to_json(params)},
     };
     std::string meta_str = meta.dump();
     uint32_t mlen = static_cast<uint32_t>(meta_str.size());
-    size_t emb_bytes  = embedding_size > 0 ? (size_t) embedding_size  * sizeof(float)   : 0;
-    size_t code_bytes = n_ref_frames   > 0 ? (size_t) n_ref_frames    * sizeof(int32_t) : 0;
+    size_t emb_bytes  = embedding_size > 0 ? (size_t) embedding_size * sizeof(float)   : 0;
+    size_t code_bytes = n_ref_codes    > 0 ? (size_t) n_ref_codes    * sizeof(int32_t) : 0;
     std::vector<uint8_t> out;
     out.resize(sizeof(mlen) + meta_str.size() + emb_bytes + code_bytes);
     std::memcpy(out.data(),                         &mlen,           sizeof(mlen));
@@ -128,6 +130,7 @@ static bool unpack_synth_payload(
         std::string * out_text,
         std::vector<float> * out_embedding,
         std::vector<int32_t> * out_ref_codes,
+        int32_t * out_n_ref_frames,
         tts_params * out_params,
         std::string * err) {
     if (payload.size() < sizeof(uint32_t)) {
@@ -150,32 +153,33 @@ static bool unpack_synth_payload(
     }
     *out_text   = meta.value("text", std::string{});
     *out_params = params_from_json(meta.value("params", json::object()));
-    int32_t emb_size  = meta.value("embedding_size", 0);
-    int32_t n_ref     = meta.value("n_ref_frames",   0);
+    int32_t emb_size    = meta.value("embedding_size", 0);
+    int32_t n_ref_codes = meta.value("n_ref_codes",    0);
+    *out_n_ref_frames   = meta.value("n_ref_frames",   0);
     size_t expected = sizeof(mlen) + mlen
-                    + (size_t) emb_size * sizeof(float)
-                    + (size_t) n_ref    * sizeof(int32_t);
+                    + (size_t) emb_size    * sizeof(float)
+                    + (size_t) n_ref_codes * sizeof(int32_t);
     if (expected != payload.size()) {
         if (err) {
-            char buf[128];
+            char buf[160];
             std::snprintf(buf, sizeof(buf),
-                          "synth_req payload size mismatch (expected %zu, got %zu)",
-                          expected, payload.size());
+                          "synth_req payload size mismatch (expected %zu = hdr+json+%dx4f+%dx4i, got %zu)",
+                          expected, emb_size, n_ref_codes, payload.size());
             *err = buf;
         }
         return false;
     }
     out_embedding->resize(emb_size);
-    out_ref_codes->resize(n_ref);
+    out_ref_codes->resize(n_ref_codes);
     size_t off = sizeof(mlen) + mlen;
     if (emb_size) {
         std::memcpy(out_embedding->data(), payload.data() + off,
                     (size_t) emb_size * sizeof(float));
         off += (size_t) emb_size * sizeof(float);
     }
-    if (n_ref) {
+    if (n_ref_codes) {
         std::memcpy(out_ref_codes->data(), payload.data() + off,
-                    (size_t) n_ref * sizeof(int32_t));
+                    (size_t) n_ref_codes * sizeof(int32_t));
     }
     return true;
 }
@@ -331,7 +335,8 @@ tts_result WorkerSession::do_synth_locked(
         const std::string & text,
         const float * embedding, int32_t embedding_size,
         const tts_params & params,
-        const int32_t * ref_codes, int32_t n_ref_frames) {
+        const int32_t * ref_codes, int32_t n_ref_codes,
+        int32_t n_ref_frames) {
     tts_result fail;
     fail.success = false;
 
@@ -341,7 +346,8 @@ tts_result WorkerSession::do_synth_locked(
     }
 
     auto payload = pack_synth_payload(text, embedding, embedding_size,
-                                      params, ref_codes, n_ref_frames);
+                                      params, ref_codes, n_ref_codes,
+                                      n_ref_frames);
     uint32_t req_id = next_req_id_.fetch_add(1);
     IpcError e = send_frame(fd_, WorkerFrame::SYNTH_REQ, req_id, payload);
     if (e != IpcError::OK) {
@@ -387,17 +393,18 @@ tts_result WorkerSession::do_synth_locked(
 tts_result WorkerSession::synthesize(const std::string & text,
                                      const tts_params & params) {
     std::lock_guard<std::mutex> lock(io_mutex_);
-    return do_synth_locked(text, nullptr, 0, params, nullptr, 0);
+    return do_synth_locked(text, nullptr, 0, params, nullptr, 0, 0);
 }
 
 tts_result WorkerSession::synthesize_with_embedding(
         const std::string & text,
         const float * embedding, int32_t embedding_size,
         const tts_params & params,
-        const int32_t * ref_codes, int32_t n_ref_frames) {
+        const int32_t * ref_codes, int32_t n_ref_codes,
+        int32_t n_ref_frames) {
     std::lock_guard<std::mutex> lock(io_mutex_);
     return do_synth_locked(text, embedding, embedding_size, params,
-                           ref_codes, n_ref_frames);
+                           ref_codes, n_ref_codes, n_ref_frames);
 }
 
 // ───────────────────────── run_worker_loop (child) ─────────────────────
@@ -475,11 +482,12 @@ int run_worker_loop(int fd) {
                 std::string text;
                 std::vector<float>   embedding;
                 std::vector<int32_t> ref_codes;
+                int32_t n_ref_frames = 0;
                 tts_params params;
                 std::string err;
 
                 if (!unpack_synth_payload(payload, &text, &embedding, &ref_codes,
-                                          &params, &err)) {
+                                          &n_ref_frames, &params, &err)) {
                     json e = { {"error", err} };
                     send_frame(fd, WorkerFrame::SYNTH_ERR, hdr.req_id, e.dump());
                     break;
@@ -499,7 +507,7 @@ int run_worker_loop(int fd) {
                 if (!ref_codes.empty()) {
                     result = tts.synthesize_with_embedding(
                         text, embedding.data(), (int32_t) embedding.size(),
-                        params, ref_codes.data(), (int32_t) ref_codes.size());
+                        params, ref_codes.data(), n_ref_frames);
                 } else if (!embedding.empty()) {
                     result = tts.synthesize_with_embedding(
                         text, embedding.data(), (int32_t) embedding.size(),

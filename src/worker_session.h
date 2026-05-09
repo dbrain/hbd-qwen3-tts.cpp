@@ -63,11 +63,17 @@ public:
     //    call respawns it (but the in-flight call returns failure).
     tts_result synthesize(const std::string & text, const tts_params & params);
 
+    // ref_codes points to a buffer of `n_ref_codes` int32s (= n_ref_frames *
+    // n_codebooks). n_ref_frames is the timestep count consumed by the
+    // synth API. Tracking both separately because the IPC needs the full
+    // byte length AND the synth API takes the frame count.
     tts_result synthesize_with_embedding(
         const std::string & text,
         const float * embedding, int32_t embedding_size,
         const tts_params & params,
-        const int32_t * ref_codes = nullptr, int32_t n_ref_frames = 0);
+        const int32_t * ref_codes = nullptr,
+        int32_t n_ref_codes = 0,
+        int32_t n_ref_frames = 0);
 
 private:
     // Send LOAD_REQ, wait for LOAD_RESP. Caller must hold io_mutex_.
@@ -80,7 +86,8 @@ private:
         const std::string & text,
         const float * embedding, int32_t embedding_size,
         const tts_params & params,
-        const int32_t * ref_codes, int32_t n_ref_frames);
+        const int32_t * ref_codes, int32_t n_ref_codes,
+        int32_t n_ref_frames);
 
     // SIGKILL + waitpid. Caller must hold io_mutex_.
     void kill_worker_locked();
