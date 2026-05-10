@@ -13,7 +13,7 @@ Main TTS endpoint. Accepts JSON body, returns audio (one-shot) or a streaming re
 | `input` | OpenAI | required; default cap 6144 chars (env `QWEN3_TTS_MAX_INPUT_CHARS`) |
 | `voice` | OpenAI | `"default"`, a built-in speaker, or a registered clone id; empty = `"default"` |
 | `instructions` | OpenAI | VoiceDesign description; works alongside `voice="default"` (no clone needed) |
-| `response_format` | OpenAI (subset) | this fork accepts `wav` and `pcm`; OpenAI's `mp3`/`opus`/`aac`/`flac` are not implemented |
+| `response_format` | OpenAI (subset) | `wav`, `pcm`, `mp3`, `ogg` (Opus-in-Ogg), `aac` (ADTS). FLAC is not implemented. Compressed formats (mp3/ogg/aac) honour `bitrate_kbps` (32–192, default 64). |
 | `stream_format` | OpenAI | `audio` (chunked binary) or `sse` (`speech.audio.delta` events with base64 audio); empty = one-shot |
 | `model`, `speed` | OpenAI | accepted in the body but currently ignored |
 | `language` | this fork | language code (`en`, `zh`, ...); see `GET /v1/audio/languages` |
@@ -28,8 +28,11 @@ Main TTS endpoint. Accepts JSON body, returns audio (one-shot) or a streaming re
 |---|---|---|
 | `wav` | `audio` | `audio/wav`, chunked: 44-byte placeholder header (size fields = `0xFFFFFFFF`) emitted with first PCM batch, then 16-bit-LE PCM chunks. Most players accept the placeholder; `wave.open()` rejects it — fix by rewriting bytes 4 and 40 once the stream lands. |
 | `pcm` | `audio` | `audio/pcm`, chunked: raw 16-bit-LE PCM, no header. Caller must know the sample rate (24 kHz V1, 48 kHz V2). |
+| `mp3` | `audio` | `audio/mpeg`, chunked: self-syncing MP3 frames; no leading header needed. |
+| `ogg` | `audio` | `audio/ogg`, chunked: standalone Ogg Opus pages. |
+| `aac` | `audio` | `audio/aac`, chunked: ADTS-framed AAC. Default `stream_first_batch_size` for AAC is 4 (encoder buffers ≥1 frame internally; smaller values gain little TTFA). |
 | `wav` \| `pcm` | `sse` | `text/event-stream`: `speech.audio.delta` events with `{type, audio: <base64>}` data, then a closing `speech.audio.done` event carrying usage/timing. |
-| any | empty | one-shot: full WAV/PCM body in a single response, no chunked transfer encoding. |
+| any | empty | one-shot: full body in a single response, no chunked transfer encoding. |
 
 ### TTFA-accurate Python clients
 
