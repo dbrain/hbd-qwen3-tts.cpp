@@ -190,6 +190,60 @@ float* qwen3_asr_run_aligner(struct qwen3_asr_context* ctx, const float* inputs_
 int qwen3_asr_align_words(struct qwen3_asr_context* ctx, const float* samples, int n_samples, const char** words,
                           int n_words, int64_t* out_start_ms, int64_t* out_end_ms);
 
+// ---- Streaming forced alignment --------------------------------------------
+//
+// Stateful variant of qwen3_asr_align_words that keeps the LLM-body KV
+// cache alive across partial calls so the audio prefix doesn't have to
+// be re-forwarded each pass. Designed for the "partial alignment over a
+// growing audio buffer" use case.
+//
+// First call (or reset=true) runs the full pipeline: mel + encoder +
+// prompt embed + full forward + argmax. Subsequent calls (reset=false)
+// with the same word list re-encode the cumulative audio, splice in
+// the new audio_pad embeds, and forward only [Δ audio_pads, audio_end,
+// text suffix] at their new absolute positions — typically ~30% the
+// per-partial body-forward cost.
+//
+// `samples` is the FULL cumulative PCM buffer at 16 kHz mono float32;
+// `n_samples` is the cumulative count from t=0 (NOT the delta).
+//
+// The function detects:
+//   - A different `words` list → forces an internal reset.
+//   - `n_samples` smaller than previously seen → forces an internal reset.
+//   - Encoder output shrinking → forces an internal reset.
+// In all cases the caller can set reset=true explicitly to force a
+// fresh start (e.g. at paragraph boundaries).
+//
+// Same output contract as qwen3_asr_align_words: out_start_ms[w] /
+// out_end_ms[w] in milliseconds, malloc'd by the caller. Returns 0 on
+// success, non-zero on failure.
+//
+// Bit-identity:
+//   - The mel cache is bit-identical to a one-shot mel: only frames
+//     whose entire STFT window is covered by real audio are cached;
+//     the trailing "unsafe" frames near the audio tail are recomputed
+//     each call so their right-context fills in as audio arrives.
+//   - With QWEN3_FA_STREAMING_KV=0 (default), the body forward sees
+//     the full prompt each partial → word timings are bit-identical
+//     to qwen3_asr_align_words. Win is mel cost: ~200 ms → ~30 ms
+//     per partial at the tail of a 30 s paragraph.
+//   - With QWEN3_FA_STREAMING_KV=1, the body forward also caches
+//     audio-prefix K/V across partials. Because the FA encoder runs
+//     full bidirectional self-attention, the encoder's old-frame
+//     embeds shift as new chunks are appended → cached K/V drifts.
+//     Measured drift on the Hobbit smoke paragraph: 32/73 word
+//     diffs, max 720 ms. Per-partial wallclock saves ~10-30 ms vs
+//     KV=0. Opt-in for latency-sensitive callers that don't need
+//     strict bit-identity.
+int qwen3_asr_align_words_streaming(struct qwen3_asr_context* ctx, const float* samples, int n_samples,
+                                    const char** words, int n_words, bool reset, int64_t* out_start_ms,
+                                    int64_t* out_end_ms);
+
+// Drop the streaming alignment state. Does NOT free the KV cache itself
+// (kept alive so the next paragraph reuses the allocation). Call at the
+// end of a paragraph or before switching to a different alignment task.
+void qwen3_asr_align_streaming_reset(struct qwen3_asr_context* ctx);
+
 // ---- VRAM probe API ---------------------------------------------------------
 //
 // Reports a region-by-region breakdown of GPU bytes held by the qwen3_asr

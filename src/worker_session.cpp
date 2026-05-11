@@ -272,13 +272,19 @@ void WorkerSession::shutdown() {
 
 bool WorkerSession::send_load_req_locked(const WorkerLoadConfig & cfg) {
     json req = {
-        {"model",             cfg.model},
-        {"vocoder",           cfg.vocoder},
-        {"speaker_encoder",   cfg.speaker_encoder},
-        {"voice_archive_dir", cfg.voice_archive_dir},
-        {"model_id",          cfg.model_id},
-        {"aligner_model",     cfg.aligner_model},
-        {"lazy_load",         cfg.lazy_load},
+        {"model",              cfg.model},
+        {"vocoder",            cfg.vocoder},
+        {"speaker_encoder",    cfg.speaker_encoder},
+        {"voice_archive_dir",  cfg.voice_archive_dir},
+        {"model_id",           cfg.model_id},
+        {"aligner_model",      cfg.aligner_model},
+        {"lazy_load",          cfg.lazy_load},
+        // When the parent spawns an aligner-only sibling (eager-spawn
+        // path), it expects the subprocess to load the FA GGUF
+        // synchronously in LOAD_REQ rather than lazily on the first
+        // ALIGN_PARTIAL_REQ. That way the GGUF mmap + buffer alloc
+        // overlaps with the parent's own synth cold load.
+        {"eager_load_aligner", cfg.aligner_only},
     };
     IpcError e = send_frame(fd_, WorkerFrame::LOAD_REQ, 0, req.dump());
     if (e != IpcError::OK) {
@@ -935,6 +941,20 @@ bool WorkerSession::finalize_streaming_align(const float * tail_pcm,
                                              std::vector<AlignedWord> & out_words,
                                              AlignProfile & out_profile) {
     std::lock_guard<std::mutex> lock(io_mutex_);
+    // Reset session state unconditionally on exit so a failed finalize
+    // (socket error, parse error, worker died) doesn't strand
+    // stream_align_active_=true and break the next paragraph's
+    // begin_streaming_align. State is request-local; the caller already
+    // sees the failure via the return value.
+    struct ResetOnExit {
+        WorkerSession * s;
+        ~ResetOnExit() {
+            s->stream_align_active_       = false;
+            s->stream_align_has_sent_any_ = false;
+            s->stream_align_words_.clear();
+            s->stream_align_pcm_sr_       = 0;
+        }
+    } reset_on_exit{this};
     if (!stream_align_active_) {
         last_error_ = "finalize_streaming_align: no active stream";
         return false;
@@ -1027,10 +1047,8 @@ bool WorkerSession::finalize_streaming_align(const float * tail_pcm,
         break;
     }
 
-    stream_align_active_ = false;
-    stream_align_has_sent_any_ = false;
-    stream_align_words_.clear();
-    stream_align_pcm_sr_ = 0;
+    // Successful path: ResetOnExit will run the same clear sequence
+    // below, but only after we've signalled success to the caller.
     return true;
 }
 
@@ -1601,12 +1619,27 @@ int run_aligner_worker_loop(int fd) {
     return 1;
 #else
     setvbuf(stderr, nullptr, _IONBF, 0);
-#if defined(__linux__)
-    if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0) {
-        fprintf(stderr, "aligner-worker: prctl(PR_SET_PDEATHSIG) failed: %s (continuing)\n",
-                strerror(errno));
-    }
-#endif
+    // NOTE: intentionally NOT calling prctl(PR_SET_PDEATHSIG) here.
+    //
+    // Linux's PR_SET_PDEATHSIG triggers when the *thread that created
+    // this process via fork* terminates — not when the parent process
+    // dies. With the eager-aligner-spawn pattern in server.cpp, the
+    // aligner subprocess is forked from a short-lived std::thread that
+    // hands off after ensure_loaded() and exits. The kernel then sends
+    // SIGTERM to the aligner the moment that thread exits, killing the
+    // aligner mid-request (symptom: EPIPE on the first push_partial_pcm
+    // because the aligner is already gone). The synth-worker sibling
+    // doesn't hit this because it's forked from the main thread, which
+    // is the process's thread-group leader and lives until shutdown.
+    //
+    // The tradeoff: if the parent process crashes without graceful
+    // shutdown, the aligner becomes an orphan and stays alive until
+    // explicit reaping. The graceful-shutdown path in server.cpp still
+    // SIGKILLs the aligner via aligner_session->shutdown(), so crash-
+    // free exits are clean. Catastrophic parent crashes will leak the
+    // aligner subprocess (~700 MiB GPU). Acceptable to keep eager
+    // spawn working — restore PDEATHSIG only if the eager spawn moves
+    // to a long-lived dedicated thread.
 
     using aw_clk = std::chrono::steady_clock;
     const auto t_worker_start = aw_clk::now();
@@ -1620,12 +1653,12 @@ int run_aligner_worker_loop(int fd) {
     fprintf(stderr, "  [aw-time worker-start  ] t+%lld ms\n",
             (long long) t_since_start_ms());
 
-    // ── Aligner-only VRAM-minimal defaults (HANDOFF-fa-aligner-vram.md
-    //    Phase B). The aligner sibling subprocess trades perf for VRAM
-    //    (~5 % wallclock for ~110 MiB GPU). Both knobs are opt-out — set
-    //    the corresponding env var to "0"/"1" to override before launching
-    //    the parent. Synth subprocesses are unaffected; this only runs in
-    //    the --worker-aligner dispatch path.
+    // ── Aligner-only defaults. The aligner sibling subprocess opt-outs of
+    //    a couple of perf/VRAM trade-offs the synth worker keeps on. All
+    //    three knobs are opt-out — set the corresponding env var to
+    //    "0"/"1" to override before launching the parent. Synth
+    //    subprocesses are unaffected; this only runs in the
+    //    --worker-aligner dispatch path.
     //
     //    GGML_CUDA_DISABLE_GRAPHS=1 — drops ~48 MiB of cudaGraph-capture
     //      machinery state (cg=2/0 in the probe shows no graphs actually
@@ -1636,17 +1669,19 @@ int run_aligner_worker_loop(int fd) {
     //      already in model.buf. Re-fuse from a deduped load is the
     //      cleaner long-term fix (Phase B7); the env knob is the cheap
     //      win for now.
-    //    CRISPASR_N_GPU_LAYERS=0 — Phase-C1: route all 28 LLM blk layers
-    //      to host RAM, leaving GPU with non-layered tensors (embed,
-    //      lm_head, ln_f) + audio tower + KV + sched. Measured cost on
-    //      RTX 3060 / 12-thread CPU: +5 % wallclock / RTF synth-only
-    //      3.94 → 3.81 (parallel sibling subprocess hides most of the
-    //      CPU body cost behind synth's GPU work). Saves ~210 MiB GPU
-    //      vs the GPU-resident layered weights. Set the env to 28 to
-    //      override and keep all layers on GPU.
+    //    CRISPASR_N_GPU_LAYERS=28 — keep all 28 Qwen3 LLM blk layers on
+    //      GPU. Phase-C1 originally routed them to CPU to save VRAM
+    //      (-210 MiB), but the streaming-aligned-TTS perf trade had
+    //      gotten much worse than the original "+5 % wallclock" forecast
+    //      once profiling landed: CPU body forward is ~200 ms/partial
+    //      vs ~40-60 ms on GPU. Measured on RTX 3060: warm TTFP
+    //      327 ms → 186 ms (-43 %), partial-7 align 381 ms → 120 ms
+    //      (-69 %), aligner pid VRAM 556 MiB → 766 MiB (+210 MiB).
+    //      Set the env to 0 to revert to the VRAM-minimal CPU body
+    //      path if budget pressure ever comes back.
     setenv("GGML_CUDA_DISABLE_GRAPHS",       "1", /*overwrite=*/0);
     setenv("CRISPASR_QWEN3_ASR_FUSED_QKV",   "0", /*overwrite=*/0);
-    setenv("CRISPASR_N_GPU_LAYERS",          "0", /*overwrite=*/0);
+    setenv("CRISPASR_N_GPU_LAYERS",         "28", /*overwrite=*/0);
 
     // ── Phase-A VRAM probe (HANDOFF-fa-aligner-vram.md) ───────────────────
     // Gated by QWEN3_TTS_LOG_VRAM_PROBE=1. Reports per-pid GPU bytes from
@@ -1920,15 +1955,43 @@ int run_aligner_worker_loop(int fd) {
             cstr_words.reserve(words.size());
             for (const auto & w : words) cstr_words.push_back(w.c_str());
             const auto t0 = clk::now();
-            const int rc = qwen3_asr_align_words(
-                    fa_ctx,
-                    samples_16k.data(), (int) samples_16k.size(),
-                    cstr_words.data(),  (int) cstr_words.size(),
-                    out_t0_ms.data(), out_t1_ms.data());
+            // Default ON: the streaming aligner caches the audio prefix's
+            // K/V across partials, dropping per-partial cost from
+            // O(N_enc + n_text) → O(Δ_audio + n_text). On a 32 s paragraph
+            // partial-7 wallclock drops from ~400 ms → ~150 ms (CPU body
+            // forward). Reset=true at a paragraph boundary clears the
+            // streaming state; the function also auto-resets if the
+            // word list or encoder length shrinks. See HANDOFF-fa-
+            // aligner-vram-2.md acceptance criteria.
+            //
+            // Opt-out for A/B and bit-identity diffing:
+            // QWEN3_FA_STREAMING_ALIGN=0 routes back through
+            // qwen3_asr_align_words (one-shot per partial, full forward).
+            const bool use_streaming = []() {
+                const char * e = std::getenv("QWEN3_FA_STREAMING_ALIGN");
+                if (!e || !*e) return true;
+                return std::atoi(e) != 0;
+            }();
+            int rc;
+            if (use_streaming) {
+                rc = qwen3_asr_align_words_streaming(
+                        fa_ctx,
+                        samples_16k.data(), (int) samples_16k.size(),
+                        cstr_words.data(),  (int) cstr_words.size(),
+                        /*reset=*/reset,
+                        out_t0_ms.data(), out_t1_ms.data());
+            } else {
+                rc = qwen3_asr_align_words(
+                        fa_ctx,
+                        samples_16k.data(), (int) samples_16k.size(),
+                        cstr_words.data(),  (int) cstr_words.size(),
+                        out_t0_ms.data(), out_t1_ms.data());
+            }
             t_align_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                              clk::now() - t0).count();
             if (rc != 0) {
-                err_msg = std::string("qwen3_asr_align_words rc=") + std::to_string(rc);
+                err_msg = std::string(use_streaming ? "qwen3_asr_align_words_streaming rc=" : "qwen3_asr_align_words rc=")
+                          + std::to_string(rc);
             } else {
                 ok = true;
             }
@@ -2034,13 +2097,30 @@ int run_aligner_worker_loop(int fd) {
             case WorkerFrame::LOAD_REQ: {
                 // We accept LOAD_REQ for protocol symmetry but only honour
                 // `aligner_model`; talker/vocoder/spk_enc paths are ignored.
+                //
+                // Eager-load gate: when the parent sends LOAD_REQ with
+                // `eager_load=true`, we synchronously run
+                // qwen3_asr_init_from_file here so the FA GGUF + buffers
+                // are warm by the time the first ALIGN_PARTIAL_REQ lands.
+                // The parent does this on a background thread in
+                // parallel with its own synth load so the cost overlaps
+                // with synth's cold path. Without `eager_load=true` we
+                // just stash the model path (original behaviour) and let
+                // ensure_fa_loaded fire lazily on the first
+                // ALIGN_PARTIAL_REQ.
                 std::string err_msg;
                 bool ok = false;
+                int64_t t_load_ms = 0;
+                bool req_eager_load = false;
                 try {
                     json req = json::parse(std::string(payload.begin(), payload.end()));
                     fa_model_path = req.value("aligner_model", std::string{});
+                    req_eager_load = req.value("eager_load_aligner", false);
                     if (fa_model_path.empty()) {
                         err_msg = "aligner-worker: aligner_model empty in LOAD_REQ";
+                    } else if (req_eager_load) {
+                        ensure_fa_loaded(err_msg, t_load_ms);
+                        ok = err_msg.empty();
                     } else {
                         ok = true;
                     }
@@ -2052,6 +2132,7 @@ int run_aligner_worker_loop(int fd) {
                     {"error",          err_msg},
                     {"sample_rate",    0},        // no vocoder
                     {"loaded_warmups", 0},
+                    {"t_load_ms",      t_load_ms},
                 };
                 if (send_frame(fd, WorkerFrame::LOAD_RESP, hdr.req_id, resp.dump())
                     != IpcError::OK) {

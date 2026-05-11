@@ -84,6 +84,31 @@ void crisp_audio_free(struct crisp_audio_context* ctx);
 float* crisp_audio_compute_mel(struct crisp_audio_context* ctx, const float* samples, int n_samples, int* out_n_mels,
                                int* out_T_mel);
 
+// Streaming-friendly variant: compute the RAW (pre-normalization) log-mel
+// for the frame range [T_start, T_end) using whisper-style center
+// padding. Frame t's window covers samples
+// [t*hop_length - n_fft/2, t*hop_length + n_fft/2) of the input (with
+// zero-pad at the boundaries). The Whisper GlobalClipMax normalization
+// step is intentionally NOT applied here — the caller is expected to
+// stitch successive ranges together and apply normalization globally
+// over the assembled buffer.
+//
+// Output layout is (T_end - T_start, n_mels) row-major (TimeMels) — each
+// frame's n_mels values are contiguous, so the caller can append new
+// ranges with a plain memcpy / vector::insert. Caller frees with free().
+//
+// Used by the streaming forced-alignment path to avoid re-running
+// STFT + mel-projection over the audio prefix on every partial.
+float* crisp_audio_compute_log_mel_range(struct crisp_audio_context* ctx, const float* samples, int n_samples,
+                                         int T_start, int T_end, int* out_n_mels);
+
+// Apply the GlobalClipMax normalization used by the Qwen-Omni dialect
+// (Whisper convention) to a flat log-mel buffer of n_mels*T_mel floats.
+// In place: `(max(x, max(x)-8) + 4) / 4`. Layout-agnostic — the formula
+// only depends on the global max + each element, so it works for either
+// (n_mels, T) or (T, n_mels) row-major.
+void crisp_audio_apply_clip_max_norm(float* log_mel, int n_mels, int T_mel);
+
 // Run the full audio encoder forward pass on a precomputed log-mel.
 // Output: malloc'd (n_frames, output_dim) row-major, or NULL on failure.
 // *out_n_frames and *out_dim are set on return. Caller frees with free().

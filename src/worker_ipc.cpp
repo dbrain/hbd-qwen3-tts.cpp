@@ -121,6 +121,8 @@ IpcError send_frame(int fd, WorkerFrame type, uint32_t req_id,
         if (w > 0) { sent += static_cast<size_t>(w); continue; }
         if (w < 0) {
             if (errno == EINTR) continue;
+            fprintf(stderr, "send_frame writev failed: fd=%d errno=%d (%s)\n",
+                    fd, errno, strerror(errno));
             return IpcError::SocketError;
         }
     }

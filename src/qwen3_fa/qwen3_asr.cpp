@@ -29,6 +29,7 @@
 #endif
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -219,6 +220,50 @@ struct qwen3_asr_context {
     // qwen3_asr_compute_mel / qwen3_asr_run_encoder once `audio_ca` is open.
     crisp_audio_context* audio_ca = nullptr;
     std::string model_path; // remembered for lazy crisp_audio init
+
+    // ---- Streaming forced-alignment state ----
+    // Held across partial align calls in the same paragraph so we can
+    // skip re-forwarding the audio prefix each pass. Cleared by
+    // qwen3_asr_align_streaming_reset() (or implicit reset=true).
+    //
+    // After each partial, the KV cache holds:
+    //   slot 0:                       audio_start
+    //   slot [1, N_enc+1):            audio_pad × N_enc
+    //   slot [N_enc+1, N_enc+2):      audio_end          (may be stale across partials)
+    //   slot [N_enc+2, N_enc+2+nt):   text suffix tokens (may be stale across partials)
+    //
+    // On the next partial we rewind n_past to (N_enc + 1) so audio_end
+    // + text suffix get re-written at their NEW absolute positions. The
+    // audio prefix's K/V stays put.
+    //
+    // Caveat (and the reason this is gated behind QWEN3_FA_STREAMING_ALIGN):
+    // the audio encoder runs full bidirectional self-attention across all
+    // chunks (attn_window_mode=0 in the cstr/qwen3-forced-aligner-0.6b
+    // GGUF), so the audio_pad embeds for old frames are NOT bit-identical
+    // between partials — appending new audio shifts the embeds of the
+    // already-cached frames. We accept that drift in exchange for the
+    // ~N_enc/N_total per-partial wallclock saving; measure word-timing
+    // drift vs the one-shot path with /tmp/diff_words.py.
+    struct {
+        bool                 initialized   = false;
+        int                  N_enc_committed = 0;     // audio_pad slots currently in cache
+        int                  n_text_tokens   = 0;     // count of audio_end + words + timestamps
+        std::vector<int32_t> text_ids;                // [audio_end, w1_toks, ts, ts, w2_toks, ts, ts, ...]
+        // Snapshot of the word list as a single newline-joined string, so we
+        // can cheaply detect a different paragraph being pushed in and force
+        // a reset. (Per-word strings live in the caller; we only need a hash.)
+        std::string          words_signature;
+
+        // Cached raw (pre-normalization) log-mel spectrogram in (T, n_mels)
+        // row-major layout. Grown incrementally each partial via
+        // crisp_audio_compute_log_mel_range. Bit-identical reconstruction
+        // to a one-shot mel compute is guaranteed because the STFT + mel
+        // filter + log10 steps are time-local; only the GlobalClipMax
+        // normalization is global, and that's re-applied to a temp copy
+        // of the full buffer on each partial.
+        std::vector<float> raw_log_mel_TM;
+        int                T_committed_mel = 0;
+    } align_stream;
 };
 
 // ===========================================================================
@@ -2303,50 +2348,53 @@ extern "C" int qwen3_asr_align_words(struct qwen3_asr_context* ctx, const float*
     return 0;
 }
 
-// One full-T forward pass for the Qwen3-ForcedAligner. Same KV-cached
-// graph the ASR backend uses for prefill, but with last_token_only=false
-// so the lm_head sees every position. The KV cache is reset at the start
-// because forced alignment is one-shot — no autoregressive decode loop.
-extern "C" float* qwen3_asr_run_aligner(struct qwen3_asr_context* ctx, const float* inputs_embeds, int n_tokens,
-                                        int* out_n_tokens, int* out_lm_head_dim) {
+// Internal core: full-T forward through the FA LLM body at any n_past.
+// The KV cache must already be allocated AND positioned (caller is
+// responsible for kv_reset on one-shot, or for setting kv_n_used to
+// the prior commit point on streaming). Writes K/V into slots
+// [n_past, n_past + n_tokens). Returns malloc'd (n_tokens, H) logits.
+static float* qwen3_asr_run_aligner_core(qwen3_asr_context* ctx, const float* inputs_embeds, int n_tokens, int n_past,
+                                         int* out_n_tokens, int* out_lm_head_dim) {
     if (!ctx || !inputs_embeds || n_tokens <= 0)
         return nullptr;
     if (!ctx->kv_k) {
         fprintf(stderr, "qwen3_asr: kv cache not initialized — call qwen3_asr_kv_init first\n");
         return nullptr;
     }
-    if (n_tokens > ctx->kv_max_ctx) {
-        fprintf(stderr, "qwen3_asr: aligner needs %d tokens but kv max_ctx is %d\n", n_tokens, ctx->kv_max_ctx);
+    if (n_past + n_tokens > ctx->kv_max_ctx) {
+        fprintf(stderr, "qwen3_asr: aligner needs %d+%d tokens but kv max_ctx is %d\n", n_past, n_tokens,
+                ctx->kv_max_ctx);
         return nullptr;
     }
-    qwen3_asr_kv_reset(ctx);
 
     const auto& hp = ctx->model.hparams;
     const int d = (int)hp.llm_d_model;
     const int H = (int)(hp.llm_lm_head_dim ? hp.llm_lm_head_dim : hp.llm_vocab_size);
-    const int Lk = n_tokens;
+    const int Lk = n_past + n_tokens;
 
-    // Positions 0..n_tokens-1.
+    // Positions n_past..n_past+n_tokens-1.
     std::vector<int32_t> positions(n_tokens);
     for (int i = 0; i < n_tokens; i++)
-        positions[i] = i;
+        positions[i] = n_past + i;
 
-    // Causal mask for the prefill path. Same encoding the run_llm_kv
-    // path uses (F16, ne[0]=Lk for fast key axis, ne[1]=n_tokens for
-    // queries; -inf above the diagonal).
+    // Causal mask (Lk, n_tokens) F16, -inf above the diagonal relative to
+    // the absolute slot of each query. For n_past=0 this is a standard
+    // upper-triangular mask; for n_past>0 the cached audio prefix is
+    // always visible to the new queries (their causal frontier sits at
+    // n_past+q, which is >= n_past for any q >= 0).
     std::vector<ggml_fp16_t> mask;
     if (n_tokens > 1) {
         const ggml_fp16_t zero_h = ggml_fp32_to_fp16(0.0f);
         const ggml_fp16_t neginf_h = ggml_fp32_to_fp16(-INFINITY);
         mask.assign((size_t)Lk * n_tokens, zero_h);
         for (int q = 0; q < n_tokens; q++) {
-            for (int k = q + 1; k < Lk; k++) {
+            for (int k = n_past + q + 1; k < Lk; k++) {
                 mask[(size_t)q * Lk + k] = neginf_h;
             }
         }
     }
 
-    ggml_cgraph* gf = qwen3_asr_build_graph_llm_kv(ctx, /*n_past=*/0, n_tokens, /*last_token_only=*/false);
+    ggml_cgraph* gf = qwen3_asr_build_graph_llm_kv(ctx, n_past, n_tokens, /*last_token_only=*/false);
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
         fprintf(stderr, "qwen3_asr: failed to alloc aligner graph\n");
@@ -2367,7 +2415,7 @@ extern "C" float* qwen3_asr_run_aligner(struct qwen3_asr_context* ctx, const flo
         return nullptr;
     }
 
-    ctx->kv_n_used = n_tokens;
+    ctx->kv_n_used = n_past + n_tokens;
 
     ggml_tensor* out = ggml_graph_get_tensor(gf, "logits");
     if (!out)
@@ -2383,6 +2431,595 @@ extern "C" float* qwen3_asr_run_aligner(struct qwen3_asr_context* ctx, const flo
         return nullptr;
     ggml_backend_tensor_get(out, result, 0, total * sizeof(float));
     return result;
+}
+
+// One full-T forward pass for the Qwen3-ForcedAligner. Same KV-cached
+// graph the ASR backend uses for prefill, but with last_token_only=false
+// so the lm_head sees every position. The KV cache is reset at the start
+// because forced alignment is one-shot — no autoregressive decode loop.
+extern "C" float* qwen3_asr_run_aligner(struct qwen3_asr_context* ctx, const float* inputs_embeds, int n_tokens,
+                                        int* out_n_tokens, int* out_lm_head_dim) {
+    if (!ctx)
+        return nullptr;
+    qwen3_asr_kv_reset(ctx);
+    return qwen3_asr_run_aligner_core(ctx, inputs_embeds, n_tokens, /*n_past=*/0, out_n_tokens, out_lm_head_dim);
+}
+
+// ============================================================================
+// Streaming forced alignment
+// ============================================================================
+//
+// Public API: qwen3_asr_align_words_streaming + qwen3_asr_align_streaming_reset.
+// Internal helpers below extract the argmax+LIS+ms-conversion pipeline so
+// the streaming path can reuse it without duplicating ~80 lines of
+// fragile timestamp post-processing.
+
+constexpr int kQwen3FaTimestampTokenId = 151705;
+constexpr float kQwen3FaTimestampSegmentMs = 80.0f;
+
+// Apply the LIS-based monotonicity fix in-place on a 2*n_words vector
+// of timestamp class indices. Same algo as qwen3_asr_align_words; lifted
+// out so both the one-shot and streaming paths share it.
+static void qwen3_fa_lis_monotonize(std::vector<int>& ts_classes, int n_words) {
+    const int M = (int)ts_classes.size();
+    std::vector<int> dp;
+    std::vector<int> parent(M, -1);
+    std::vector<int> idx_map;
+    for (int i = 0; i < M; i++) {
+        int val = ts_classes[i];
+        auto it = std::upper_bound(dp.begin(), dp.end(), val);
+        int pos = (int)(it - dp.begin());
+        if (pos == (int)dp.size()) {
+            dp.push_back(val);
+            idx_map.push_back(i);
+        } else {
+            dp[pos] = val;
+            idx_map[pos] = i;
+        }
+        parent[i] = (pos > 0) ? idx_map[pos - 1] : -1;
+    }
+    std::vector<bool> in_lis(M, false);
+    if (!idx_map.empty()) {
+        int k = idx_map.back();
+        while (k >= 0) {
+            in_lis[k] = true;
+            k = parent[k];
+        }
+    }
+    int prev_lis = -1;
+    int prev_val = 0;
+    for (int i = 0; i < M; i++) {
+        if (in_lis[i]) {
+            if (prev_lis >= 0) {
+                for (int j = prev_lis + 1; j < i; j++) {
+                    float frac = (float)(j - prev_lis) / (float)(i - prev_lis);
+                    ts_classes[j] = prev_val + (int)(frac * (float)(ts_classes[i] - prev_val));
+                }
+            }
+            prev_lis = i;
+            prev_val = ts_classes[i];
+        }
+    }
+    for (int j = prev_lis + 1; j < M; j++)
+        ts_classes[j] = prev_val;
+    for (int w = 0; w < n_words; w++) {
+        if (ts_classes[2 * w + 1] < ts_classes[2 * w])
+            ts_classes[2 * w + 1] = ts_classes[2 * w];
+    }
+}
+
+// Pull argmax-class at each timestamp position out of a (n_logit_rows, H)
+// logits buffer, run LIS monotonicity, and convert to ms.
+//
+// `ts_logit_rows[i]` is the row index inside `logits` for the i-th
+// timestamp placeholder (chronological order). Returns 0 on success.
+static int qwen3_fa_extract_word_timings(const float* logits, int /*n_logit_rows*/, int H,
+                                         const std::vector<int>& ts_logit_rows, int n_words, int64_t* out_start_ms,
+                                         int64_t* out_end_ms) {
+    if ((int)ts_logit_rows.size() != 2 * n_words) {
+        fprintf(stderr, "qwen3_asr[align]: timestamp count mismatch — got %zu placeholders, expected %d\n",
+                ts_logit_rows.size(), 2 * n_words);
+        return -7;
+    }
+    std::vector<int> ts_classes;
+    ts_classes.reserve(ts_logit_rows.size());
+    for (int row : ts_logit_rows) {
+        const float* r = logits + (size_t)row * H;
+        int best = 0;
+        float mx = r[0];
+        for (int k = 1; k < H; k++) {
+            if (r[k] > mx) {
+                mx = r[k];
+                best = k;
+            }
+        }
+        ts_classes.push_back(best);
+    }
+    qwen3_fa_lis_monotonize(ts_classes, n_words);
+    for (int w = 0; w < n_words; w++) {
+        out_start_ms[w] = (int64_t)((float)ts_classes[2 * w + 0] * kQwen3FaTimestampSegmentMs);
+        out_end_ms[w] = (int64_t)((float)ts_classes[2 * w + 1] * kQwen3FaTimestampSegmentMs);
+    }
+    return 0;
+}
+
+// Build the text-suffix token id stream for the FA prompt:
+//   [audio_end, w1_tokens..., TS, TS, w2_tokens..., TS, TS, ...]
+// `ts_offsets_in_suffix` gets the offset (within text_suffix_ids) of
+// each timestamp placeholder in chronological order — used by the
+// argmax helper to find the right logits rows.
+static void qwen3_fa_build_text_suffix(qwen3_asr_context* ctx, const char** words, int n_words, int audio_end_id,
+                                       std::vector<int32_t>& text_suffix_ids, std::vector<int>& ts_offsets_in_suffix) {
+    text_suffix_ids.clear();
+    ts_offsets_in_suffix.clear();
+    text_suffix_ids.reserve((size_t)(n_words * 6 + 4));
+    ts_offsets_in_suffix.reserve((size_t)(2 * n_words));
+    text_suffix_ids.push_back((int32_t)audio_end_id);
+    for (int w = 0; w < n_words; w++) {
+        const std::string word = (w == 0) ? std::string(words[w]) : std::string(" ") + words[w];
+        int n = 0;
+        int32_t* arr = qwen3_asr_tokenize(ctx, word.c_str(), &n);
+        if (arr && n > 0) {
+            for (int i = 0; i < n; i++)
+                text_suffix_ids.push_back(arr[i]);
+        }
+        free(arr);
+        ts_offsets_in_suffix.push_back((int)text_suffix_ids.size());
+        text_suffix_ids.push_back((int32_t)kQwen3FaTimestampTokenId);
+        ts_offsets_in_suffix.push_back((int)text_suffix_ids.size());
+        text_suffix_ids.push_back((int32_t)kQwen3FaTimestampTokenId);
+    }
+}
+
+extern "C" void qwen3_asr_align_streaming_reset(struct qwen3_asr_context* ctx) {
+    if (!ctx)
+        return;
+    ctx->align_stream.initialized = false;
+    ctx->align_stream.N_enc_committed = 0;
+    ctx->align_stream.n_text_tokens = 0;
+    ctx->align_stream.text_ids.clear();
+    ctx->align_stream.words_signature.clear();
+    ctx->align_stream.raw_log_mel_TM.clear();
+    ctx->align_stream.T_committed_mel = 0;
+    // KV cache buffer stays alive — the next call may reuse it.
+    qwen3_asr_kv_reset(ctx);
+}
+
+extern "C" int qwen3_asr_align_words_streaming(struct qwen3_asr_context* ctx, const float* samples, int n_samples,
+                                               const char** words, int n_words, bool reset, int64_t* out_start_ms,
+                                               int64_t* out_end_ms) {
+    if (!ctx || !samples || n_samples <= 0 || !words || n_words <= 0 || !out_start_ms || !out_end_ms)
+        return -1;
+
+    const bool probe_vram = []() {
+        const char* e = std::getenv("QWEN3_FA_PROFILE_VRAM");
+        return e && *e && std::atoi(e) > 0;
+    }();
+    // Fine-grained timing breakdown for the streaming path — used to
+    // determine which inner stage (encoder vs body forward vs other) is
+    // the actual bottleneck. The handoff's "body forward dominates"
+    // premise turned out to be wrong on this model (q4_k_m FA, RTX 3060
+    // host, CPU LLM body), so we keep this in tree as a permanent
+    // diagnostic and not just temporary instrumentation.
+    const bool probe_time = []() {
+        const char* e = std::getenv("QWEN3_FA_PROFILE_TIME");
+        return e && *e && std::atoi(e) > 0;
+    }();
+    using clk_t = std::chrono::steady_clock;
+    auto vram_used_mib = [&]() -> double {
+        size_t f = 0, t = 0;
+        ggml_backend_dev_t gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        if (gpu)
+            ggml_backend_dev_memory(gpu, &f, &t);
+        return (double)(t - f) / 1048576.0;
+    };
+    auto probe = [&](const char* label) {
+        if (!probe_vram)
+            return;
+        fprintf(stderr, "  [fa-vram-stream %-16s] gpu_used=%7.1f MiB\n", label, vram_used_mib());
+    };
+    auto t_entry = clk_t::now();
+    int64_t t_mel_ms = 0, t_enc_ms = 0, t_embed_ms = 0, t_body_ms = 0, t_argmax_ms = 0;
+    probe("entry");
+
+    // Build a cheap stable signature of the word list so we can detect
+    // a different paragraph being pushed in mid-stream and force a reset.
+    std::string sig;
+    sig.reserve((size_t)n_words * 8);
+    for (int i = 0; i < n_words; i++) {
+        sig.append(words[i]);
+        sig.push_back('\n');
+    }
+
+    bool need_reset = reset || !ctx->align_stream.initialized || ctx->align_stream.words_signature != sig;
+
+    // K/V cache reuse across partials is a separate (drift-introducing)
+    // optimization on top of the bit-identical mel cache.
+    //
+    // **Default OFF.** Empirically the body forward isn't dominated by
+    // per-token cost: dropping from N_enc + n_text (~435) tokens to
+    // Δ + n_text (~265) only saves ~10-30 ms while sacrificing strict
+    // bit-identity (the FA encoder is fully bidirectional, so cached
+    // audio K/V drifts as new chunks shift the encoder's old-frame
+    // embeds). The mel cache alone delivers ~150 ms/partial wallclock
+    // savings AND zero word-timing drift, which is the right default.
+    //
+    // Set QWEN3_FA_STREAMING_KV=1 to opt in to the K/V cache reuse
+    // (faster by ~10-30 ms per partial at the tail; ~720 ms max
+    // word-timing drift on the smoke paragraph). Useful when latency
+    // matters more than bit-identical word boundaries.
+    const bool kv_reuse = []() {
+        const char* e = std::getenv("QWEN3_FA_STREAMING_KV");
+        if (!e || !*e)
+            return false;
+        return std::atoi(e) != 0;
+    }();
+
+    if (need_reset) {
+        qwen3_asr_align_streaming_reset(ctx);
+        ctx->align_stream.words_signature = sig;
+    }
+
+    // ---- Mel (incremental) ----
+    //
+    // Whisper-style STFT + mel-filter + log10 is time-local: frame t only
+    // depends on samples [t*hop - n_fft/2, t*hop + n_fft/2). We cache the
+    // RAW (pre-normalization) log-mel across partials and only run STFT
+    // for the newly-arrived frames. The Whisper GlobalClipMax norm step
+    // IS global, so we apply it to a temp copy of the cumulative buffer
+    // each partial — that's a flat O(n_mels*T) scan and negligible cost.
+    //
+    // For a 32 s paragraph this cuts the per-partial mel cost from
+    // ~200 ms (full STFT) to ~10-20 ms (just the Δ_audio frames). Mel
+    // output is bit-identical to qwen3_asr_compute_mel on the same
+    // cumulative samples (we manually verify under
+    // QWEN3_FA_MEL_VERIFY=1).
+    auto t_stage = clk_t::now();
+    crisp_audio_context* ca = qwen3_asr_get_audio(ctx);
+    if (!ca) {
+        fprintf(stderr, "qwen3_asr[align-stream]: audio tower unavailable\n");
+        return -2;
+    }
+    const int hop = (int)ctx->model.hparams.hop_length;
+    const int n_mels = (int)ctx->model.hparams.n_mels;
+    const int n_fft = (int)ctx->model.hparams.n_fft;
+    const int T_total = n_samples / hop; // matches qwen3_asr_compute_mel's drop_last_frame T
+    if (T_total <= 0) {
+        fprintf(stderr, "qwen3_asr[align-stream]: audio too short (n_samples=%d < hop=%d)\n", n_samples, hop);
+        return -2;
+    }
+    // Only cache frames whose entire STFT window lies inside the current
+    // sample buffer. A frame at index t reads samples [t*hop - n_fft/2,
+    // t*hop + n_fft/2); if its right edge extends past n_samples the
+    // missing tail is zero-padded — fine for the current call but stale
+    // once more audio arrives (the one-shot mel at the larger n_samples
+    // would use REAL audio there). T_safe is the largest frame index
+    // whose right edge is still strictly inside the buffer.
+    const int T_safe_raw = (n_samples - n_fft / 2) / hop;
+    const int T_safe = std::max(0, std::min(T_safe_raw, T_total));
+
+    if (need_reset) {
+        ctx->align_stream.raw_log_mel_TM.clear();
+        ctx->align_stream.T_committed_mel = 0;
+    }
+    int T_committed = ctx->align_stream.T_committed_mel;
+    if (T_committed > T_safe) {
+        // Audio shrank or boundary moved backwards — trim cache.
+        ctx->align_stream.raw_log_mel_TM.resize((size_t)T_safe * n_mels);
+        ctx->align_stream.T_committed_mel = T_safe;
+        T_committed = T_safe;
+    }
+    // 1. Append newly-safe frames [T_committed, T_safe) to the persistent cache.
+    if (T_safe > T_committed) {
+        int n_mels_got = 0;
+        float* new_safe = crisp_audio_compute_log_mel_range(ca, samples, n_samples, T_committed, T_safe, &n_mels_got);
+        if (!new_safe || n_mels_got != n_mels) {
+            free(new_safe);
+            fprintf(stderr, "qwen3_asr[align-stream]: incremental mel failed (safe range [%d, %d))\n", T_committed,
+                    T_safe);
+            return -2;
+        }
+        const size_t n_new = (size_t)(T_safe - T_committed) * n_mels;
+        ctx->align_stream.raw_log_mel_TM.insert(ctx->align_stream.raw_log_mel_TM.end(), new_safe, new_safe + n_new);
+        free(new_safe);
+        ctx->align_stream.T_committed_mel = T_safe;
+    }
+    // 2. Compute the "unsafe" frames [T_safe, T_total) on every call —
+    //    their right-context will fill in as more audio arrives, so we
+    //    can't cache them bit-identically. Held in a temporary stage
+    //    buffer that's freed at end of this call.
+    std::vector<float> unsafe_TM;
+    if (T_total > T_safe) {
+        int n_mels_got = 0;
+        float* unsafe = crisp_audio_compute_log_mel_range(ca, samples, n_samples, T_safe, T_total, &n_mels_got);
+        if (!unsafe || n_mels_got != n_mels) {
+            free(unsafe);
+            fprintf(stderr, "qwen3_asr[align-stream]: incremental mel failed (unsafe range [%d, %d))\n", T_safe,
+                    T_total);
+            return -2;
+        }
+        const size_t n_unsafe = (size_t)(T_total - T_safe) * n_mels;
+        unsafe_TM.assign(unsafe, unsafe + n_unsafe);
+        free(unsafe);
+    }
+    probe("after-mel");
+    t_mel_ms = std::chrono::duration_cast<std::chrono::milliseconds>(clk_t::now() - t_stage).count();
+
+    // ---- Transpose (T, n_mels) → (n_mels, T) and apply GlobalClipMax ----
+    //
+    // We stitch two segments here: the cached safe frames [0, T_safe)
+    // from raw_log_mel_TM, followed by the freshly-computed unsafe
+    // frames [T_safe, T_total) from unsafe_TM. Both are (T, n_mels)
+    // row-major; the loop body handles the index → row-major-(n_mels, T)
+    // transpose in one pass.
+    t_stage = clk_t::now();
+    std::vector<float> mel_for_encoder((size_t)n_mels * T_total);
+    {
+        const float* safe_src = ctx->align_stream.raw_log_mel_TM.data();
+        const float* unsafe_src = unsafe_TM.data();
+        for (int t = 0; t < T_total; t++) {
+            const float* row = (t < T_safe) ? (safe_src + (size_t)t * n_mels)
+                                            : (unsafe_src + (size_t)(t - T_safe) * n_mels);
+            for (int m = 0; m < n_mels; m++) {
+                mel_for_encoder[(size_t)m * T_total + t] = row[m];
+            }
+        }
+        crisp_audio_apply_clip_max_norm(mel_for_encoder.data(), n_mels, T_total);
+    }
+
+    // Optional verification: compare against the one-shot mel each call.
+    // QWEN3_FA_MEL_VERIFY=1 turns it on. Bails out + logs if drift is
+    // non-negligible.
+    if (const char* mv = std::getenv("QWEN3_FA_MEL_VERIFY"); mv && std::atoi(mv) > 0) {
+        int gold_n_mels = 0, gold_T = 0;
+        float* gold = qwen3_asr_compute_mel(ctx, samples, n_samples, &gold_n_mels, &gold_T);
+        if (gold && gold_n_mels == n_mels && gold_T == T_total) {
+            double max_diff = 0;
+            int n_nonzero = 0;
+            int first_t = -1, first_m = -1;
+            float first_gold = 0, first_mine = 0;
+            for (int m = 0; m < n_mels; m++) {
+                for (int t = 0; t < T_total; t++) {
+                    const size_t i = (size_t)m * T_total + t;
+                    double d = std::abs((double)gold[i] - (double)mel_for_encoder[i]);
+                    if (d > max_diff)
+                        max_diff = d;
+                    if (d > 1e-5) {
+                        n_nonzero++;
+                        if (first_t < 0) {
+                            first_t = t;
+                            first_m = m;
+                            first_gold = gold[i];
+                            first_mine = mel_for_encoder[i];
+                        }
+                    }
+                }
+            }
+            fprintf(stderr,
+                    "  [fa-mel-verify] T=%d max_abs_diff=%.6f n_diff_gt_1e5=%d first_diff(t=%d,m=%d) gold=%.6f "
+                    "mine=%.6f T_committed_pre=%d\n",
+                    T_total, max_diff, n_nonzero, first_t, first_m, first_gold, first_mine,
+                    ctx->align_stream.T_committed_mel - (T_total - T_committed));
+        }
+        free(gold);
+    }
+
+    int N_enc = 0, pdim = 0;
+    float* audio_embeds = qwen3_asr_run_encoder(ctx, mel_for_encoder.data(), n_mels, T_total, &N_enc, &pdim);
+    if (!audio_embeds) {
+        fprintf(stderr, "qwen3_asr[align-stream]: encoder failed\n");
+        return -3;
+    }
+    probe("after-encoder");
+    t_enc_ms = std::chrono::duration_cast<std::chrono::milliseconds>(clk_t::now() - t_stage).count();
+
+    // Encoder shrinking would indicate a non-monotonic call — force reset.
+    if (!need_reset && N_enc < ctx->align_stream.N_enc_committed) {
+        free(audio_embeds);
+        qwen3_asr_align_streaming_reset(ctx);
+        // Try again from scratch via a tail-recursive call. (One-shot;
+        // the recursive call will hit the reset path.)
+        return qwen3_asr_align_words_streaming(ctx, samples, n_samples, words, n_words, /*reset=*/true,
+                                               out_start_ms, out_end_ms);
+    }
+
+    const auto& hp = ctx->model.hparams;
+    const int audio_start_id = (int)hp.audio_start_token_id;
+    const int audio_end_id = (int)hp.audio_end_token_id;
+    const int audio_pad_id = (int)hp.audio_pad_token_id;
+
+    // Build / re-use the text-suffix token list.
+    std::vector<int> ts_offsets_in_suffix; // recomputed on reset
+    if (need_reset) {
+        ctx->align_stream.text_ids.clear();
+        qwen3_fa_build_text_suffix(ctx, words, n_words, audio_end_id, ctx->align_stream.text_ids,
+                                   ts_offsets_in_suffix);
+        ctx->align_stream.n_text_tokens = (int)ctx->align_stream.text_ids.size();
+    } else {
+        // Reconstruct ts_offsets_in_suffix from the cached text_ids by
+        // scanning for TIMESTAMP_TOKEN_ID. Cheaper than caching the
+        // vector (we'd have to keep it in sync with text_ids anyway).
+        ts_offsets_in_suffix.reserve((size_t)(2 * n_words));
+        for (int i = 0; i < (int)ctx->align_stream.text_ids.size(); i++) {
+            if (ctx->align_stream.text_ids[i] == kQwen3FaTimestampTokenId)
+                ts_offsets_in_suffix.push_back(i);
+        }
+        if ((int)ts_offsets_in_suffix.size() != 2 * n_words) {
+            // Word list shape mismatch — fall back to reset.
+            free(audio_embeds);
+            qwen3_asr_align_streaming_reset(ctx);
+            return qwen3_asr_align_words_streaming(ctx, samples, n_samples, words, n_words, /*reset=*/true,
+                                                   out_start_ms, out_end_ms);
+        }
+    }
+
+    // ---- Decide cache sizing + n_past ----
+    const int n_text = ctx->align_stream.n_text_tokens;
+    int n_past = 0;
+    int n_input_tokens = 0;
+    int n_audio_rows_in_input = 0; // how many of the leading input rows are audio pads
+    int N_enc_committed_pre = ctx->align_stream.N_enc_committed;
+
+    if (need_reset || !kv_reuse) {
+        // Full prompt: [audio_start, N_enc audio_pads, audio_end, words+ts].
+        // The `!kv_reuse` branch runs each partial without reusing prior
+        // K/V — bit-identical to the one-shot path, but still benefits
+        // from the cached mel.
+        n_audio_rows_in_input = N_enc;
+        n_input_tokens = 1 + N_enc + n_text; // +1 for audio_start
+        n_past = 0;
+    } else {
+        // Just the delta + text suffix re-forward.
+        const int delta = N_enc - N_enc_committed_pre;
+        n_audio_rows_in_input = delta;
+        n_input_tokens = delta + n_text;
+        n_past = 1 + N_enc_committed_pre; // audio_start + committed audio_pads
+    }
+
+    // Right-size the KV cache. On reset we overshoot generously so
+    // subsequent partials never trigger a realloc (which would zero
+    // kv_n_used and destroy the audio K/V we just cached). Default
+    // ceiling assumes paragraph length ≤ ~60 s of audio:
+    //   audio @ ~12.5 Hz post-cnn × 60 s ≈ 750 slots
+    //   + audio_start + audio_end + (~200 token text suffix worst-case)
+    //   + headroom for the LIS argmax row scan
+    //   ≈ 1024
+    int kv_min_ctx = 0;
+    if (const char* e = std::getenv("QWEN3_FA_KV_MIN_CTX"))
+        kv_min_ctx = std::atoi(e);
+    const bool full_forward = need_reset || !kv_reuse;
+    // Oversize the cache only on the first partial of a kv_reuse session,
+    // so subsequent resume partials can grow the prompt without triggering
+    // a realloc (which would zero kv_n_used and drop the audio K/V). In
+    // every other case (one-shot, !kv_reuse, mid-session resume) we
+    // right-size to this call's prompt + 16 — matches the prior
+    // PLAN #69f VRAM target (~340-390 MiB recovered vs the historical
+    // 4096-slot floor; ~117 MiB more recovered vs an unconditional 1024).
+    const int kv_baseline = (need_reset && kv_reuse) ? 1024 : 16;
+    const int kv_target = std::max({n_past + n_input_tokens + kv_baseline, kv_min_ctx, ctx->kv_max_ctx});
+    if (!full_forward && kv_target > ctx->kv_max_ctx) {
+        // Resume path can't grow the cache without losing the audio K/V.
+        // Force a reset and re-run from scratch.
+        free(audio_embeds);
+        qwen3_asr_align_streaming_reset(ctx);
+        return qwen3_asr_align_words_streaming(ctx, samples, n_samples, words, n_words, /*reset=*/true, out_start_ms,
+                                               out_end_ms);
+    }
+    if (!qwen3_asr_kv_init(ctx, kv_target)) {
+        free(audio_embeds);
+        fprintf(stderr, "qwen3_asr[align-stream]: kv_init failed\n");
+        return -5;
+    }
+    if (full_forward) {
+        // Full forward path — cache cursor starts at 0. align_streaming_reset
+        // already called kv_reset on the reset branch; for !kv_reuse we
+        // do it here explicitly.
+        qwen3_asr_kv_reset(ctx);
+    } else {
+        // Rewind the cursor so the upcoming forward writes start at
+        // n_past = 1 + N_enc_committed. (This is bookkeeping for the
+        // graph builder's GGML_ASSERT(Lk <= kv_max_ctx); the actual
+        // cache slots [0, n_past) are preserved.)
+        ctx->kv_n_used = n_past;
+    }
+    probe("after-kv_init");
+
+    // ---- Build the input_ids stream for embedding + later argmax ----
+    std::vector<int32_t> input_ids;
+    input_ids.reserve((size_t)n_input_tokens);
+    if (full_forward) {
+        input_ids.push_back((int32_t)audio_start_id);
+        for (int i = 0; i < N_enc; i++)
+            input_ids.push_back((int32_t)audio_pad_id);
+    } else {
+        for (int i = 0; i < n_audio_rows_in_input; i++)
+            input_ids.push_back((int32_t)audio_pad_id);
+    }
+    for (int t : ctx->align_stream.text_ids)
+        input_ids.push_back(t);
+    if ((int)input_ids.size() != n_input_tokens) {
+        free(audio_embeds);
+        fprintf(stderr, "qwen3_asr[align-stream]: input_ids size mismatch (%zu vs %d)\n", input_ids.size(),
+                n_input_tokens);
+        return -8;
+    }
+
+    // ---- Embed + splice audio into audio_pad slots ----
+    t_stage = clk_t::now();
+    float* text_embeds = qwen3_asr_embed_tokens(ctx, input_ids.data(), n_input_tokens);
+    if (!text_embeds) {
+        free(audio_embeds);
+        fprintf(stderr, "qwen3_asr[align-stream]: embed failed\n");
+        return -4;
+    }
+    probe("after-embed");
+    {
+        // Which audio_embeds rows to splice in. For full_forward paths
+        // that's [0, N_enc); for the K/V-reuse resume path it's
+        // [N_enc_committed, N_enc).
+        int splice_src_base = full_forward ? 0 : N_enc_committed_pre;
+        int spliced = 0;
+        for (int i = 0; i < n_input_tokens; i++) {
+            if (input_ids[i] == audio_pad_id) {
+                std::memcpy(text_embeds + (size_t)i * pdim, audio_embeds + (size_t)(splice_src_base + spliced) * pdim,
+                            (size_t)pdim * sizeof(float));
+                spliced++;
+            }
+        }
+        if (spliced != n_audio_rows_in_input) {
+            free(text_embeds);
+            free(audio_embeds);
+            fprintf(stderr, "qwen3_asr[align-stream]: audio splice mismatch (%d vs %d)\n", spliced,
+                    n_audio_rows_in_input);
+            return -9;
+        }
+    }
+    free(audio_embeds);
+    t_embed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(clk_t::now() - t_stage).count();
+
+    // ---- Forward ----
+    t_stage = clk_t::now();
+    int n_t_out = 0, H = 0;
+    float* logits = qwen3_asr_run_aligner_core(ctx, text_embeds, n_input_tokens, n_past, &n_t_out, &H);
+    free(text_embeds);
+    if (!logits) {
+        fprintf(stderr, "qwen3_asr[align-stream]: aligner forward failed\n");
+        return -6;
+    }
+    probe("after-aligner");
+    t_body_ms = std::chrono::duration_cast<std::chrono::milliseconds>(clk_t::now() - t_stage).count();
+
+    // ---- Argmax timestamps ----
+    t_stage = clk_t::now();
+    // Convert ts_offsets_in_suffix (offsets within text_suffix) to
+    // logit row indices. The text suffix begins at:
+    //   full_forward: 1 + N_enc      (audio_start at row 0, then N_enc audio_pads)
+    //   KV resume:    n_audio_rows_in_input  (= Δ, no audio_start in the slice)
+    const int text_suffix_logit_base = full_forward ? (1 + N_enc) : n_audio_rows_in_input;
+    std::vector<int> ts_logit_rows;
+    ts_logit_rows.reserve((size_t)(2 * n_words));
+    for (int off : ts_offsets_in_suffix)
+        ts_logit_rows.push_back(text_suffix_logit_base + off);
+
+    int rc = qwen3_fa_extract_word_timings(logits, n_input_tokens, H, ts_logit_rows, n_words, out_start_ms, out_end_ms);
+    free(logits);
+    probe("after-argmax");
+    t_argmax_ms = std::chrono::duration_cast<std::chrono::milliseconds>(clk_t::now() - t_stage).count();
+
+    if (rc == 0) {
+        ctx->align_stream.N_enc_committed = N_enc;
+        ctx->align_stream.initialized = true;
+    }
+    if (probe_time) {
+        const int64_t total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(clk_t::now() - t_entry).count();
+        fprintf(stderr,
+                "  [fa-time-stream %s] mel=%lld enc=%lld embed=%lld body=%lld argmax=%lld TOTAL=%lld ms  "
+                "N_enc=%d Δ=%d n_text=%d n_past=%d n_input=%d\n",
+                need_reset ? "reset" : "resume", (long long)t_mel_ms, (long long)t_enc_ms, (long long)t_embed_ms,
+                (long long)t_body_ms, (long long)t_argmax_ms, (long long)total_ms, N_enc,
+                N_enc - N_enc_committed_pre, n_text, n_past, n_input_tokens);
+    }
+    return rc;
 }
 
 extern "C" void qwen3_asr_get_vram_breakdown(qwen3_asr_context* ctx, qwen3_asr_vram_breakdown* out) {

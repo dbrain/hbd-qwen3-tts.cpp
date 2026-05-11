@@ -749,6 +749,101 @@ float* crisp_audio_compute_mel(struct crisp_audio_context* ctx, const float* sam
     return result;
 }
 
+float* crisp_audio_compute_log_mel_range(struct crisp_audio_context* ctx, const float* samples, int n_samples,
+                                         int T_start, int T_end, int* out_n_mels) {
+    if (!ctx || !samples || n_samples <= 0 || T_end <= T_start)
+        return nullptr;
+    const auto& hp = ctx->hp;
+    if (!ctx->w.mel_filters || !ctx->w.mel_window) {
+        fprintf(stderr, "crisp_audio: GGUF missing mel_filters / mel_window\n");
+        return nullptr;
+    }
+
+    const int n_fft = (int)hp.n_fft;
+    const int hop = (int)hp.hop_length;
+    const int n_mels = (int)hp.n_mels;
+    const int n_freqs = n_fft / 2 + 1;
+    const int half_n_fft = n_fft / 2;
+    const int T = T_end - T_start;
+
+    std::vector<float> hann(n_fft);
+    ggml_backend_tensor_get(ctx->w.mel_window, hann.data(), 0, (size_t)n_fft * sizeof(float));
+    std::vector<float> filt((size_t)n_freqs * n_mels);
+    ggml_backend_tensor_get(ctx->w.mel_filters, filt.data(), 0, filt.size() * sizeof(float));
+
+    // For each frame t ∈ [T_start, T_end), the STFT window covers original
+    // samples [t*hop - n_fft/2, t*hop + n_fft/2). Out-of-range positions
+    // (negative on the left edge, past n_samples on the right edge) read
+    // as zero — matches whisper-style center padding.
+    std::vector<float> fft_in((size_t)n_fft);
+    std::vector<float> fft_out((size_t)n_fft * 2);
+    std::vector<float> mel_tn((size_t)T * n_mels, 0.0f);
+    constexpr float kLogEps = 1e-10f;
+    for (int ti = 0; ti < T; ti++) {
+        const int t_abs = T_start + ti;
+        const int win_start_abs = t_abs * hop - half_n_fft;
+        // Build windowed frame, zero-padding outside [0, n_samples).
+        for (int n = 0; n < n_fft; n++) {
+            const int idx = win_start_abs + n;
+            const float s = (idx >= 0 && idx < n_samples) ? samples[idx] : 0.0f;
+            fft_in[n] = s * hann[n];
+        }
+        crisp_audio_fft_wrapper(fft_in.data(), n_fft, fft_out.data());
+        // Power spectrum.
+        // (Stack-allocate to avoid an extra heap alloc per frame.)
+        // n_freqs == n_fft/2 + 1, capped at 4097 for our n_fft=400.
+        std::vector<float> power((size_t)n_freqs);
+        for (int k = 0; k < n_freqs; k++) {
+            const float re = fft_out[2 * k];
+            const float im = fft_out[2 * k + 1];
+            power[k] = re * re + im * im;
+        }
+        // Mel projection in double precision (matches qwen3 / whisper).
+        // filt is laid out as FbLayout::FreqsMels: filt[k * n_mels + m].
+        float* mp = mel_tn.data() + (size_t)ti * n_mels;
+        for (int m = 0; m < n_mels; m++) {
+            double s = 0.0;
+            for (int k = 0; k < n_freqs; k++) {
+                s += (double)power[k] * (double)filt[(size_t)k * n_mels + m];
+            }
+            // log10 with MaxClip guard.
+            float v = (float)s;
+            if (v < kLogEps)
+                v = kLogEps;
+            mp[m] = std::log10(v);
+        }
+    }
+
+    // Output layout: (T, n_mels) row-major — frames are contiguous so the
+    // streaming caller can append successive ranges with vector::insert /
+    // memcpy. Conversion to (n_mels, T) happens on the way into the
+    // encoder via a separate transpose.
+    float* out = (float*)std::malloc((size_t)T * n_mels * sizeof(float));
+    if (!out)
+        return nullptr;
+    std::memcpy(out, mel_tn.data(), (size_t)T * n_mels * sizeof(float));
+    if (out_n_mels)
+        *out_n_mels = n_mels;
+    return out;
+}
+
+void crisp_audio_apply_clip_max_norm(float* log_mel, int n_mels, int T_mel) {
+    if (!log_mel || n_mels <= 0 || T_mel <= 0)
+        return;
+    const size_t N = (size_t)n_mels * T_mel;
+    float mx = -1e30f;
+    for (size_t i = 0; i < N; i++)
+        if (log_mel[i] > mx)
+            mx = log_mel[i];
+    const float floor_v = mx - 8.0f;
+    for (size_t i = 0; i < N; i++) {
+        float v = log_mel[i];
+        if (v < floor_v)
+            v = floor_v;
+        log_mel[i] = (v + 4.0f) / 4.0f;
+    }
+}
+
 float* crisp_audio_encode(struct crisp_audio_context* ctx, const float* mel_features, int n_mels, int T_mel,
                           int* out_n_frames, int* out_dim) {
     if (!ctx || !mel_features)
