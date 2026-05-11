@@ -97,12 +97,14 @@ void TTSTransformer::unload_model() {
 
 bool TTSTransformer::load_model(const std::string & model_path) {
     unload_model();
+    const int64_t t_lm_start = ggml_time_ms();
 
 #if defined(QWEN3_TTS_HAS_MEGAKERNEL)
     // QWEN3_TTS_SPECIALIZED_MMVQ=1 → install the shape-specialized Q8_0 MMVQ
     // hook in ggml-cuda. Idempotent across repeated load_model calls.
     qwen3_megakernel::install();
 #endif
+    const int64_t t_lm_after_mk = ggml_time_ms();
 
     skip_ggml_code_pred_layers_ = false;
 #if defined(__APPLE__)
@@ -149,26 +151,37 @@ bool TTSTransformer::load_model(const std::string & model_path) {
         error_msg_ = "Failed to open GGUF file: " + model_path;
         return false;
     }
-    
+    const int64_t t_lm_after_gguf = ggml_time_ms();
+
     if (!parse_config(ctx)) {
         gguf_free(ctx);
         if (meta_ctx) ggml_free(meta_ctx);
         return false;
     }
-    
+    const int64_t t_lm_after_cfg = ggml_time_ms();
+
     if (!create_tensors(ctx)) {
         gguf_free(ctx);
         if (meta_ctx) ggml_free(meta_ctx);
         return false;
     }
-    
+    const int64_t t_lm_after_ct = ggml_time_ms();
+
     if (!load_tensor_data(model_path, ctx)) {
         free_transformer_model(model_);
         gguf_free(ctx);
         if (meta_ctx) ggml_free(meta_ctx);
         return false;
     }
-    
+    const int64_t t_lm_after_ltd = ggml_time_ms();
+    fprintf(stderr, "  [transformer.load] mk=%lld ms gguf_init=%lld ms parse=%lld ms create=%lld ms load_tensor=%lld ms (cum=%lld ms)\n",
+            (long long)(t_lm_after_mk - t_lm_start),
+            (long long)(t_lm_after_gguf - t_lm_after_mk),
+            (long long)(t_lm_after_cfg - t_lm_after_gguf),
+            (long long)(t_lm_after_ct - t_lm_after_cfg),
+            (long long)(t_lm_after_ltd - t_lm_after_ct),
+            (long long)(t_lm_after_ltd - t_lm_start));
+
     gguf_free(ctx);
     if (meta_ctx) ggml_free(meta_ctx);
     
@@ -834,11 +847,13 @@ bool TTSTransformer::create_tensors(struct gguf_context * ctx) {
  }
 
 bool TTSTransformer::load_tensor_data(const std::string & path, struct gguf_context * ctx) {
+    const int64_t t_ltd_start = ggml_time_ms();
     ggml_backend_t backend = init_preferred_backend("TTSTransformer", &error_msg_);
     if (!backend) {
         return false;
     }
-    
+    const int64_t t_ltd_after_backend = ggml_time_ms();
+
     model_.buffer = ggml_backend_alloc_ctx_tensors(model_.ctx, backend);
     if (!model_.buffer) {
         error_msg_ = "Failed to allocate tensor buffer";
@@ -846,6 +861,10 @@ bool TTSTransformer::load_tensor_data(const std::string & path, struct gguf_cont
         return false;
     }
     ggml_backend_buffer_set_usage(model_.buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    const int64_t t_ltd_after_alloc = ggml_time_ms();
+    fprintf(stderr, "  [ltd] init_backend=%lld ms alloc_ctx_tensors=%lld ms\n",
+            (long long)(t_ltd_after_backend - t_ltd_start),
+            (long long)(t_ltd_after_alloc - t_ltd_after_backend));
     
     FILE * f = fopen(path.c_str(), "rb");
     if (!f) {
@@ -857,41 +876,55 @@ bool TTSTransformer::load_tensor_data(const std::string & path, struct gguf_cont
     const size_t data_offset = gguf_get_data_offset(ctx);
     const int64_t n_tensors = gguf_get_n_tensors(ctx);
     std::vector<uint8_t> read_buf;
-    
+
+    int64_t t_io_us = 0, t_h2d_us = 0;
+    size_t total_bytes = 0;
+    int    n_loaded = 0;
+
     for (int64_t i = 0; i < n_tensors; ++i) {
         const char * name = gguf_get_tensor_name(ctx, i);
         size_t offset = gguf_get_tensor_offset(ctx, i);
-        
+
         auto it = model_.tensors.find(name);
         if (it == model_.tensors.end()) {
             continue;
         }
-        
+
         struct ggml_tensor * tensor = it->second;
         size_t nbytes = ggml_nbytes(tensor);
-        
+
         read_buf.resize(nbytes);
-        
+
         if (fseek(f, (long)(data_offset + offset), SEEK_SET) != 0) {
             error_msg_ = "Failed to seek to tensor data: " + std::string(name);
             fclose(f);
             release_preferred_backend(backend);
             return false;
         }
-        
+
+        auto t_io0 = std::chrono::steady_clock::now();
         if (fread(read_buf.data(), 1, nbytes, f) != nbytes) {
             error_msg_ = "Failed to read tensor data: " + std::string(name);
             fclose(f);
             release_preferred_backend(backend);
             return false;
         }
-        
+        auto t_io1 = std::chrono::steady_clock::now();
         ggml_backend_tensor_set(tensor, read_buf.data(), 0, nbytes);
+        auto t_h2d1 = std::chrono::steady_clock::now();
+        t_io_us  += std::chrono::duration_cast<std::chrono::microseconds>(t_io1 - t_io0).count();
+        t_h2d_us += std::chrono::duration_cast<std::chrono::microseconds>(t_h2d1 - t_io1).count();
+        total_bytes += nbytes;
+        ++n_loaded;
     }
-    
+
     fclose(f);
     release_preferred_backend(backend);
-    
+
+    fprintf(stderr, "  [load-bw transformer] %d tensors, %.1f MiB: fread=%lld ms, H2D=%lld ms (%.2f GiB/s)\n",
+            n_loaded, total_bytes / 1048576.0,
+            (long long)(t_io_us / 1000), (long long)(t_h2d_us / 1000),
+            t_h2d_us > 0 ? (total_bytes / 1073741824.0) / (t_h2d_us / 1e6) : 0.0);
     return true;
 }
 

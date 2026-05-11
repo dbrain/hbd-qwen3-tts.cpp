@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <chrono>
 #include <csignal>
+#include "ggml.h"
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -336,6 +337,7 @@ bool WorkerSession::ensure_loaded(const WorkerLoadConfig & cfg) {
     // Different config (or first load) → kill any existing worker, respawn.
     if (pid_ > 0) kill_worker_locked();
 
+    const int64_t t_spawn_start = ggml_time_ms();
     pid_t child = spawn_worker(argv0_.c_str(), extra_argv_, &fd_,
                                 aligner_only_ ? "--worker-aligner" : "--worker");
     if (child < 0) {
@@ -343,8 +345,12 @@ bool WorkerSession::ensure_loaded(const WorkerLoadConfig & cfg) {
         return false;
     }
     pid_ = child;
+    fprintf(stderr, "worker-session[%s]: spawn_worker took %lld ms (pid=%d)\n",
+            aligner_only_ ? "aligner" : "synth",
+            (long long)(ggml_time_ms() - t_spawn_start), (int)child);
 
     // Expect HELLO before LOAD_REQ.
+    const int64_t t_hello_start = ggml_time_ms();
     FrameHeader hdr{};
     std::vector<uint8_t> payload;
     IpcError e = recv_frame(fd_, &hdr, &payload);
@@ -353,13 +359,19 @@ bool WorkerSession::ensure_loaded(const WorkerLoadConfig & cfg) {
         kill_worker_locked();
         return false;
     }
-    fprintf(stderr, "worker-session: child pid=%d HELLO: %.*s\n",
+    fprintf(stderr, "worker-session[%s]: HELLO recv took %lld ms (pid=%d): %.*s\n",
+            aligner_only_ ? "aligner" : "synth",
+            (long long)(ggml_time_ms() - t_hello_start),
             (int) pid_, (int) payload.size(), (const char *) payload.data());
 
+    const int64_t t_load_req_start = ggml_time_ms();
     if (!send_load_req_locked(cfg)) {
         kill_worker_locked();
         return false;
     }
+    fprintf(stderr, "worker-session[%s]: send_load_req+recv took %lld ms\n",
+            aligner_only_ ? "aligner" : "synth",
+            (long long)(ggml_time_ms() - t_load_req_start));
     loaded_cfg_ = cfg;
     loaded_ok_  = true;
     return true;
@@ -1058,6 +1070,13 @@ int run_worker_loop(int fd) {
     // Same unbuffered-stderr discipline as main() for crash handler logs.
     setvbuf(stderr, nullptr, _IONBF, 0);
 
+    // TTFA decomposition timeline (parallels [aw-time] on the aligner side).
+    const int64_t t_worker_start = ggml_time_ms();
+    auto t_since_start = [t_worker_start]() {
+        return (long long)(ggml_time_ms() - t_worker_start);
+    };
+    fprintf(stderr, "  [synth-time worker-start ] t+0 ms\n");
+
     // Linux PR_SET_PDEATHSIG: ask the kernel to send SIGTERM if our parent
     // dies. Belt-and-braces against an orphaned worker holding 2.6 GiB of
     // VRAM after the parent process exits abnormally. (We can't follow up
@@ -1129,6 +1148,8 @@ int run_worker_loop(int fd) {
                 break;
             }
             case WorkerFrame::LOAD_REQ: {
+                fprintf(stderr, "  [synth-time load-req-in   ] t+%lld ms\n", t_since_start());
+                const int64_t t_load_in = ggml_time_ms();
                 json req;
                 std::string err_msg;
                 bool ok = false;
@@ -1154,6 +1175,9 @@ int run_worker_loop(int fd) {
                 } catch (const std::exception & ex) {
                     err_msg = std::string("LOAD_REQ parse failed: ") + ex.what();
                 }
+                const int64_t t_after_models = ggml_time_ms();
+                fprintf(stderr, "  [synth-time models-loaded ] t+%lld ms  (models %lld ms)\n",
+                        t_since_start(), (long long)(t_after_models - t_load_in));
 
                 // After successful load, scan voice_archive_dir for *.warmup
                 // and inject into the model's prefill cache. This is what
@@ -1175,6 +1199,10 @@ int run_worker_loop(int fd) {
                     fprintf(stderr, "worker: loaded %d voice.warmup blob(s) from %s\n",
                             loaded_warmups, voice_archive_dir.c_str());
                 }
+                fprintf(stderr, "  [synth-time warmup-scan   ] t+%lld ms  (scan %lld ms, %d blobs)\n",
+                        t_since_start(),
+                        (long long)(ggml_time_ms() - t_after_models),
+                        loaded_warmups);
 
                 int sr = (ok && tts.is_loaded()) ? tts.get_sample_rate() : 0;
                 json resp = {
@@ -1191,6 +1219,7 @@ int run_worker_loop(int fd) {
                 break;
             }
             case WorkerFrame::SYNTH_REQ: {
+                fprintf(stderr, "  [synth-time synth-req-in  ] t+%lld ms\n", t_since_start());
                 std::string text;
                 std::vector<float>   embedding;
                 std::vector<int32_t> ref_codes;
@@ -1228,12 +1257,18 @@ int run_worker_loop(int fd) {
                 const bool streaming = (stream_batch_size > 0);
                 streaming_opts sopts;
                 std::atomic<bool> ipc_ok{ true };
+                std::atomic<bool> first_audio_logged{ false };
                 if (streaming) {
                     sopts.batch_size       = stream_batch_size;
                     sopts.first_batch_size = stream_first_batch_size;
                     const uint32_t cb_req_id = hdr.req_id;
-                    sopts.on_pcm = [fd, cb_req_id, &ipc_ok, &last_pcm]
+                    sopts.on_pcm = [fd, cb_req_id, &ipc_ok, &last_pcm,
+                                    &first_audio_logged, &t_since_start]
                                    (const float * pcm, size_t n) -> bool {
+                        if (!first_audio_logged.exchange(true)) {
+                            fprintf(stderr, "  [synth-time first-audio   ] t+%lld ms  (%zu samples in first batch)\n",
+                                    t_since_start(), n);
+                        }
                         // Accumulate into FA scratch BEFORE IPC send so
                         // even a half-streamed synth (IPC failure mid-way)
                         // leaves usable audio for diagnostics. Resampling

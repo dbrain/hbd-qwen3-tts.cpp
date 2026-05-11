@@ -1,5 +1,6 @@
 #include "gguf_loader.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -252,6 +253,10 @@ bool load_tensor_data_from_file(
     std::vector<float> f32_buf;     // F16 → F32 staging for quant
     std::vector<uint8_t> quant_buf; // F32 → Q8_0 staging for upload
 
+    int64_t t_io_us = 0, t_h2d_us = 0, t_quant_us = 0;
+    size_t total_h2d_bytes = 0;
+    int n_loaded = 0;
+
     for (int64_t i = 0; i < n_tensors; ++i) {
         const char * name = gguf_get_tensor_name(ctx, i);
         size_t offset = gguf_get_tensor_offset(ctx, i);
@@ -286,15 +291,22 @@ bool load_tensor_data_from_file(
             return false;
         }
 
+        auto t_io0 = std::chrono::steady_clock::now();
         if (fread(read_buf.data(), 1, src_nbytes, f) != src_nbytes) {
             error_msg = "Failed to read tensor data: " + std::string(name);
             fclose(f);
             ggml_backend_free(backend);
             return false;
         }
+        auto t_io1 = std::chrono::steady_clock::now();
+        t_io_us += std::chrono::duration_cast<std::chrono::microseconds>(t_io1 - t_io0).count();
 
         if (src_type == dst_type) {
             ggml_backend_tensor_set(tensor, read_buf.data(), 0, src_nbytes);
+            auto t_h2d1 = std::chrono::steady_clock::now();
+            t_h2d_us += std::chrono::duration_cast<std::chrono::microseconds>(t_h2d1 - t_io1).count();
+            total_h2d_bytes += src_nbytes;
+            ++n_loaded;
         } else if (src_type == GGML_TYPE_F16 && dst_type == GGML_TYPE_Q8_0) {
             // Decoder requested Q8_0 for selected mat-mul-only weights to
             // shrink vocoder VRAM (~28 MiB on the V1 12Hz tokenizer). On-disk
@@ -317,7 +329,13 @@ bool load_tensor_data_from_file(
                 ggml_backend_free(backend);
                 return false;
             }
+            auto t_q1 = std::chrono::steady_clock::now();
+            t_quant_us += std::chrono::duration_cast<std::chrono::microseconds>(t_q1 - t_io1).count();
             ggml_backend_tensor_set(tensor, quant_buf.data(), 0, q_bytes);
+            auto t_h2d1 = std::chrono::steady_clock::now();
+            t_h2d_us += std::chrono::duration_cast<std::chrono::microseconds>(t_h2d1 - t_q1).count();
+            total_h2d_bytes += q_bytes;
+            ++n_loaded;
         } else {
             error_msg = std::string("Unsupported dtype conversion ") +
                         ggml_type_name(src_type) + "->" + ggml_type_name(dst_type) +
@@ -327,10 +345,15 @@ bool load_tensor_data_from_file(
             return false;
         }
     }
-    
+
     fclose(f);
     ggml_backend_free(backend);
-    
+
+    fprintf(stderr, "  [load-bw %s] %d tensors, %.1f MiB H2D: fread=%lld ms, quant=%lld ms, H2D=%lld ms (%.2f GiB/s)\n",
+            path.c_str(), n_loaded, total_h2d_bytes / 1048576.0,
+            (long long)(t_io_us / 1000), (long long)(t_quant_us / 1000),
+            (long long)(t_h2d_us / 1000),
+            t_h2d_us > 0 ? (total_h2d_bytes / 1073741824.0) / (t_h2d_us / 1e6) : 0.0);
     return true;
 }
 
