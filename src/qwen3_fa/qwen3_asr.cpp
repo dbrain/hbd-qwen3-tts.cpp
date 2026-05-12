@@ -2102,6 +2102,11 @@ extern "C" int qwen3_asr_lm_head_dim(struct qwen3_asr_context* ctx) {
     return (int)(hp.llm_lm_head_dim ? hp.llm_lm_head_dim : hp.llm_vocab_size);
 }
 
+// Forward decl — defined alongside the streaming-path helpers further
+// down. Both the one-shot and streaming dispatchers run this on the
+// argmax timestamp-class vector before converting to ms.
+static void qwen3_fa_lis_monotonize(std::vector<int>& ts_classes, int n_words);
+
 // High-level forced-alignment dispatch.
 //
 // Mirrors qwen_asr/inference/qwen3_forced_aligner.py::Qwen3ForcedAligner.align
@@ -2276,69 +2281,9 @@ extern "C" int qwen3_asr_align_words(struct qwen3_asr_context* ctx, const float*
         return -7;
     }
 
-    // 6b. Fix timestamp monotonicity via LIS (longest increasing subsequence).
-    // The reference Qwen3-ForcedAligner uses LIS to find the longest monotone
-    // chain, then interpolates outliers. This is more robust than a simple
-    // forward clamp for cases where large inversions occur mid-sequence.
-    {
-        const int M = (int)ts_classes.size();
-        // O(n log n) LIS — find indices of the longest non-decreasing subsequence
-        std::vector<int> dp; // dp[i] = smallest tail value for IS of length i+1
-        std::vector<int> parent(M, -1);
-        std::vector<int> idx_map; // which index produced each dp entry
-
-        for (int i = 0; i < M; i++) {
-            int val = ts_classes[i];
-            // Binary search for first dp entry > val (upper_bound for non-decreasing)
-            auto it = std::upper_bound(dp.begin(), dp.end(), val);
-            int pos = (int)(it - dp.begin());
-            if (pos == (int)dp.size()) {
-                dp.push_back(val);
-                idx_map.push_back(i);
-            } else {
-                dp[pos] = val;
-                idx_map[pos] = i;
-            }
-            parent[i] = (pos > 0) ? idx_map[pos - 1] : -1;
-        }
-
-        // Traceback: find which indices are in the LIS
-        std::vector<bool> in_lis(M, false);
-        int k = idx_map.back();
-        while (k >= 0) {
-            in_lis[k] = true;
-            k = parent[k];
-        }
-
-        // Interpolate outliers: for each non-LIS element, set it to the
-        // value of the nearest LIS neighbor (linear interpolation between
-        // the previous and next LIS values).
-        int prev_lis = -1;
-        int prev_val = 0;
-        for (int i = 0; i < M; i++) {
-            if (in_lis[i]) {
-                // Fill any gap between prev_lis and i
-                if (prev_lis >= 0) {
-                    for (int j = prev_lis + 1; j < i; j++) {
-                        // Linear interpolation
-                        float frac = (float)(j - prev_lis) / (float)(i - prev_lis);
-                        ts_classes[j] = prev_val + (int)(frac * (float)(ts_classes[i] - prev_val));
-                    }
-                }
-                prev_lis = i;
-                prev_val = ts_classes[i];
-            }
-        }
-        // Fill trailing non-LIS elements
-        for (int j = prev_lis + 1; j < M; j++)
-            ts_classes[j] = prev_val;
-    }
-
-    // Ensure each word's end >= start.
-    for (int w = 0; w < n_words; w++) {
-        if (ts_classes[2 * w + 1] < ts_classes[2 * w])
-            ts_classes[2 * w + 1] = ts_classes[2 * w];
-    }
+    // 6b. LIS-based monotonicity fix + minimum 1-class duration. Shared
+    // with the streaming path; see qwen3_fa_lis_monotonize for the algo.
+    qwen3_fa_lis_monotonize(ts_classes, n_words);
 
     // 7. Convert classes → ms and write into the caller's parallel arrays.
     for (int w = 0; w < n_words; w++) {
@@ -2458,10 +2403,31 @@ constexpr int kQwen3FaTimestampTokenId = 151705;
 constexpr float kQwen3FaTimestampSegmentMs = 80.0f;
 
 // Apply the LIS-based monotonicity fix in-place on a 2*n_words vector
-// of timestamp class indices. Same algo as qwen3_asr_align_words; lifted
-// out so both the one-shot and streaming paths share it.
+// of timestamp class indices, then enforce a minimum 1-class duration
+// per word. Same algo as the reference Qwen3-ForcedAligner: find the
+// longest non-decreasing subsequence and treat non-LIS elements as
+// outliers to be reconstructed.
+//
+// Outlier handling for non-LIS elements:
+//   * Between two LIS anchors: linear interpolation.
+//   * Leading (before first LIS): step back by 1 class per index from
+//     the first LIS value, clamped at 0. Without this, a low-confidence
+//     leading prediction sitting ABOVE the first LIS value would survive
+//     unmodified and the per-word end-vs-start guard would collapse the
+//     first word to t0 == t1.
+//   * Trailing (after last LIS): step forward by 1 class per index from
+//     the last LIS value. Without this, a trailing prediction ABOVE the
+//     LIS tail would be held flat at prev_val and the end-vs-start guard
+//     would collapse the final word to t0 == t1 — by far the most
+//     common breakage in prod alignment output.
+//
+// Finally each word is given at least 1 class of duration, cascading
+// forward so a bump on word w doesn't leave w+1 starting before w's
+// new end.
 static void qwen3_fa_lis_monotonize(std::vector<int>& ts_classes, int n_words) {
     const int M = (int)ts_classes.size();
+    if (M == 0) return;
+
     std::vector<int> dp;
     std::vector<int> parent(M, -1);
     std::vector<int> idx_map;
@@ -2479,32 +2445,49 @@ static void qwen3_fa_lis_monotonize(std::vector<int>& ts_classes, int n_words) {
         parent[i] = (pos > 0) ? idx_map[pos - 1] : -1;
     }
     std::vector<bool> in_lis(M, false);
+    int first_lis = -1, last_lis = -1;
     if (!idx_map.empty()) {
         int k = idx_map.back();
+        last_lis = k;
         while (k >= 0) {
             in_lis[k] = true;
+            first_lis = k;
             k = parent[k];
         }
     }
-    int prev_lis = -1;
-    int prev_val = 0;
-    for (int i = 0; i < M; i++) {
+    if (first_lis < 0) {
+        // M >= 1 always yields at least one LIS member, but guard anyway.
+        return;
+    }
+
+    // Leading non-LIS: step back from first LIS value, clamped at 0.
+    for (int j = 0; j < first_lis; j++) {
+        int v = ts_classes[first_lis] - (first_lis - j);
+        ts_classes[j] = v < 0 ? 0 : v;
+    }
+    // Middle gaps: linear interpolation between adjacent LIS anchors.
+    int prev_lis = first_lis;
+    int prev_val = ts_classes[first_lis];
+    for (int i = first_lis + 1; i <= last_lis; i++) {
         if (in_lis[i]) {
-            if (prev_lis >= 0) {
-                for (int j = prev_lis + 1; j < i; j++) {
-                    float frac = (float)(j - prev_lis) / (float)(i - prev_lis);
-                    ts_classes[j] = prev_val + (int)(frac * (float)(ts_classes[i] - prev_val));
-                }
+            for (int j = prev_lis + 1; j < i; j++) {
+                float frac = (float)(j - prev_lis) / (float)(i - prev_lis);
+                ts_classes[j] = prev_val + (int)(frac * (float)(ts_classes[i] - prev_val));
             }
             prev_lis = i;
             prev_val = ts_classes[i];
         }
     }
-    for (int j = prev_lis + 1; j < M; j++)
-        ts_classes[j] = prev_val;
+    // Trailing non-LIS: step forward by 1 class per index past last LIS.
+    for (int j = last_lis + 1; j < M; j++)
+        ts_classes[j] = ts_classes[last_lis] + (j - last_lis);
+
+    // Minimum 1-class duration per word, cascading across boundaries.
     for (int w = 0; w < n_words; w++) {
-        if (ts_classes[2 * w + 1] < ts_classes[2 * w])
-            ts_classes[2 * w + 1] = ts_classes[2 * w];
+        if (ts_classes[2 * w + 1] <= ts_classes[2 * w])
+            ts_classes[2 * w + 1] = ts_classes[2 * w] + 1;
+        if (w + 1 < n_words && ts_classes[2 * (w + 1)] < ts_classes[2 * w + 1])
+            ts_classes[2 * (w + 1)] = ts_classes[2 * w + 1];
     }
 }
 
