@@ -1789,8 +1789,15 @@ extern "C" float* qwen3_asr_run_encoder(qwen3_asr_context* ctx, const float* mel
         ggml_backend_tensor_set(pe_in, pe_buf.data(), 0, pe_buf.size() * sizeof(float));
     }
 
+    // attn_mask is unreferenced when build_graph_qwen_omni took the
+    // flash-attention path (mask is all-zero in this caller, so FA with
+    // nullptr mask is equivalent and skips materialising the N²×n_heads
+    // scores tensor). In that case the tensor is optimized out and
+    // ggml_graph_get_tensor returns NULL.
     ggml_tensor* mask_in = ggml_graph_get_tensor(gf, "attn_mask");
-    ggml_backend_tensor_set(mask_in, mask.data(), 0, mask.size() * sizeof(float));
+    if (mask_in) {
+        ggml_backend_tensor_set(mask_in, mask.data(), 0, mask.size() * sizeof(float));
+    }
 
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "qwen3_asr: encoder graph compute failed\n");
@@ -1858,10 +1865,19 @@ extern "C" bool qwen3_asr_kv_init(qwen3_asr_context* ctx, int max_ctx) {
     ggml_set_name(ctx->kv_k, "kv_k");
     ggml_set_name(ctx->kv_v, "kv_v");
 
-    const size_t kbytes = ggml_nbytes(ctx->kv_k);
-    const size_t vbytes = ggml_nbytes(ctx->kv_v);
     // PLAN #69b: optional KV-on-CPU spill for long-context / tight-VRAM users.
     ggml_backend_t kv_backend = core_attn::kv_backend_from_env(ctx->backend, ctx->backend_cpu, "qwen3_asr");
+    // ggml_nbytes() returns the *content* size of a quantised tensor, but
+    // the backend buffer requires the *alignment-rounded* size for the
+    // allocator's bookkeeping (256 B on CUDA, etc.). For F16/F32 the two
+    // are equal; for Q8_0/Q4_0 the alloc size is >= content size, so we
+    // must consult the backend's buffer_type alloc_size, not ggml_nbytes.
+    // Without this, Q8 KV tripped ggml-backend.cpp:2010 GGML_ASSERT on
+    // the v tensor (offset by kbytes content size + v_alloc_size > buffer
+    // end). Use buffer_type alignment-aware sizing for both tensors.
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(kv_backend);
+    const size_t kbytes = ggml_backend_buft_get_alloc_size(buft, ctx->kv_k);
+    const size_t vbytes = ggml_backend_buft_get_alloc_size(buft, ctx->kv_v);
     ctx->kv_buf = ggml_backend_alloc_buffer(kv_backend, kbytes + vbytes);
     if (!ctx->kv_buf) {
         fprintf(stderr, "qwen3_asr: failed to allocate kv buffer\n");

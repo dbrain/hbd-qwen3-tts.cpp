@@ -524,14 +524,35 @@ ggml_cgraph* build_body_subgraph(crisp_audio_context& ctx, int N_padded) {
         K = ggml_cont(g, ggml_permute(g, K, 0, 2, 1, 3));
         V = ggml_cont(g, ggml_permute(g, V, 0, 2, 1, 3));
 
-        ggml_tensor* scores = ggml_mul_mat(g, K, Q);
-        scores = ggml_add(g, scores, mask_in);
-        scores = ggml_soft_max_ext(g, scores, nullptr, attn_scale, 0.0f);
+        // ggml_flash_attn_ext doesn't materialise the (N_padded × N_padded ×
+        // n_heads × 4B) softmax-scores tensor that the mul_mat → softmax →
+        // mul_mat path used to. On Tolstoy-length input (N_padded≈1586),
+        // that buffer was ~140 MiB of the encoder body-sched alloc. The
+        // encoder mask is all-zeros (full bidirectional self-attention, no
+        // per-chunk padding mask wired yet), so nullptr is correct here.
+        // Opt out via QWEN3_FA_NO_ENCODER_FA=1 to compare against the
+        // legacy path.
+        static const bool s_no_enc_fa = std::getenv("QWEN3_FA_NO_ENCODER_FA") != nullptr;
+        ggml_tensor* attn;
+        if (!s_no_enc_fa) {
+            (void) mask_in; // unused on FA path; mask is all-zero in caller
+            attn = ggml_flash_attn_ext(g, Q, K, V, /*mask*/ nullptr, attn_scale,
+                                       /*max_bias*/ 0.0f, /*logit_softcap*/ 0.0f);
+            ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+            // FA output: (head_dim, n_heads, N_padded, 1) — already in the
+            // permuted-and-cont layout that the legacy code reaches via
+            // `ggml_cont(ggml_permute(attn, 0, 2, 1, 3))`. Reshape to (d, N_padded).
+            attn = ggml_reshape_2d(g, attn, d, N_padded);
+        } else {
+            ggml_tensor* scores = ggml_mul_mat(g, K, Q);
+            scores = ggml_add(g, scores, mask_in);
+            scores = ggml_soft_max_ext(g, scores, nullptr, attn_scale, 0.0f);
 
-        ggml_tensor* V2 = ggml_cont(g, ggml_permute(g, V, 1, 0, 2, 3));
-        ggml_tensor* attn = ggml_mul_mat(g, V2, scores);
-        attn = ggml_cont(g, ggml_permute(g, attn, 0, 2, 1, 3));
-        attn = ggml_reshape_2d(g, attn, d, N_padded);
+            ggml_tensor* V2 = ggml_cont(g, ggml_permute(g, V, 1, 0, 2, 3));
+            attn = ggml_mul_mat(g, V2, scores);
+            attn = ggml_cont(g, ggml_permute(g, attn, 0, 2, 1, 3));
+            attn = ggml_reshape_2d(g, attn, d, N_padded);
+        }
 
         attn = ggml_add(g, ggml_mul_mat(g, b.attn_out_w, attn), b.attn_out_b);
         cur = ggml_add(g, residual, attn);
@@ -1071,8 +1092,14 @@ float* crisp_audio_encode(struct crisp_audio_context* ctx, const float* mel_feat
 
     ggml_backend_tensor_set(ggml_graph_get_tensor(body_gf, "body_in"), flat.data(), 0,
                             flat.size() * sizeof(float));
-    ggml_backend_tensor_set(ggml_graph_get_tensor(body_gf, "attn_mask"), mask.data(), 0,
-                            mask.size() * sizeof(float));
+    // attn_mask is unreferenced when build_body_subgraph took the
+    // flash-attention path (mask is all-zero in this caller, so FA with
+    // nullptr mask is equivalent and skips materialising the N²×n_heads
+    // scores tensor). In that case the tensor is optimised out and
+    // ggml_graph_get_tensor returns NULL.
+    if (ggml_tensor* mask_in = ggml_graph_get_tensor(body_gf, "attn_mask")) {
+        ggml_backend_tensor_set(mask_in, mask.data(), 0, mask.size() * sizeof(float));
+    }
 
     auto body_t0 = std::chrono::steady_clock::now();
     if (ggml_backend_sched_graph_compute(ctx->body_sched, body_gf) != GGML_STATUS_SUCCESS) {

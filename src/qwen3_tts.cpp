@@ -947,6 +947,21 @@ tts_result Qwen3TTS::synthesize_internal(const std::string & text,
         prefill_cache_key = h;
         if (prefill_cache_key == 0) prefill_cache_key = 1; // 0 reserved for "no cache"
     }
+    // Cold/warm fp-determinism kill-switch. The prefix-only-suffix-forward
+    // warm path produces FP-non-identical KV at positions [cacheable_len..
+    // prefill_len) compared to the cold full-prefill path because the
+    // split changes batched matmul shapes / FA tile boundaries. The
+    // resulting KV drift propagates into the talker's cb0 trajectory →
+    // codes-emitted differs by 1-3% between cold (r1) and warm (r2..N)
+    // requests of the same prompt. Set QWEN3_TTS_NO_PREFILL_CACHE=1 to
+    // force every request through the cold full-prefill path; the cost
+    // is one extra forward of `cacheable_len` (~50-200) prefix tokens
+    // per request. See HANDOFF-ggml-cuda-capture-replay-fpdiverge.md.
+    static const bool s_no_prefill_cache =
+        std::getenv("QWEN3_TTS_NO_PREFILL_CACHE") != nullptr;
+    if (s_no_prefill_cache) {
+        prefill_cache_key = 0;
+    }
     result.prefill_cache_key = prefill_cache_key;
 
     // Also compute the ref_codes_hash that build_prefill_graph and the ICL
