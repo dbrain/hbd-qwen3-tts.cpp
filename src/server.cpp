@@ -1572,8 +1572,11 @@ int main(int argc, char ** argv) {
     });
 
     // --- DELETE /v1/audio/voices/:id ---
+    // Erases both the in-memory entry and the on-disk voice_archive_dir/<id>/
+    // tree. Without the disk removal, the next startup's archive scan would
+    // re-load the bundle and the "deleted" voice would come back.
     svr.Delete(R"(/v1/audio/voices/(.+))",
-        [&voices, &voices_mutex](const httplib::Request & req, httplib::Response & res) {
+        [&voices, &voices_mutex, &voice_archive_dir](const httplib::Request & req, httplib::Response & res) {
         std::string voice_id = req.matches[1];
         if (!is_safe_voice_name(voice_id)) {
             res.status = 400;
@@ -1581,8 +1584,29 @@ int main(int argc, char ** argv) {
                             "application/json");
             return;
         }
-        std::lock_guard<std::mutex> lock(voices_mutex);
-        if (voices.erase(voice_id)) {
+        bool found_in_memory = false;
+        {
+            std::lock_guard<std::mutex> lock(voices_mutex);
+            found_in_memory = voices.erase(voice_id) > 0;
+        }
+        bool found_on_disk = false;
+        const std::string voice_dir = voice_dir_path(voice_archive_dir, voice_id);
+        if (!voice_dir.empty()) {
+            std::error_code ec;
+            if (std::filesystem::is_directory(voice_dir, ec)) {
+                const auto removed = std::filesystem::remove_all(voice_dir, ec);
+                if (ec) {
+                    fprintf(stderr, "voice delete: failed to remove '%s': %s\n",
+                            voice_dir.c_str(), ec.message().c_str());
+                    res.status = 500;
+                    res.set_content(R"({"error":{"message":"failed to remove voice from archive","type":"server_error"}})",
+                                    "application/json");
+                    return;
+                }
+                found_on_disk = removed > 0;
+            }
+        }
+        if (found_in_memory || found_on_disk) {
             res.set_content(R"({"deleted":true})", "application/json");
         } else {
             res.status = 404;
