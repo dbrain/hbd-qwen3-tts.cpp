@@ -187,8 +187,14 @@ float* qwen3_asr_run_aligner(struct qwen3_asr_context* ctx, const float* inputs_
 // the per-word timestamps in milliseconds. The caller must allocate
 // these arrays with at least `n_words` int64_t entries each. Returns
 // 0 on success, non-zero on failure.
+// `out_confidence` is optional (may be nullptr). When non-null, each entry
+// is the softmax-top1 probability of the noisier of the two timestamp
+// boundaries for that word, in [1/H, 1]. ~1 means a sharp peak (the model
+// is sure where the boundary sits); near 1/H means a near-uniform row
+// (the model has no idea). Use to surface low-confidence words to the UI.
 int qwen3_asr_align_words(struct qwen3_asr_context* ctx, const float* samples, int n_samples, const char** words,
-                          int n_words, int64_t* out_start_ms, int64_t* out_end_ms);
+                          int n_words, int64_t* out_start_ms, int64_t* out_end_ms,
+                          float* out_confidence /* may be nullptr */);
 
 // ---- Streaming forced alignment --------------------------------------------
 //
@@ -237,7 +243,7 @@ int qwen3_asr_align_words(struct qwen3_asr_context* ctx, const float* samples, i
 //     strict bit-identity.
 int qwen3_asr_align_words_streaming(struct qwen3_asr_context* ctx, const float* samples, int n_samples,
                                     const char** words, int n_words, bool reset, int64_t* out_start_ms,
-                                    int64_t* out_end_ms);
+                                    int64_t* out_end_ms, float* out_confidence /* may be nullptr */);
 
 // Drop the streaming alignment state. Does NOT free the KV cache itself
 // (kept alive so the next paragraph reuses the allocation). Call at the

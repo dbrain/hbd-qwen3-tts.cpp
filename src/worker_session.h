@@ -43,10 +43,14 @@ struct WorkerLoadConfig {
 
 // One word's forced-aligned position in the synthesised audio. Times are
 // milliseconds from start-of-audio. Filled by WorkerSession::align_words.
+// `confidence` is the softmax-top1 probability of the noisier of the two
+// timestamp-class predictions for this word, in [1/H, 1]; ~1 = sharp
+// peak, near 1/H = near-uniform. -1.0f if the aligner didn't supply one.
 struct AlignedWord {
     std::string text;
     int64_t     t0_ms = 0;
     int64_t     t1_ms = 0;
+    float       confidence = -1.0f;
 };
 
 // Per-stage timing returned alongside an alignment result. All fields in

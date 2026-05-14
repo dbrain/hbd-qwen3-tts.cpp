@@ -774,9 +774,10 @@ bool WorkerSession::align_words(const std::vector<std::string> & words,
         out_words.reserve(resp["words"].size());
         for (const auto & w : resp["words"]) {
             AlignedWord aw;
-            aw.text  = w.value("text",  std::string{});
-            aw.t0_ms = w.value("t0_ms", (int64_t) 0);
-            aw.t1_ms = w.value("t1_ms", (int64_t) 0);
+            aw.text       = w.value("text",       std::string{});
+            aw.t0_ms      = w.value("t0_ms",      (int64_t) 0);
+            aw.t1_ms      = w.value("t1_ms",      (int64_t) 0);
+            aw.confidence = w.value("confidence", -1.0f);
             out_words.push_back(std::move(aw));
         }
     }
@@ -929,9 +930,10 @@ bool WorkerSession::drain_partial_alignments(const PartialAlignCallback & cb) {
             std::vector<AlignedWord> words;
             for (const auto & w : r["words"]) {
                 AlignedWord aw;
-                aw.text  = w.value("text",  std::string{});
-                aw.t0_ms = w.value("t0_ms", (int64_t) 0);
-                aw.t1_ms = w.value("t1_ms", (int64_t) 0);
+                aw.text       = w.value("text",       std::string{});
+                aw.t0_ms      = w.value("t0_ms",      (int64_t) 0);
+                aw.t1_ms      = w.value("t1_ms",      (int64_t) 0);
+                aw.confidence = w.value("confidence", -1.0f);
                 words.push_back(std::move(aw));
             }
             const int64_t audio_seen_ms = r.value("audio_seen_ms", (int64_t) 0);
@@ -1035,9 +1037,10 @@ bool WorkerSession::finalize_streaming_align(const float * tail_pcm,
             out_words.clear();
             for (const auto & w : r["words"]) {
                 AlignedWord aw;
-                aw.text  = w.value("text",  std::string{});
-                aw.t0_ms = w.value("t0_ms", (int64_t) 0);
-                aw.t1_ms = w.value("t1_ms", (int64_t) 0);
+                aw.text       = w.value("text",       std::string{});
+                aw.t0_ms      = w.value("t0_ms",      (int64_t) 0);
+                aw.t1_ms      = w.value("t1_ms",      (int64_t) 0);
+                aw.confidence = w.value("confidence", -1.0f);
                 out_words.push_back(std::move(aw));
             }
             if (r.contains("profile") && r["profile"].is_object()) {
@@ -1450,6 +1453,7 @@ int run_worker_loop(int fd) {
                 std::string err_msg;
                 bool ok = false;
                 std::vector<int64_t> out_t0_ms, out_t1_ms;
+                std::vector<float>   out_conf;
                 int64_t t_load_ms = 0, t_resample_ms = 0, t_align_ms = 0;
                 std::vector<float> samples_16k;
                 try {
@@ -1559,6 +1563,7 @@ int run_worker_loop(int fd) {
                 if (err_msg.empty()) {
                     out_t0_ms.assign(words.size(), 0);
                     out_t1_ms.assign(words.size(), 0);
+                    out_conf.assign(words.size(), 0.0f);
                     std::vector<const char *> cstr_words;
                     cstr_words.reserve(words.size());
                     for (const auto & w : words) cstr_words.push_back(w.c_str());
@@ -1568,7 +1573,8 @@ int run_worker_loop(int fd) {
                             fa_ctx,
                             samples_16k.data(), (int) samples_16k.size(),
                             cstr_words.data(),  (int) cstr_words.size(),
-                            out_t0_ms.data(), out_t1_ms.data());
+                            out_t0_ms.data(), out_t1_ms.data(),
+                            out_conf.data());
                     t_align_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                      clk::now() - t0).count();
                     if (rc != 0) {
@@ -1586,9 +1592,10 @@ int run_worker_loop(int fd) {
                     json wj = json::array();
                     for (size_t i = 0; i < words.size(); i++) {
                         wj.push_back({
-                            {"text",  words[i]},
-                            {"t0_ms", out_t0_ms[i]},
-                            {"t1_ms", out_t1_ms[i]},
+                            {"text",       words[i]},
+                            {"t0_ms",      out_t0_ms[i]},
+                            {"t1_ms",      out_t1_ms[i]},
+                            {"confidence", out_conf[i]},
                         });
                     }
                     resp["words"] = std::move(wj);
@@ -1829,6 +1836,7 @@ int run_aligner_worker_loop(int fd) {
     std::vector<std::string>   cached_partial_words;
     std::vector<int64_t>       cached_partial_t0_ms;
     std::vector<int64_t>       cached_partial_t1_ms;
+    std::vector<float>         cached_partial_conf;
 
     // Shared lazy-load lambda — same logic as ALIGN_REQ's load block in
     // run_worker_loop, factored locally so a future refactor can extract
@@ -1902,7 +1910,8 @@ int run_aligner_worker_loop(int fd) {
         bool reset = false;
         int64_t t_load_ms = 0, t_resample_ms = 0, t_align_ms = 0;
         std::vector<int64_t> out_t0_ms, out_t1_ms;
-        std::vector<float> samples_16k;
+        std::vector<float>   out_conf;
+        std::vector<float>   samples_16k;
 
         if (!unpack_audio_payload(payload, &json_meta, &pcm_delta)) {
             err_msg = "ALIGN_*_REQ: unpack_audio_payload failed";
@@ -1953,6 +1962,7 @@ int run_aligner_worker_loop(int fd) {
             cached_partial_words   == words) {
             out_t0_ms = cached_partial_t0_ms;
             out_t1_ms = cached_partial_t1_ms;
+            out_conf  = cached_partial_conf;
             ok = true;
             reused_cache = true;
         }
@@ -1986,6 +1996,7 @@ int run_aligner_worker_loop(int fd) {
         if (err_msg.empty() && !reused_cache) {
             out_t0_ms.assign(words.size(), 0);
             out_t1_ms.assign(words.size(), 0);
+            out_conf.assign(words.size(), 0.0f);
             std::vector<const char *> cstr_words;
             cstr_words.reserve(words.size());
             for (const auto & w : words) cstr_words.push_back(w.c_str());
@@ -2014,13 +2025,15 @@ int run_aligner_worker_loop(int fd) {
                         samples_16k.data(), (int) samples_16k.size(),
                         cstr_words.data(),  (int) cstr_words.size(),
                         /*reset=*/reset,
-                        out_t0_ms.data(), out_t1_ms.data());
+                        out_t0_ms.data(), out_t1_ms.data(),
+                        out_conf.data());
             } else {
                 rc = qwen3_asr_align_words(
                         fa_ctx,
                         samples_16k.data(), (int) samples_16k.size(),
                         cstr_words.data(),  (int) cstr_words.size(),
-                        out_t0_ms.data(), out_t1_ms.data());
+                        out_t0_ms.data(), out_t1_ms.data(),
+                        out_conf.data());
             }
             t_align_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                              clk::now() - t0).count();
@@ -2051,6 +2064,7 @@ int run_aligner_worker_loop(int fd) {
             cached_partial_words    = words;
             cached_partial_t0_ms    = out_t0_ms;
             cached_partial_t1_ms    = out_t1_ms;
+            cached_partial_conf     = out_conf;
         }
         if (err_msg.empty()) {
             // Per-pass timing breakdown — t_load_ms is non-zero only on the
@@ -2083,6 +2097,7 @@ int run_aligner_worker_loop(int fd) {
                     {"text",       words[i]},
                     {"t0_ms",      out_t0_ms[i]},
                     {"t1_ms",      out_t1_ms[i]},
+                    {"confidence", out_conf[i]},
                 });
             }
             resp["words"] = std::move(wj);

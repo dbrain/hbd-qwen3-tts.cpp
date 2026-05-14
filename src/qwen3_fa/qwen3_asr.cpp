@@ -2120,8 +2120,353 @@ extern "C" int qwen3_asr_lm_head_dim(struct qwen3_asr_context* ctx) {
 
 // Forward decl — defined alongside the streaming-path helpers further
 // down. Both the one-shot and streaming dispatchers run this on the
-// argmax timestamp-class vector before converting to ms.
-static void qwen3_fa_lis_monotonize(std::vector<int>& ts_classes, int n_words);
+// argmax timestamp-class vector before converting to ms. `ts_confs`
+// (optional, pass nullptr to disable) carries per-row top-1 softmax
+// probabilities; when paired with a non-zero threshold (env
+// QWEN3_FA_LIS_CONF_THRESHOLD), low-confidence positions get demoted out
+// of LIS membership so the per-word boundary is interpolated from
+// surrounding high-confidence anchors instead of trusting a noisy
+// argmax that happened to fit the monotone chain.
+static void qwen3_fa_lis_monotonize(std::vector<int>& ts_classes, int n_words,
+                                    const std::vector<float>* ts_confs = nullptr);
+
+// Soft-argmax over one row of logits (H = lm_head_dim classes).
+//
+// Three passes:
+//   pass 1: find max-logit (numerics anchor + argmax index `best`).
+//   pass 2: full-row softmax denominator → top-1 probability as `*out_conf`.
+//   pass 3: windowed expectation over [best-W, best+W] (clipped to row
+//           bounds) using exp(row[k] - mx) weights — same un-normalized
+//           weights as the full softmax, so within-window probabilities
+//           are just window weights / window denominator.
+//
+// Why windowed: lm_head_dim is 5000 classes covering 400 s of timestamp
+// space, but Tolstoy-class prompts only use the first ~1500. Full-row
+// expectation gets dragged thousands of classes high by the tiny but
+// numerous masses on out-of-range distant classes. A ±W window around
+// argmax keeps the expectation local to the actual peak — for a sharp
+// F16 peak it collapses back to argmax (within-window non-best mass is
+// negligible), and for a fat Q8 peak it averages the ±1-2 class jitter.
+//
+// Confidence uses the full-row softmax denominator so it remains
+// comparable across windowed/un-windowed analyses; 1/Z ∈ [1/H, 1].
+//
+// Window radius is overridable via QWEN3_FA_SOFTMAX_WINDOW.
+//
+// Default 0 = pure argmax (no class-picker change vs pre-patch). The
+// confidence value is still emitted because pass 2 always runs the
+// full-row softmax denominator. Setting W>0 enables ±W-class windowed
+// expectation; empirically W=4 changes 36/670 F16 placeholders by 5-10
+// ms mean drift but doesn't close the 3-of-335 Q8 outliers (those are
+// 6-class noise spikes, beyond any reasonable W), and lever #3
+// (low-conf LIS gate) is a more targeted attack.
+static inline int qwen3_fa_softmax_window() {
+    static const int W = []() {
+        const char* e = std::getenv("QWEN3_FA_SOFTMAX_WINDOW");
+        if (!e || !*e) return 0;
+        const int v = std::atoi(e);
+        return v < 0 ? 0 : v;
+    }();
+    return W;
+}
+
+// Confidence threshold for LIS anchor gating (lever #3). Positions with
+// top-1 softmax probability below this threshold are demoted out of the
+// LIS chain so their values are reconstructed by interpolation from
+// surrounding high-confidence anchors. Default 0 = gate disabled. Set
+// QWEN3_FA_LIS_CONF_THRESHOLD=0.4 to activate.
+static inline float qwen3_fa_lis_conf_threshold() {
+    static const float T = []() {
+        const char* e = std::getenv("QWEN3_FA_LIS_CONF_THRESHOLD");
+        if (!e || !*e) return 0.0f;
+        const float v = (float)std::atof(e);
+        return v < 0.0f ? 0.0f : v;
+    }();
+    return T;
+}
+
+// Audio-aware post-LIS boundary refinement (HANDOFF-aligner-audio-peaks).
+// After LIS gives interpolated [t0,t1] for each word, we walk ±W bins of
+// 40 ms RMS energy and snap each boundary to the nearest speech onset
+// (for t0) or offset (for t1). Closes the "highlight in silence"
+// failure mode that bench_audio_peaks.py's low_energy_words metric
+// catches. Default W=6 (±240 ms) → quality fixes ship without operator
+// intervention; pass QWEN3_FA_AUDIO_REFINE=0 to opt out.
+static inline int qwen3_fa_audio_refine_window() {
+    static const int W = []() {
+        const char* e = std::getenv("QWEN3_FA_AUDIO_REFINE");
+        if (!e || !*e) return 6;
+        const int v = std::atoi(e);
+        return v < 0 ? 0 : v;
+    }();
+    return W;
+}
+
+// RMS-vs-median threshold ratio for "speech" classification in the
+// audio-refine walker. Bins with RMS > median * thresh are speech;
+// below are quiet. Default 0.30 — matches bench_audio_peaks.py's
+// gap_quiet_frac threshold so the in-aligner refiner uses the same
+// notion of "silence" as the off-line scorer.
+static inline float qwen3_fa_audio_refine_thresh() {
+    static const float T = []() {
+        const char* e = std::getenv("QWEN3_FA_AUDIO_REFINE_THRESH");
+        if (!e || !*e) return 0.30f;
+        const float v = (float)std::atof(e);
+        return v <= 0.0f ? 0.30f : v;
+    }();
+    return T;
+}
+
+// Bin width in ms for the RMS energy ladder. Default 40 — matches the
+// off-line bench scorer. Keep aligned with bench_audio_peaks.BIN_MS so
+// the metric directly predicts the in-aligner walker's notion of
+// "this boundary is in silence."
+static inline int qwen3_fa_audio_refine_bin_ms() {
+    static const int B = []() {
+        const char* e = std::getenv("QWEN3_FA_AUDIO_REFINE_BIN_MS");
+        if (!e || !*e) return 40;
+        const int v = std::atoi(e);
+        return v < 5 ? 40 : v;
+    }();
+    return B;
+}
+
+// Gap-bridge pass: when adjacent words leave a gap larger than this
+// many ms AND the gap's audio is mostly loud (≥ gap-loud-frac), the
+// model has carved a phantom pause through a continuous speech run.
+// Snap both word[i-1].t1 and word[i].t0 to the quietest bin in the
+// gap so playback never falls between words. Default 200 ms (~2.5
+// 80 ms classes — small enough to ignore real pauses, large enough to
+// catch the failure mode).
+static inline int qwen3_fa_audio_refine_gap_min_ms() {
+    static const int M = []() {
+        const char* e = std::getenv("QWEN3_FA_AUDIO_REFINE_GAP_MIN_MS");
+        if (!e || !*e) return 200;
+        const int v = std::atoi(e);
+        return v < 0 ? 200 : v;
+    }();
+    return M;
+}
+
+// Fraction of bins in the gap that must exceed `loud_thresh` to treat
+// the gap as "phantom silence inside continuous speech." Default 0.60.
+// Tighter (higher) → only bridge gaps that are clearly inside speech.
+static inline float qwen3_fa_audio_refine_gap_loud() {
+    static const float F = []() {
+        const char* e = std::getenv("QWEN3_FA_AUDIO_REFINE_GAP_LOUD");
+        if (!e || !*e) return 0.60f;
+        const float v = (float)std::atof(e);
+        return v <= 0.0f || v > 1.0f ? 0.60f : v;
+    }();
+    return F;
+}
+
+// Highlight lead-time in ms: shift all word boundaries EARLIER by this
+// many ms before emitting. Compensates for human-perceptual playback
+// lag (audio reaches the ear a few frames after the playhead reports
+// it) so the highlight feels "in sync" rather than chasing the audio.
+// Default 80 ms — empirical sweet spot on browser audio + AGC tail.
+// Boundaries clamp to >= 0 so leading silence words still start at 0.
+static inline int qwen3_fa_audio_refine_lead_ms() {
+    static const int L = []() {
+        const char* e = std::getenv("QWEN3_FA_AUDIO_REFINE_LEAD_MS");
+        if (!e) return 80;        // env unset → default lead
+        if (!*e) return 0;        // env set to empty → off
+        const int v = std::atoi(e);
+        return v < 0 ? 0 : v;
+    }();
+    return L;
+}
+
+// Walk per-word [t0,t1] ms boundaries ±W bins on the RMS ladder and
+// snap each to the nearest speech edge. Two failure modes attacked:
+//
+//   t0 in silence (word-start latency, e.g. 'I' w219):
+//       → first bin in [t0-W, t0+W] whose RMS > loud_thresh
+//   t1 in silence (sentence-end tail, e.g. 'place.' w334):
+//       → last  bin in [t1-W, t1+W]+1 whose RMS > loud_thresh
+//
+// If no qualifying bin found in the window, the boundary is left
+// alone (refusal-to-snap = safer than landing on noise).
+//
+// After per-word snaps, a monotonicity sweep enforces
+// out_start_ms[w] <= out_end_ms[w] <= out_start_ms[w+1].
+//
+// `samples` are mono float32 at `sample_rate` Hz (the aligner uses
+// 16 kHz). RMS is computed over non-overlapping bin_ms windows.
+static void qwen3_fa_audio_refine_bounds(const float* samples, int n_samples, int sample_rate,
+                                         int64_t* out_start_ms, int64_t* out_end_ms, int n_words) {
+    if (!samples || n_samples <= 0 || !out_start_ms || !out_end_ms || n_words <= 0)
+        return;
+    const int W = qwen3_fa_audio_refine_window();
+    if (W <= 0) return; // disabled
+    const int bin_ms = qwen3_fa_audio_refine_bin_ms();
+    const int per_bin = (sample_rate * bin_ms) / 1000;
+    if (per_bin <= 0) return;
+    const int n_bins = n_samples / per_bin;
+    if (n_bins <= 0) return;
+
+    std::vector<float> rms(n_bins);
+    for (int i = 0; i < n_bins; i++) {
+        double sq = 0.0;
+        const float* p = samples + (size_t)i * per_bin;
+        for (int k = 0; k < per_bin; k++) sq += (double)p[k] * (double)p[k];
+        rms[i] = (float)std::sqrt(sq / per_bin);
+    }
+    // Median via nth_element.
+    std::vector<float> tmp(rms);
+    std::nth_element(tmp.begin(), tmp.begin() + tmp.size() / 2, tmp.end());
+    const float median = tmp[tmp.size() / 2];
+    const float loud = median * qwen3_fa_audio_refine_thresh();
+
+    auto bin_of = [&](int64_t ms) -> int {
+        int b = (int)(ms / bin_ms);
+        if (b < 0) b = 0;
+        if (b > n_bins - 1) b = n_bins - 1;
+        return b;
+    };
+
+    auto loud_at = [&](int b) -> bool { return b >= 0 && b < n_bins && rms[b] > loud; };
+
+    for (int w = 0; w < n_words; w++) {
+        // t0: locate the speech onset for this word.
+        //   If t0_bin is already inside speech: walk LEFT as long as bins
+        //     stay loud, capped at W bins. Stops at the first silence —
+        //     never crosses into the previous word's speech body.
+        //   If t0_bin is in silence: walk RIGHT for the first loud bin
+        //     in [t0_bin+1, t0_bin+W]. This catches "t0 lands before
+        //     speech onset" without ever extending across an intervening
+        //     silent gap (so the walker can't jump TO the next word).
+        const int t0_bin = bin_of(out_start_ms[w]);
+        int new_t0 = t0_bin;
+        if (loud_at(t0_bin)) {
+            int onset = t0_bin;
+            for (int i = t0_bin - 1; i >= std::max(0, t0_bin - W); i--) {
+                if (loud_at(i)) onset = i;
+                else break;
+            }
+            new_t0 = onset;
+        } else {
+            for (int i = t0_bin + 1; i <= std::min(n_bins - 1, t0_bin + W); i++) {
+                if (loud_at(i)) { new_t0 = i; break; }
+            }
+        }
+        out_start_ms[w] = (int64_t)new_t0 * bin_ms;
+
+        // t1: locate speech offset. Same asymmetry, mirrored:
+        //   If t1-1 bin is loud (currently inside speech): walk RIGHT only
+        //     while bins stay loud, capped at W. Stops at the first
+        //     silence — won't run into the NEXT word's speech body even
+        //     when adjacent words are tightly butted.
+        //   If t1-1 bin is silent: walk LEFT for the last loud bin in
+        //     [t1_bin-W, t1_bin-1]. This trims sentence-end tails.
+        const int t1_bin = bin_of(out_end_ms[w] > 0 ? out_end_ms[w] - 1 : 0);
+        int new_t1 = t1_bin + 1;
+        if (loud_at(t1_bin)) {
+            int offset = t1_bin;
+            for (int i = t1_bin + 1; i <= std::min(n_bins - 1, t1_bin + W); i++) {
+                if (loud_at(i)) offset = i;
+                else break;
+            }
+            new_t1 = offset + 1;
+        } else {
+            for (int i = t1_bin - 1; i >= std::max(0, t1_bin - W); i--) {
+                if (loud_at(i)) { new_t1 = i + 1; break; }
+            }
+        }
+        out_end_ms[w] = (int64_t)new_t1 * bin_ms;
+    }
+
+    // Monotonicity sweep: out_start <= out_end, no overlap across words.
+    for (int w = 0; w < n_words; w++) {
+        if (out_end_ms[w] <= out_start_ms[w])
+            out_end_ms[w] = out_start_ms[w] + bin_ms;
+        if (w > 0 && out_start_ms[w] < out_end_ms[w - 1])
+            out_start_ms[w] = out_end_ms[w - 1];
+        if (out_end_ms[w] <= out_start_ms[w])
+            out_end_ms[w] = out_start_ms[w] + bin_ms;
+    }
+
+    // Gap-bridge pass. When two adjacent words have a gap > gap_min_ms
+    // and most of that gap is loud, the model carved a phantom silence
+    // through a continuous speech run (the canonical "fields highlights
+    // late" failure — model puts the.t1 mid-run and fields.t0 way after
+    // the actual onset). Snap both boundaries to the quietest bin in
+    // the gap so playback never falls between words.
+    const int   gap_min_ms = qwen3_fa_audio_refine_gap_min_ms();
+    const float gap_loud_f = qwen3_fa_audio_refine_gap_loud();
+    if (gap_min_ms > 0 && gap_loud_f > 0.0f) {
+        for (int w = 1; w < n_words; w++) {
+            const int64_t gap_start = out_end_ms[w - 1];
+            const int64_t gap_end   = out_start_ms[w];
+            if (gap_end - gap_start < gap_min_ms) continue;
+            int gap_lo = (int)(gap_start / bin_ms);
+            int gap_hi = (int)((gap_end - 1) / bin_ms);
+            if (gap_lo < 0) gap_lo = 0;
+            if (gap_hi > n_bins - 1) gap_hi = n_bins - 1;
+            if (gap_hi < gap_lo) continue;
+            int n_gap = gap_hi - gap_lo + 1;
+            int n_loud = 0;
+            int   min_idx = gap_lo;
+            float min_rms = rms[gap_lo];
+            for (int i = gap_lo; i <= gap_hi; i++) {
+                if (rms[i] > loud) n_loud++;
+                if (rms[i] < min_rms) { min_rms = rms[i]; min_idx = i; }
+            }
+            if ((float)n_loud / (float)n_gap < gap_loud_f) continue;
+            const int64_t mid_ms = (int64_t)min_idx * bin_ms;
+            out_end_ms[w - 1] = mid_ms;
+            out_start_ms[w]   = mid_ms;
+        }
+    }
+
+    // Highlight lead-time. Shift every word's [t0,t1] EARLIER by N ms
+    // to compensate for browser-side audio playback lag; the highlight
+    // then sits a hair ahead of the audio so it doesn't feel like it's
+    // chasing. Clamp to >= 0 so leading words stay non-negative.
+    const int lead_ms = qwen3_fa_audio_refine_lead_ms();
+    if (lead_ms > 0) {
+        for (int w = 0; w < n_words; w++) {
+            out_start_ms[w] = std::max<int64_t>(0, out_start_ms[w] - lead_ms);
+            out_end_ms[w]   = std::max<int64_t>(0, out_end_ms[w] - lead_ms);
+            if (out_end_ms[w] <= out_start_ms[w])
+                out_end_ms[w] = out_start_ms[w] + bin_ms;
+        }
+    }
+}
+
+static inline int qwen3_fa_pick_row_class(const float* row, int H, float* out_conf) {
+    int best = 0;
+    float mx = row[0];
+    for (int k = 1; k < H; k++) {
+        if (row[k] > mx) { mx = row[k]; best = k; }
+    }
+    // Confidence: softmax(best) = 1 / Σ_k exp(row[k] - mx). Full-row.
+    double sum_full = 0.0;
+    for (int k = 0; k < H; k++) sum_full += std::exp((double)(row[k] - mx));
+    if (out_conf) {
+        float c = (float)(1.0 / sum_full);
+        if (c < 0.0f) c = 0.0f;
+        else if (c > 1.0f) c = 1.0f;
+        *out_conf = c;
+    }
+    // Windowed expectation. W=0 reduces to argmax exactly.
+    const int W = qwen3_fa_softmax_window();
+    if (W == 0) return best;
+    const int lo = std::max(0, best - W);
+    const int hi = std::min(H - 1, best + W);
+    double sum_w = 0.0;
+    double sum_kw = 0.0;
+    for (int k = lo; k <= hi; k++) {
+        double w = std::exp((double)(row[k] - mx));
+        sum_w  += w;
+        sum_kw += (double)k * w;
+    }
+    long soft = std::lround(sum_kw / sum_w);
+    if (soft < 0) soft = 0;
+    if (soft > H - 1) soft = H - 1;
+    return (int)soft;
+}
 
 // High-level forced-alignment dispatch.
 //
@@ -2130,7 +2475,8 @@ static void qwen3_fa_lis_monotonize(std::vector<int>& ts_classes, int n_words);
 // each word go through the standard byte-level BPE encoder; CJK char-level
 // tokenization is a follow-up).
 extern "C" int qwen3_asr_align_words(struct qwen3_asr_context* ctx, const float* samples, int n_samples,
-                                     const char** words, int n_words, int64_t* out_start_ms, int64_t* out_end_ms) {
+                                     const char** words, int n_words, int64_t* out_start_ms, int64_t* out_end_ms,
+                                     float* out_confidence) {
     if (!ctx || !samples || n_samples <= 0 || !words || n_words <= 0 || !out_start_ms || !out_end_ms)
         return -1;
 
@@ -2267,24 +2613,22 @@ extern "C" int qwen3_asr_align_words(struct qwen3_asr_context* ctx, const float*
     }
     probe("after-aligner");
 
-    // 6. argmax over the lm_head_dim classes at each <timestamp>
-    // position. The graph stores logits as ne[0]=H, ne[1]=T_prompt
-    // row-major, i.e. logits[t * H + k] = score(k, t).
-    std::vector<int> ts_classes;
+    // 6. Softmax-expectation class pick at each <timestamp> placeholder.
+    // The graph stores logits as ne[0]=H, ne[1]=T_prompt row-major, i.e.
+    // logits[t * H + k] = score(k, t). See qwen3_fa_pick_row_class for the
+    // expectation vs raw-argmax rationale (Q8 KV peak-widening robustness).
+    std::vector<int>   ts_classes;
+    std::vector<float> ts_confs;
     ts_classes.reserve((size_t)(n_words * 2));
+    ts_confs.reserve((size_t)(n_words * 2));
     for (int t = 0; t < T_prompt; t++) {
         if (ids[t] != TIMESTAMP_TOKEN_ID)
             continue;
         const float* row = logits + (size_t)t * H;
-        int best = 0;
-        float mx = row[0];
-        for (int k = 1; k < H; k++) {
-            if (row[k] > mx) {
-                mx = row[k];
-                best = k;
-            }
-        }
-        ts_classes.push_back(best);
+        float conf = 0.0f;
+        const int cls = qwen3_fa_pick_row_class(row, H, &conf);
+        ts_classes.push_back(cls);
+        ts_confs.push_back(conf);
     }
     free(logits);
     probe("after-argmax");
@@ -2299,13 +2643,24 @@ extern "C" int qwen3_asr_align_words(struct qwen3_asr_context* ctx, const float*
 
     // 6b. LIS-based monotonicity fix + minimum 1-class duration. Shared
     // with the streaming path; see qwen3_fa_lis_monotonize for the algo.
-    qwen3_fa_lis_monotonize(ts_classes, n_words);
+    // ts_confs is forwarded so the optional low-conf anchor gate can fire.
+    qwen3_fa_lis_monotonize(ts_classes, n_words, &ts_confs);
 
     // 7. Convert classes → ms and write into the caller's parallel arrays.
+    //    Per-word confidence is the min of the two boundary placeholders
+    //    (a word is only as confident as its weakest boundary).
     for (int w = 0; w < n_words; w++) {
         out_start_ms[w] = (int64_t)((float)ts_classes[2 * w + 0] * TIMESTAMP_SEGMENT_TIME_MS);
         out_end_ms[w] = (int64_t)((float)ts_classes[2 * w + 1] * TIMESTAMP_SEGMENT_TIME_MS);
+        if (out_confidence)
+            out_confidence[w] = std::min(ts_confs[2 * w + 0], ts_confs[2 * w + 1]);
     }
+
+    // 8. Optional audio-aware boundary refinement. Gated by
+    //    QWEN3_FA_AUDIO_REFINE=W (window radius in bins, default 0 = off).
+    //    No-op when disabled → bit-identical to pre-patch.
+    qwen3_fa_audio_refine_bounds(samples, n_samples, /*sample_rate=*/16000,
+                                  out_start_ms, out_end_ms, n_words);
     return 0;
 }
 
@@ -2440,7 +2795,8 @@ constexpr float kQwen3FaTimestampSegmentMs = 80.0f;
 // Finally each word is given at least 1 class of duration, cascading
 // forward so a bump on word w doesn't leave w+1 starting before w's
 // new end.
-static void qwen3_fa_lis_monotonize(std::vector<int>& ts_classes, int n_words) {
+static void qwen3_fa_lis_monotonize(std::vector<int>& ts_classes, int n_words,
+                                    const std::vector<float>* ts_confs) {
     const int M = (int)ts_classes.size();
     if (M == 0) return;
 
@@ -2471,6 +2827,34 @@ static void qwen3_fa_lis_monotonize(std::vector<int>& ts_classes, int n_words) {
             k = parent[k];
         }
     }
+
+    // Lever #3 low-conf gate: demote LIS members whose row confidence
+    // falls below the threshold so they get interpolated from neighbors
+    // instead of anchoring the chain to a noisy argmax. After demotion,
+    // recompute first_lis / last_lis. If the gate would drop EVERYONE,
+    // disable it to preserve the original LIS chain.
+    const float conf_thresh = qwen3_fa_lis_conf_threshold();
+    if (ts_confs && (int)ts_confs->size() == M && conf_thresh > 0.0f) {
+        std::vector<bool> demoted = in_lis;  // working copy
+        int kept = 0;
+        for (int i = 0; i < M; i++) {
+            if (demoted[i] && (*ts_confs)[i] < conf_thresh) demoted[i] = false;
+            if (demoted[i]) kept++;
+        }
+        // Need at least 2 anchors for middle-interp to make sense; if the
+        // gate would leave us with 0 or 1, skip the gate this call.
+        if (kept >= 2) {
+            in_lis = std::move(demoted);
+            first_lis = last_lis = -1;
+            for (int i = 0; i < M; i++) {
+                if (in_lis[i]) {
+                    if (first_lis < 0) first_lis = i;
+                    last_lis = i;
+                }
+            }
+        }
+    }
+
     if (first_lis < 0) {
         // M >= 1 always yields at least one LIS member, but guard anyway.
         return;
@@ -2507,37 +2891,38 @@ static void qwen3_fa_lis_monotonize(std::vector<int>& ts_classes, int n_words) {
     }
 }
 
-// Pull argmax-class at each timestamp position out of a (n_logit_rows, H)
-// logits buffer, run LIS monotonicity, and convert to ms.
+// Pull soft-argmax class at each timestamp position out of a
+// (n_logit_rows, H) logits buffer, run LIS monotonicity, and convert to ms.
 //
 // `ts_logit_rows[i]` is the row index inside `logits` for the i-th
-// timestamp placeholder (chronological order). Returns 0 on success.
+// timestamp placeholder (chronological order). `out_confidence` is
+// nullptr-safe; when non-null, the per-word value is the min softmax(top1)
+// across the two boundary placeholders. Returns 0 on success.
 static int qwen3_fa_extract_word_timings(const float* logits, int /*n_logit_rows*/, int H,
                                          const std::vector<int>& ts_logit_rows, int n_words, int64_t* out_start_ms,
-                                         int64_t* out_end_ms) {
+                                         int64_t* out_end_ms, float* out_confidence) {
     if ((int)ts_logit_rows.size() != 2 * n_words) {
         fprintf(stderr, "qwen3_asr[align]: timestamp count mismatch — got %zu placeholders, expected %d\n",
                 ts_logit_rows.size(), 2 * n_words);
         return -7;
     }
-    std::vector<int> ts_classes;
+    std::vector<int>   ts_classes;
+    std::vector<float> ts_confs;
     ts_classes.reserve(ts_logit_rows.size());
+    ts_confs.reserve(ts_logit_rows.size());
     for (int row : ts_logit_rows) {
         const float* r = logits + (size_t)row * H;
-        int best = 0;
-        float mx = r[0];
-        for (int k = 1; k < H; k++) {
-            if (r[k] > mx) {
-                mx = r[k];
-                best = k;
-            }
-        }
-        ts_classes.push_back(best);
+        float conf = 0.0f;
+        const int cls = qwen3_fa_pick_row_class(r, H, &conf);
+        ts_classes.push_back(cls);
+        ts_confs.push_back(conf);
     }
-    qwen3_fa_lis_monotonize(ts_classes, n_words);
+    qwen3_fa_lis_monotonize(ts_classes, n_words, &ts_confs);
     for (int w = 0; w < n_words; w++) {
         out_start_ms[w] = (int64_t)((float)ts_classes[2 * w + 0] * kQwen3FaTimestampSegmentMs);
         out_end_ms[w] = (int64_t)((float)ts_classes[2 * w + 1] * kQwen3FaTimestampSegmentMs);
+        if (out_confidence)
+            out_confidence[w] = std::min(ts_confs[2 * w + 0], ts_confs[2 * w + 1]);
     }
     return 0;
 }
@@ -2586,7 +2971,7 @@ extern "C" void qwen3_asr_align_streaming_reset(struct qwen3_asr_context* ctx) {
 
 extern "C" int qwen3_asr_align_words_streaming(struct qwen3_asr_context* ctx, const float* samples, int n_samples,
                                                const char** words, int n_words, bool reset, int64_t* out_start_ms,
-                                               int64_t* out_end_ms) {
+                                               int64_t* out_end_ms, float* out_confidence) {
     if (!ctx || !samples || n_samples <= 0 || !words || n_words <= 0 || !out_start_ms || !out_end_ms)
         return -1;
 
@@ -2819,7 +3204,7 @@ extern "C" int qwen3_asr_align_words_streaming(struct qwen3_asr_context* ctx, co
         // Try again from scratch via a tail-recursive call. (One-shot;
         // the recursive call will hit the reset path.)
         return qwen3_asr_align_words_streaming(ctx, samples, n_samples, words, n_words, /*reset=*/true,
-                                               out_start_ms, out_end_ms);
+                                               out_start_ms, out_end_ms, out_confidence);
     }
 
     const auto& hp = ctx->model.hparams;
@@ -2848,7 +3233,7 @@ extern "C" int qwen3_asr_align_words_streaming(struct qwen3_asr_context* ctx, co
             free(audio_embeds);
             qwen3_asr_align_streaming_reset(ctx);
             return qwen3_asr_align_words_streaming(ctx, samples, n_samples, words, n_words, /*reset=*/true,
-                                                   out_start_ms, out_end_ms);
+                                                   out_start_ms, out_end_ms, out_confidence);
         }
     }
 
@@ -2902,7 +3287,7 @@ extern "C" int qwen3_asr_align_words_streaming(struct qwen3_asr_context* ctx, co
         free(audio_embeds);
         qwen3_asr_align_streaming_reset(ctx);
         return qwen3_asr_align_words_streaming(ctx, samples, n_samples, words, n_words, /*reset=*/true, out_start_ms,
-                                               out_end_ms);
+                                               out_end_ms, out_confidence);
     }
     if (!qwen3_asr_kv_init(ctx, kv_target)) {
         free(audio_embeds);
@@ -3000,12 +3385,18 @@ extern "C" int qwen3_asr_align_words_streaming(struct qwen3_asr_context* ctx, co
     for (int off : ts_offsets_in_suffix)
         ts_logit_rows.push_back(text_suffix_logit_base + off);
 
-    int rc = qwen3_fa_extract_word_timings(logits, n_input_tokens, H, ts_logit_rows, n_words, out_start_ms, out_end_ms);
+    int rc = qwen3_fa_extract_word_timings(logits, n_input_tokens, H, ts_logit_rows, n_words, out_start_ms, out_end_ms,
+                                            out_confidence);
     free(logits);
     probe("after-argmax");
     t_argmax_ms = std::chrono::duration_cast<std::chrono::milliseconds>(clk_t::now() - t_stage).count();
 
     if (rc == 0) {
+        // Optional audio-aware boundary refinement on the cumulative
+        // PCM. Gated by QWEN3_FA_AUDIO_REFINE; no-op when unset →
+        // bit-identical to pre-patch streaming output.
+        qwen3_fa_audio_refine_bounds(samples, n_samples, /*sample_rate=*/16000,
+                                      out_start_ms, out_end_ms, n_words);
         ctx->align_stream.N_enc_committed = N_enc;
         ctx->align_stream.initialized = true;
     }

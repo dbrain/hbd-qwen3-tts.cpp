@@ -2200,6 +2200,7 @@ int main(int argc, char ** argv) {
                                                         {"text",       words[i].text},
                                                         {"t0_ms",      words[i].t0_ms},
                                                         {"t1_ms",      words[i].t1_ms},
+                                                        {"confidence", words[i].confidence},
                                                     });
                                                 }
                                                 json ev = {
@@ -2357,6 +2358,7 @@ int main(int argc, char ** argv) {
                                     {"text",       aligned[i].text},
                                     {"t0_ms",      aligned[i].t0_ms},
                                     {"t1_ms",      aligned[i].t1_ms},
+                                    {"confidence", aligned[i].confidence},
                                 });
                             }
                             ev = {{"type",           "speech.audio.alignment.final"},
@@ -2406,9 +2408,10 @@ int main(int argc, char ** argv) {
                         if (ok) {
                             json wj = json::array();
                             for (const auto & w : aligned) {
-                                wj.push_back({{"text", w.text},
-                                              {"t0_ms", w.t0_ms},
-                                              {"t1_ms", w.t1_ms}});
+                                wj.push_back({{"text",       w.text},
+                                              {"t0_ms",      w.t0_ms},
+                                              {"t1_ms",      w.t1_ms},
+                                              {"confidence", w.confidence}});
                             }
                             ev = {{"type",    "speech.audio.alignment"},
                                   {"words",   std::move(wj)},
@@ -2672,9 +2675,10 @@ int main(int argc, char ** argv) {
                 if (ok) {
                     json wj = json::array();
                     for (const auto & w : aligned) {
-                        wj.push_back({{"text", w.text},
-                                      {"t0_ms", w.t0_ms},
-                                      {"t1_ms", w.t1_ms}});
+                        wj.push_back({{"text",       w.text},
+                                      {"t0_ms",      w.t0_ms},
+                                      {"t1_ms",      w.t1_ms},
+                                      {"confidence", w.confidence}});
                     }
                     ev = {{"type",    "speech.audio.alignment"},
                           {"words",   std::move(wj)},
