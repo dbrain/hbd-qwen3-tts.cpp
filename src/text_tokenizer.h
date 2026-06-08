@@ -40,6 +40,12 @@ public:
     
     // Decode single token
     std::string decode_token(int32_t token_id) const;
+
+    // Look up a token string's id (e.g. "<|emotion:happy|>"); -1 if absent.
+    int32_t token_to_id(const std::string & tok) const {
+        auto it = vocab_.find(tok);
+        return it == vocab_.end() ? -1 : it->second;
+    }
     
     // Get configuration
     const tokenizer_config & get_config() const { return config_; }

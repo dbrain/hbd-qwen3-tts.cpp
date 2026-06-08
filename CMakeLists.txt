@@ -169,6 +169,141 @@ target_link_libraries(audio_tokenizer_decoder PUBLIC
     Threads::Threads
 )
 
+# Higgs-Audio-v3 XCodec2 decode path (codes -> 24 kHz PCM). Self-contained
+# GGML graph; shares only the GGUF loader. Used by the higgs port + validated
+# standalone against the PyTorch oracle via the higgs_codec_test harness.
+# Shared GGUF loader for the higgs libs (avoids duplicate symbols when an exe
+# links both higgs_codec and higgs_lm).
+add_library(higgs_gguf STATIC
+    src/gguf_loader.cpp
+)
+target_include_directories(higgs_gguf PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${GGML_DIR}/include
+)
+target_link_libraries(higgs_gguf PUBLIC ggml Threads::Threads)
+
+add_library(higgs_codec STATIC
+    src/higgs_codec.cpp
+)
+target_include_directories(higgs_codec PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${GGML_DIR}/include
+)
+target_link_libraries(higgs_codec PUBLIC
+    higgs_gguf
+    ggml
+    Threads::Threads
+)
+
+# Codec-decode oracle-validation harness.
+add_executable(higgs_codec_test
+    tools/higgs_codec_test.cpp
+)
+target_include_directories(higgs_codec_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/tools
+)
+target_link_libraries(higgs_codec_test PRIVATE
+    higgs_codec
+    Threads::Threads
+)
+
+# Higgs codec ENCODE path (wav -> [T,8] codes); voice-clone front-half.
+add_library(higgs_encode STATIC
+    src/higgs_encode.cpp
+)
+target_include_directories(higgs_encode PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${GGML_DIR}/include
+)
+target_link_libraries(higgs_encode PUBLIC
+    higgs_gguf
+    ggml
+    Threads::Threads
+)
+
+# Codec-encode oracle-validation harness.
+add_executable(higgs_encode_test
+    tools/higgs_encode_test.cpp
+)
+target_include_directories(higgs_encode_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/tools
+)
+target_link_libraries(higgs_encode_test PRIVATE
+    higgs_encode
+    Threads::Threads
+)
+
+# Higgs LM backbone (Qwen3-4B + tied 8208 audio head).
+add_library(higgs_lm STATIC
+    src/higgs_lm.cpp
+)
+target_include_directories(higgs_lm PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${GGML_DIR}/include
+)
+target_link_libraries(higgs_lm PUBLIC
+    higgs_gguf
+    ggml
+    Threads::Threads
+)
+
+# Backbone step-0 logits oracle-validation harness.
+add_executable(higgs_lm_test
+    tools/higgs_lm_test.cpp
+)
+target_include_directories(higgs_lm_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/tools
+)
+target_link_libraries(higgs_lm_test PRIVATE
+    higgs_lm
+    Threads::Threads
+)
+
+# Full Higgs TTS engine (LM + delay AR loop + codec + Qwen3 BPE tokenizer).
+add_library(higgs_tts STATIC
+    src/higgs_tts.cpp
+    src/higgs_voices.cpp
+    src/text_tokenizer.cpp
+    src/tokenizer_unicode.cpp
+    src/tokenizer_unicode_data.cpp
+)
+target_include_directories(higgs_tts PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${GGML_DIR}/include
+)
+target_link_libraries(higgs_tts PUBLIC
+    higgs_lm
+    higgs_codec
+    higgs_encode
+    Threads::Threads
+)
+
+# End-to-end AR-loop oracle-validation harness.
+add_executable(higgs_tts_test
+    tools/higgs_tts_test.cpp
+)
+target_include_directories(higgs_tts_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/tools
+)
+target_link_libraries(higgs_tts_test PRIVATE
+    higgs_tts
+    Threads::Threads
+)
+
+# Standalone synth CLI (prompt-ids -> wav) for ear-test rendering.
+add_executable(higgs_synth
+    tools/higgs_synth.cpp
+)
+target_include_directories(higgs_synth PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/tools
+)
+target_link_libraries(higgs_synth PRIVATE
+    higgs_tts
+    higgs_encode
+    Threads::Threads
+)
+
 # Qwen3 Forced Aligner library — vendored from parakeet.cpp's qwen3-asr +
 # crisp_audio + core helpers. Drives the optional word-timing pass behind
 # /v1/audio/speech?align=true. Sits in its own static library so the
@@ -331,6 +466,22 @@ if(QWEN3_TTS_SERVER)
         src/worker_ipc.cpp
     )
     target_link_libraries(test_worker_ipc PRIVATE
+        nlohmann_json::nlohmann_json
+    )
+
+    # Minimal Higgs-Audio-v3 TTS HTTP server (/v1/audio/speech) + fork/IPC
+    # worker isolation (idle-VRAM→0 + cooperative cancellation).
+    add_executable(higgs-server
+        src/higgs_server.cpp
+        src/higgs_worker_ipc.cpp
+        src/higgs_worker_session.cpp
+    )
+    target_include_directories(higgs-server PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+    )
+    target_link_libraries(higgs-server PRIVATE
+        higgs_tts
+        httplib::httplib
         nlohmann_json::nlohmann_json
     )
 endif()
