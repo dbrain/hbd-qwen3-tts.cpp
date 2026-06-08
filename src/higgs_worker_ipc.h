@@ -59,6 +59,19 @@ enum class WFrame : uint32_t {
     ENCODE_RESP = 0x43,  // W→P  pack_payload(json{ok,error,T,N}, codes_i32)
     PING        = 0x50,  // P→W  {"t_send_ns":u64}
     PONG        = 0x51,  // W→P  echo
+    // ── Forced-alignment sibling (word-highlight reader). A SEPARATE aligner
+    // subprocess (spawned via "--higgs-aligner <fd>") owns the engine-agnostic
+    // qwen3-forced-aligner model. The parent streams synthesised PCM deltas as
+    // they're produced and gets back per-word t0/t1 timings. Same wire shape as
+    // qwen3-tts's ALIGN_PARTIAL/FINAL frames so the SSE event JSON matches.
+    //   *_REQ payload  = pack_audio_payload(json{words,pcm_sample_rate,
+    //                     audio_seen_ms|audio_total_ms,reset}, f32 PCM delta)
+    //   *_RESP payload = json{ok,error,audio_seen_ms,words:[{word_index,text,
+    //                     t0_ms,t1_ms,confidence}],profile}
+    ALIGN_PARTIAL_REQ  = 0x60,  // P→W
+    ALIGN_PARTIAL_RESP = 0x61,  // W→P
+    ALIGN_FINAL_REQ    = 0x62,  // P→W
+    ALIGN_FINAL_RESP   = 0x63,  // W→P
     SHUTDOWN    = 0xFF,  // P→W  exit cleanly
 };
 

@@ -159,6 +159,17 @@ public:
     bool synthesize_stream(const std::string & text, const gen_params & gp,
                            int chunk_frames, const pcm_cb & on_chunk, gen_result & out);
 
+    // Streaming voice-clone: same progressive PCM + bounded-window decode as
+    // synthesize_stream, but prefills the <|ref_audio|> clone prompt first (the
+    // 3-segment layout from synthesize_with_ref). Gives the read-along reader a
+    // cloned higgs voice WITH real TTFA + progressive word alignment, instead of
+    // buffering the whole paragraph. ref_codes_TN null/ref_T<=0 → zero-shot.
+    bool synthesize_stream_with_ref(const std::string & text,
+                                    const int32_t * ref_codes_TN, int ref_T,
+                                    const std::string & ref_text,
+                                    const gen_params & gp, int chunk_frames,
+                                    const pcm_cb & on_chunk, gen_result & out);
+
     // ---- multi-speaker dialogue (NOT model-native; a clone+stitch wrapper) ----
     struct dialogue_turn { std::string speaker; std::string text; };
     // Parse "[Speaker_N]:" tagged text into ordered turns. Leading untagged text
@@ -191,6 +202,12 @@ private:
     // codes/T/pcm/decode_ms/codec_ms fields of `out` (caller sets prefill_ms).
     bool run_ar(std::vector<float> & logits, const gen_params & gp,
                 gen_result & out, bool decode_audio);
+    // Streaming AR loop shared by synthesize_stream{,_with_ref}: runs from the
+    // post-prefill `logits`, emits bounded-window PCM blocks via on_chunk, fills
+    // out.{codes_TN,T,pcm,decode_ms,codec_ms}. Caller does prefill + sets
+    // out.prefill_ms.
+    bool run_ar_streaming(std::vector<float> & logits, const gen_params & gp,
+                          int chunk_frames, const pcm_cb & on_chunk, gen_result & out);
     // One AR step of the multi-codebook delay/EOC sampler. Mutates `st`. Writes
     // the N sampled codes into `codes` (incl. BOC/EOC specials). `hist` is the
     // delayed grid generated so far (for RAS look-back; pass {} to disable).

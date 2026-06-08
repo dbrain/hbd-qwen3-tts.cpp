@@ -445,7 +445,6 @@ bool HiggsTTS::synthesize_multispeaker(const std::string & text,
 bool HiggsTTS::synthesize_stream(const std::string & text, const gen_params & gp,
                                  int chunk_frames, const pcm_cb & on_chunk, gen_result & out) {
     if (!tok_loaded_) { error_msg_ = "tokenizer not loaded"; return false; }
-    const int N = lm_.get_config().n_codebooks;
     rng_.seed(gp.seed ? gp.seed : 0xC0FFEEu);
     lm_.reset();
     auto ids = build_prompt(text);
@@ -454,28 +453,102 @@ bool HiggsTTS::synthesize_stream(const std::string & text, const gen_params & gp
     std::vector<float> logits;
     if (!lm_.prefill(ids.data(), (int)ids.size(), logits)) { error_msg_ = "prefill: " + lm_.get_error(); return false; }
     out.prefill_ms = ms_since(t0);
+    return run_ar_streaming(logits, gp, chunk_frames, on_chunk, out);
+}
 
+// Streaming voice-clone: prefill the 3-segment <|ref_audio|> clone prompt (as in
+// synthesize_with_ref) then run the SAME streaming AR loop → progressive PCM +
+// alignment with a cloned voice. ref null/ref_T<=0 falls back to zero-shot.
+bool HiggsTTS::synthesize_stream_with_ref(const std::string & text,
+                                          const int32_t * ref_codes_TN, int ref_T,
+                                          const std::string & ref_text,
+                                          const gen_params & gp, int chunk_frames,
+                                          const pcm_cb & on_chunk, gen_result & out) {
+    if (!tok_loaded_) { error_msg_ = "tokenizer not loaded"; return false; }
+    if (!ref_codes_TN || ref_T <= 0)
+        return synthesize_stream(text, gp, chunk_frames, on_chunk, out);
+    const int N = lm_.get_config().n_codebooks;
+    rng_.seed(gp.seed ? gp.seed : 0xC0FFEEu);
+    lm_.reset();
+
+    auto t0 = clk::now();
+    std::vector<float> logits;
+    // Segment 1 (text): <|tts|> [<|ref_text|> tok(ref_text)] <|ref_audio|>
+    std::vector<int32_t> seg1; seg1.push_back(sp_.tts);
+    if (!ref_text.empty() && sp_.ref_text >= 0) {
+        seg1.push_back(sp_.ref_text);
+        auto rt = encode_with_specials(ref_text);
+        seg1.insert(seg1.end(), rt.begin(), rt.end());
+    }
+    seg1.push_back(sp_.ref_audio);
+    if (!lm_.prefill(seg1.data(), (int)seg1.size(), logits)) { error_msg_ = "ref prefill seg1: " + lm_.get_error(); return false; }
+    // Segment 2 (audio): delayed reference codes in the <|ref_audio|> slot.
+    auto delayed_ref = apply_delay_pattern(ref_codes_TN, ref_T, N);
+    if (!lm_.prefill_audio(delayed_ref.data(), (int)delayed_ref.size() / N, logits)) {
+        error_msg_ = "ref prefill audio: " + lm_.get_error(); return false;
+    }
+    // Segment 3 (text): <|text|> tok(text) <|audio|>
+    std::vector<int32_t> seg3; seg3.push_back(sp_.text);
+    auto tt = encode_with_specials(text);
+    seg3.insert(seg3.end(), tt.begin(), tt.end());
+    seg3.push_back(sp_.audio);
+    if (!lm_.prefill(seg3.data(), (int)seg3.size(), logits)) { error_msg_ = "ref prefill seg3: " + lm_.get_error(); return false; }
+
+    out.prefill_ms = ms_since(t0);
+    return run_ar_streaming(logits, gp, chunk_frames, on_chunk, out);
+}
+
+bool HiggsTTS::run_ar_streaming(std::vector<float> & logits, const gen_params & gp,
+                                int chunk_frames, const pcm_cb & on_chunk, gen_result & out) {
+    const int N = lm_.get_config().n_codebooks;
     sampler_state st; st.n = N;
     std::vector<std::vector<int32_t>> delayed;
     std::vector<int32_t> codes;
     const int hold = 3;             // frames held back near each block boundary
-    size_t emitted = 0;             // samples already emitted
-    std::vector<float> pcm_all;
     if (chunk_frames < 1) chunk_frames = 25;
 
-    auto emit_upto = [&](int t_emit, bool final) {
-        if (t_emit <= 0) return true;
-        std::vector<int32_t> codes_TN((size_t)t_emit * N);
+    // Bounded-window streaming codec decode. The legacy path re-decodes ALL
+    // codes-so-far every block (and the whole song on the final block), so the
+    // codec graph — and thus VRAM — grows with paragraph length: a max-length
+    // reader paragraph (~90 s) spikes the synth worker to ~4.5 GB. The DAC/
+    // XCodec2 acoustic decoder is a finite-receptive-field conv stack, so
+    // decoding only a recent window of frames WITH enough left-context yields
+    // bit-identical tail samples while bounding the decode to ~(chunk+ctx)
+    // frames regardless of length. Left-context absorbs the conv warm-up; we
+    // discard those samples and emit only the new tail. `decode_ctx` frames of
+    // left-context (default 256 ≈ 10.2 s): the decoder's receptive field is in
+    // (96, 256] frames — A/B'd BIT-IDENTICAL to decode-all at 256 (same sha;
+    // 96 differs), so this is lossless, not approximate. The right window edge
+    // sits at t_emit exactly as in the legacy per-block decode, so only the
+    // left context (absorbed) changes. HIGGS_STREAM_DECODE_CTX_FRAMES=0 reverts
+    // to decode-all. KV cache is untouched — this is purely codec-graph sizing.
+    int decode_ctx = 256;
+    if (const char * e = std::getenv("HIGGS_STREAM_DECODE_CTX_FRAMES")) {
+        int v = atoi(e); if (v >= 0) decode_ctx = v;
+    }
+    int emitted_frames = 0;         // output frames already emitted
+    out.pcm.clear();
+    std::vector<float> win_pcm;
+
+    auto emit_upto = [&](int t_emit, bool final_block) -> bool {
+        if (t_emit <= emitted_frames) return true;
+        const int w0   = (decode_ctx > 0) ? std::max(0, emitted_frames - decode_ctx) : 0;
+        const int wlen = t_emit - w0;
+        std::vector<int32_t> codes_TN((size_t)wlen * N);
         for (int c = 0; c < N; ++c)
-            for (int t = 0; t < t_emit; ++t) {
-                int v = delayed[t + c][c]; if (v < 0) v = 0; if (v > 1023) v = 1023;
+            for (int t = 0; t < wlen; ++t) {
+                int v = delayed[(w0 + t) + c][c]; if (v < 0) v = 0; if (v > 1023) v = 1023;
                 codes_TN[(size_t)t * N + c] = v;
             }
-        if (!codec_.decode(codes_TN.data(), t_emit, pcm_all)) { error_msg_ = "codec: " + codec_.get_error(); return false; }
-        if (pcm_all.size() > emitted) {
-            on_chunk(pcm_all.data() + emitted, (int)(pcm_all.size() - emitted), final);
-            emitted = pcm_all.size();
+        if (!codec_.decode(codes_TN.data(), wlen, win_pcm)) { error_msg_ = "codec: " + codec_.get_error(); return false; }
+        const size_t skip = (size_t)(emitted_frames - w0) * 960;
+        if (win_pcm.size() > skip) {
+            const float * p = win_pcm.data() + skip;
+            const size_t  n = win_pcm.size() - skip;
+            on_chunk(p, (int) n, final_block);
+            out.pcm.insert(out.pcm.end(), p, p + n);
         }
+        emitted_frames = t_emit;
         return true;
     };
 
@@ -490,7 +563,7 @@ bool HiggsTTS::synthesize_stream(const std::string & text, const gen_params & gp
             if (!lm_.decode_step(codes.data(), logits)) { error_msg_ = "decode_step: " + lm_.get_error(); return false; }
         }
         int T_now = (int)delayed.size() - (N - 1);
-        if (T_now - last_decoded_T >= chunk_frames && T_now - hold > (int)(emitted / 960)) {
+        if (T_now - last_decoded_T >= chunk_frames && T_now - hold > emitted_frames) {
             if (!emit_upto(T_now - hold, false)) return false;
             last_decoded_T = T_now;
         }
@@ -503,9 +576,8 @@ bool HiggsTTS::synthesize_stream(const std::string & text, const gen_params & gp
     if (T <= 0) { error_msg_ = "generated too few frames"; return false; }
     out.T = T;
     auto tc = clk::now();
-    if (!emit_upto(T, true)) return false;   // final block, decode all
+    if (!emit_upto(T, true)) return false;   // final tail (windowed)
     out.codec_ms = ms_since(tc);
-    out.pcm = pcm_all;
     out.codes_TN.assign((size_t)T * N, 0);
     for (int c = 0; c < N; ++c) for (int t = 0; t < T; ++t) {
         int v = delayed[t + c][c]; if (v < 0) v = 0; if (v > 1023) v = 1023;

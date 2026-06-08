@@ -26,6 +26,7 @@
 #include "higgs_tts.h"
 #include "higgs_voices.h"
 #include "higgs_worker_session.h"
+#include "higgs_fa_session.h"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -48,6 +49,54 @@ using namespace std::chrono_literals;
 static const char * argval(int argc, char ** argv, const char * key, const char * def) {
     for (int i = 1; i < argc - 1; ++i) if (!strcmp(argv[i], key)) return argv[i+1];
     return def;
+}
+
+// Standard base64 (for SSE speech.audio.delta payloads — raw s16le PCM b64).
+static std::string base64_encode(const void * data, size_t len) {
+    static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const uint8_t * p = (const uint8_t *) data;
+    std::string out;
+    out.reserve(((len + 2) / 3) * 4);
+    for (size_t i = 0; i < len; i += 3) {
+        uint32_t n = p[i] << 16;
+        if (i + 1 < len) n |= p[i+1] << 8;
+        if (i + 2 < len) n |= p[i+2];
+        out.push_back(tbl[(n >> 18) & 63]);
+        out.push_back(tbl[(n >> 12) & 63]);
+        out.push_back((i + 1 < len) ? tbl[(n >> 6) & 63] : '=');
+        out.push_back((i + 2 < len) ? tbl[n & 63] : '=');
+    }
+    return out;
+}
+
+// Convert float PCM [-1,1] → little-endian s16 bytes (clamped). Matches the
+// 24 kHz s16le mono shape kobbler's reader decodes from speech.audio.delta.
+static std::string pcm_f32_to_s16le(const float * pcm, size_t n) {
+    std::string b; b.reserve(n * 2);
+    for (size_t i = 0; i < n; ++i) {
+        int v = (int) lrintf(pcm[i] * 32767.0f);
+        if (v > 32767) v = 32767;
+        if (v < -32768) v = -32768;
+        int16_t x = (int16_t) v; b.append((const char *) &x, 2);
+    }
+    return b;
+}
+
+// Whitespace-split a UTF-8 string into word tokens for forced alignment. Mirrors
+// kobbler's `str::split_whitespace()` (which drives the read-along word_index
+// mapping): split on ASCII whitespace, drop empty runs, keep punctuation glued
+// to the word. The aligner's BPE tokenizer is byte-level so non-ASCII passes
+// through unchanged.
+static std::vector<std::string> whitespace_split_for_align(const std::string & s) {
+    std::vector<std::string> out;
+    size_t i = 0, n = s.size();
+    while (i < n) {
+        while (i < n && (unsigned char) s[i] <= ' ') i++;
+        size_t start = i;
+        while (i < n && (unsigned char) s[i] > ' ') i++;
+        if (i > start) out.push_back(s.substr(start, i - start));
+    }
+    return out;
 }
 
 static std::string wav_bytes(const std::vector<float> & pcm, int sr) {
@@ -133,6 +182,17 @@ struct ServerCtx {
     std::function<bool()>     ensure;     // load engine if needed (spawn in isolation); true=ready
     std::function<bool()>     is_loaded;  // engine currently resident?
     std::function<void()>     unload;     // release the engine's GPU (SIGKILL child in isolation)
+
+    // ── forced-alignment (word-highlight read-along) sibling ──
+    // The aligner is a SEPARATE subprocess (own CUDA context) lazy-spawned on the
+    // first aligned-stream request and SIGKILLed on idle / unload (VRAM true-0).
+    // `aligner_model` empty ⇒ FA disabled (align requests fall back to plain SSE
+    // audio with no highlight). Held across a whole request via `aligner_mtx`.
+    higgs::HiggsAlignerSession * aligner = nullptr;
+    std::string                  aligner_model;
+    std::mutex                   aligner_mtx;
+    std::atomic<int64_t>         aligner_last_activity_ms{0};
+    std::atomic<int>             aligner_inflight{0};
 };
 
 // trial_voice: render a zero-shot sample + recover its OUTPUT codes (the
@@ -297,6 +357,169 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
         Activity act(cx);
         if (!cx.ensure()) return err_json(res,503,"engine load failed");
 
+        // ---- SSE streaming + forced-alignment (word-highlight read-along) ----
+        // Path taken by kobbler's BookReader via koblem: stream_format="sse",
+        // response_format="pcm", align=true, align_stream="partial". Emits
+        // speech.audio.delta (b64 24 kHz s16le PCM) + interleaved
+        // speech.audio.alignment.{partial,final} + speech.audio.done — the exact
+        // event shape kobbler already parses for qwen3. The aligner is a sibling
+        // subprocess (24 kHz PCM → per-word t0/t1); falls back to plain SSE audio
+        // (no highlight) when no aligner model is configured.
+        if (body.value("stream_format", std::string()) == "sse") {
+            const bool do_align       = body.value("align", false);
+            const std::string a_mode  = body.value("align_stream", std::string("final-only"));
+            const bool do_partial     = do_align && a_mode == "partial"
+                                        && cx.aligner && !cx.aligner_model.empty();
+            // Reader paragraphs can be long; don't truncate. max_audio_tokens is
+            // the qwen3-side knob name kobbler sends; accept both.
+            gp.max_new = (int) body.value("max_new_tokens", body.value("max_audio_tokens", 2048));
+
+            // Resolve an optional clone voice (filesystem VoiceStore, GPU-free).
+            std::string voice = body.value("voice", std::string());
+            const bool have_voice = !voice.empty() && voice != "default";
+            higgs::HiggsTTS::named_voice nv; int nvN = 0;
+            std::string ref_text;
+            if (have_voice) {
+                if (!cx.voices->load(voice, nv.codes_TN, nv.T, nvN, nv.ref_text))
+                    return err_json(res, 400, "unknown voice: " + voice);
+                ref_text = body.value("ref_text", nv.ref_text);
+            }
+            std::vector<std::string> words = whitespace_split_for_align(input);
+
+            res.set_header("Content-Type", "text/event-stream");
+            res.set_header("X-Accel-Buffering", "no");
+            res.set_chunked_content_provider("text/event-stream",
+                [eng, &cx, input, gp, do_partial, have_voice,
+                 nv = std::move(nv), ref_text, words = std::move(words)]
+                (size_t, httplib::DataSink & sink) mutable -> bool {
+                    Activity act_stream(cx);
+                    std::mutex sink_write_mutex;
+                    auto write_sse = [&](const std::string & s) -> bool {
+                        std::lock_guard<std::mutex> lk(sink_write_mutex);
+                        return sink.write(s.data(), s.size());
+                    };
+                    auto emit_event = [&](const char * ev, const json & j) {
+                        write_sse(std::string("event: ") + ev + "\ndata: " + j.dump() + "\n\n");
+                    };
+
+                    // ── aligner sibling: ensure + begin + reader thread ──
+                    bool partial_active = false;
+                    std::unique_lock<std::mutex> aligner_lock;
+                    std::thread reader_thread;
+                    std::atomic<bool> reader_stop{false};
+                    std::atomic<int64_t> audio_offset_ms{0};
+                    if (do_partial) {
+                        aligner_lock = std::unique_lock<std::mutex>(cx.aligner_mtx);
+                        cx.aligner_inflight.fetch_add(1);
+                        cx.aligner_last_activity_ms.store(now_ms());
+                        if (!cx.aligner->ensure_loaded(cx.aligner_model)) {
+                            emit_event("speech.audio.alignment.error",
+                                       {{"type","speech.audio.alignment.error"},
+                                        {"error", std::string("aligner load failed: ") + cx.aligner->last_error()}});
+                            cx.aligner_inflight.fetch_sub(1);
+                            aligner_lock.unlock();
+                        } else if (!cx.aligner->begin_streaming_align(words, 24000)) {
+                            emit_event("speech.audio.alignment.error",
+                                       {{"type","speech.audio.alignment.error"},
+                                        {"error", std::string("begin_streaming_align failed: ") + cx.aligner->last_error()}});
+                            cx.aligner_inflight.fetch_sub(1);
+                            aligner_lock.unlock();
+                        } else {
+                            partial_active = true;
+                            reader_thread = std::thread([&]() {
+                                while (!reader_stop.load(std::memory_order_relaxed)) {
+                                    cx.aligner->drain_partial_alignments(
+                                        [&](int64_t seen, const std::vector<higgs::AlignedWord> & ws) {
+                                            json wj = json::array();
+                                            for (size_t i = 0; i < ws.size(); i++)
+                                                wj.push_back({{"word_index",(int)i},{"text",ws[i].text},
+                                                              {"t0_ms",ws[i].t0_ms},{"t1_ms",ws[i].t1_ms},
+                                                              {"confidence",ws[i].confidence}});
+                                            emit_event("speech.audio.alignment.partial",
+                                                       {{"type","speech.audio.alignment.partial"},
+                                                        {"audio_seen_ms",seen},{"words",std::move(wj)}});
+                                        });
+                                    std::this_thread::sleep_for(20ms);
+                                }
+                            });
+                        }
+                    }
+
+                    // ── disconnect watchdog: worker stays warm (499-style) ──
+                    std::atomic<bool> wd_stop{false};
+                    std::thread wd([&]() {
+                        while (!wd_stop.load()) {
+                            if (sink.is_writable && !sink.is_writable()) { eng->request_cancel(); break; }
+                            std::this_thread::sleep_for(50ms);
+                        }
+                    });
+
+                    auto emit_audio = [&](const float * pcm, int n) {
+                        cx.last_activity_ms.store(now_ms());
+                        std::string s16 = pcm_f32_to_s16le(pcm, (size_t) n);
+                        emit_event("speech.audio.delta",
+                                   {{"type","speech.audio.delta"},
+                                    {"audio", base64_encode(s16.data(), s16.size())}});
+                        if (partial_active) {
+                            const int64_t chunk_ms = (int64_t)((int64_t)n * 1000 / 24000);
+                            const int64_t total = audio_offset_ms.fetch_add(chunk_ms) + chunk_ms;
+                            cx.aligner_last_activity_ms.store(now_ms());
+                            cx.aligner->push_partial_pcm(pcm, (size_t) n, total);
+                        }
+                    };
+
+                    higgs::gen_result r; bool ok = false;
+                    {
+                        std::lock_guard<std::mutex> lk(cx.mtx);
+                        eng->clear_cancel();
+                        if (have_voice) {
+                            // Progressive cloned-voice read-along: real TTFA +
+                            // progressive partial alignment (not buffered).
+                            ok = eng->synthesize_stream_with_ref(input, nv.codes_TN.data(), nv.T, ref_text, gp, 25,
+                                [&](const float * pcm, int n, bool) { emit_audio(pcm, n); }, r);
+                        } else {
+                            ok = eng->synthesize_stream(input, gp, 25,
+                                [&](const float * pcm, int n, bool) { emit_audio(pcm, n); }, r);
+                        }
+                    }
+
+                    if (partial_active) {
+                        reader_stop.store(true);
+                        if (reader_thread.joinable()) reader_thread.join();
+                    }
+                    wd_stop.store(true);
+                    if (wd.joinable()) wd.join();
+
+                    // ── finalize alignment ──
+                    if (partial_active) {
+                        const int64_t total_ms = audio_offset_ms.load();
+                        std::vector<higgs::AlignedWord> aligned; higgs::AlignProfile prof;
+                        const bool fok = cx.aligner->finalize_streaming_align(nullptr, 0, total_ms, aligned, prof);
+                        if (fok) {
+                            json wj = json::array();
+                            for (size_t i = 0; i < aligned.size(); i++)
+                                wj.push_back({{"word_index",(int)i},{"text",aligned[i].text},
+                                              {"t0_ms",aligned[i].t0_ms},{"t1_ms",aligned[i].t1_ms},
+                                              {"confidence",aligned[i].confidence}});
+                            emit_event("speech.audio.alignment.final",
+                                       {{"type","speech.audio.alignment.final"},
+                                        {"audio_total_ms",total_ms},{"words",std::move(wj)}});
+                        } else {
+                            emit_event("speech.audio.alignment.error",
+                                       {{"type","speech.audio.alignment.error"},
+                                        {"error", cx.aligner->last_error()}});
+                        }
+                        cx.aligner_inflight.fetch_sub(1);
+                        if (aligner_lock.owns_lock()) aligner_lock.unlock();
+                    }
+
+                    emit_event("speech.audio.done", {{"type","speech.audio.done"}});
+                    sink.done();
+                    return true;
+                });
+            return;
+        }
+
         // ---- multi-speaker dialogue (speakers map present) ----
         if (body.contains("speakers") && body["speakers"].is_object()) {
             std::map<std::string, higgs::HiggsTTS::named_voice> vmap;
@@ -420,11 +643,13 @@ static bool trial_voice(higgs::HiggsWorkerSession * eng, const std::string & tex
 
 int main(int argc, char ** argv) {
     // Worker-isolation child: when "--higgs-worker <fd>" is passed we ARE the
-    // GPU subprocess; run the dispatch loop and never start the HTTP server.
+    // GPU synth subprocess. "--higgs-aligner <fd>" → the FA aligner sibling.
+    // Either way we run a dispatch loop and never start the HTTP server.
     for (int i = 1; i < argc - 1; ++i) {
-        if (!strcmp(argv[i], "--higgs-worker")) {
+        if (!strcmp(argv[i], "--higgs-worker"))
             return higgs::run_higgs_worker_loop(atoi(argv[i+1]));
-        }
+        if (!strcmp(argv[i], "--higgs-aligner"))
+            return higgs::run_higgs_aligner_worker_loop(atoi(argv[i+1]));
     }
 
     std::string bb = argval(argc,argv,"--backbone","");
@@ -445,12 +670,40 @@ int main(int argc, char ** argv) {
     int idle_unload_seconds = 0;
     if (const char * e = std::getenv("HIGGS_IDLE_UNLOAD_SECONDS")) { idle_unload_seconds = atoi(e); if (idle_unload_seconds < 0) idle_unload_seconds = 0; }
 
+    // Forced-alignment (word-highlight read-along) GGUF. Local path (eval/local
+    // only): --worker-aligner-fa / --aligner-model, or HIGGS_FA_MODEL. Empty ⇒
+    // FA disabled (aligned-stream requests degrade to plain SSE audio). The
+    // aligner is its own sibling subprocess; isolation must be on (it forks off
+    // the same binary via --higgs-aligner).
+    const char * fa_env = std::getenv("HIGGS_FA_MODEL");
+    std::string fa_model = argval(argc, argv, "--worker-aligner-fa",
+                            argval(argc, argv, "--aligner-model", fa_env ? fa_env : ""));
+    int aligner_idle_seconds = idle_unload_seconds > 0 ? idle_unload_seconds : 0;
+    if (const char * e = std::getenv("HIGGS_ALIGNER_IDLE_UNLOAD_SECONDS")) {
+        aligner_idle_seconds = atoi(e); if (aligner_idle_seconds < 0) aligner_idle_seconds = 0;
+    }
+
     higgs::VoiceStore voices(voices_dir);
     fprintf(stderr, "voice library: %s (%zu voices)\n", voices_dir.c_str(), voices.list().size());
 
     ServerCtx cx;
     cx.voices = &voices;
     cx.last_activity_ms.store(now_ms());
+    cx.aligner_last_activity_ms.store(now_ms());
+
+    // Forced-alignment sibling (its own subprocess + CUDA context). Lazy-spawned
+    // on the first aligned-stream request; SIGKILLed on idle / unload. Works in
+    // both isolation and in-process modes (it never shares the synth context).
+    std::unique_ptr<higgs::HiggsAlignerSession> aligner;
+    if (!fa_model.empty()) {
+        aligner = std::make_unique<higgs::HiggsAlignerSession>(argv[0]);
+        cx.aligner = aligner.get();
+        cx.aligner_model = fa_model;
+        fprintf(stderr, "higgs-server: forced-alignment enabled (fa=%s, aligner idle-unload %ds)\n",
+                fa_model.c_str(), aligner_idle_seconds);
+    } else {
+        fprintf(stderr, "higgs-server: forced-alignment DISABLED (no --worker-aligner-fa / HIGGS_FA_MODEL)\n");
+    }
 
     httplib::Server srv;
 
@@ -467,7 +720,10 @@ int main(int argc, char ** argv) {
         session = std::make_unique<higgs::HiggsWorkerSession>(argv[0]);
         cx.ensure     = [&]{ return session->ensure_loaded(wcfg); };
         cx.is_loaded  = [&]{ return session->is_alive(); };
-        cx.unload     = [&]{ session->shutdown(); };
+        // unload also drops the aligner sibling (the gate swaps the whole TTS
+        // engine out; the aligner's ~0.6-1.1 GB shouldn't linger). io_mutex_-
+        // level SIGKILL — no deadlock with the request-level aligner_mtx.
+        cx.unload     = [&]{ session->shutdown(); if (cx.aligner) cx.aligner->shutdown(); };
         fprintf(stderr, "higgs-server: WORKER ISOLATION on (idle-unload %ds; lazy load on first request)\n", idle_unload_seconds);
         install_routes(srv, session.get(), cx);
 
@@ -498,8 +754,32 @@ int main(int argc, char ** argv) {
         inproc->lm().log_vram("ready");
         cx.ensure    = []{ return true; };
         cx.is_loaded = []{ return true; };
-        cx.unload    = []{};   // in-process: model stays resident (no SIGKILL reclaim)
+        // in-process: synth model stays resident, but the aligner sibling can
+        // still be reclaimed (own subprocess).
+        cx.unload    = [&]{ if (cx.aligner) cx.aligner->shutdown(); };
         install_routes(srv, inproc.get(), cx);
+    }
+
+    // Dedicated aligner idle-unload watchdog — drops the aligner's VRAM fast
+    // when the reader pauses between paragraphs, independent of the synth
+    // worker's idle window. SIGKILL → VRAM true-0; next paragraph respawns it.
+    if (aligner && aligner_idle_seconds > 0) {
+        std::thread([&cx, &aligner, aligner_idle_seconds]{
+            const int64_t threshold = (int64_t) aligner_idle_seconds * 1000;
+            const int check_s = std::max(1, aligner_idle_seconds / 5);
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::seconds(check_s));
+                if (cx.aligner_inflight.load() > 0) continue;
+                if (!aligner->is_alive()) continue;
+                if (now_ms() - cx.aligner_last_activity_ms.load() < threshold) continue;
+                std::unique_lock<std::mutex> lk(cx.aligner_mtx, std::try_to_lock);
+                if (!lk.owns_lock()) continue;            // an align stream is mid-flight
+                if (cx.aligner_inflight.load() > 0) continue;
+                fprintf(stderr, "higgs aligner idle-unload: %lld s idle, killing aligner pid=%d\n",
+                        (long long)((now_ms() - cx.aligner_last_activity_ms.load())/1000), aligner->pid());
+                aligner->shutdown();
+            }
+        }).detach();
     }
 
     fprintf(stderr, "higgs-server listening on %s:%d\n", host.c_str(), port);

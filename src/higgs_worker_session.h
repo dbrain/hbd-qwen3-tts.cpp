@@ -70,6 +70,14 @@ public:
     bool synthesize_stream(const std::string & text, const gen_params & gp,
                            int chunk_frames, const HiggsTTS::pcm_cb & on_chunk, gen_result & out);
 
+    // Streaming voice-clone (read-along reader): progressive PCM + alignment with
+    // a cloned voice. Mirrors HiggsTTS::synthesize_stream_with_ref.
+    bool synthesize_stream_with_ref(const std::string & text,
+                                    const int32_t * ref_codes_TN, int ref_T,
+                                    const std::string & ref_text,
+                                    const gen_params & gp, int chunk_frames,
+                                    const HiggsTTS::pcm_cb & on_chunk, gen_result & out);
+
     // Trial-and-save: render zero-shot, return OUTPUT codes (parent persists).
     bool trial_codes(const std::string & text, const gen_params & gp,
                      std::vector<int32_t> & out_codes, int & out_T, int & out_N);

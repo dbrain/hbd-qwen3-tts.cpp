@@ -475,6 +475,7 @@ if(QWEN3_TTS_SERVER)
         src/higgs_server.cpp
         src/higgs_worker_ipc.cpp
         src/higgs_worker_session.cpp
+        src/higgs_fa_session.cpp
     )
     target_include_directories(higgs-server PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -484,6 +485,11 @@ if(QWEN3_TTS_SERVER)
         httplib::httplib
         nlohmann_json::nlohmann_json
     )
+    # Forced-alignment (word-highlight read-along) reuses the engine-agnostic
+    # qwen3_fa aligner lib — the ONLY shared code with the qwen3-tts stack.
+    if(QWEN3_TTS_FORCED_ALIGNMENT)
+        target_link_libraries(higgs-server PRIVATE qwen3_fa)
+    endif()
 endif()
 
 # Install targets

@@ -294,6 +294,26 @@ bool HiggsWorkerSession::synthesize_stream(const std::string & text, const gen_p
     return send_speech_locked(meta.dump(), {}, true, on_chunk, out);
 }
 
+bool HiggsWorkerSession::synthesize_stream_with_ref(const std::string & text,
+                                                    const int32_t * ref_codes_TN, int ref_T,
+                                                    const std::string & ref_text,
+                                                    const gen_params & gp, int chunk_frames,
+                                                    const HiggsTTS::pcm_cb & on_chunk, gen_result & out) {
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    if (!ref_codes_TN || ref_T <= 0) {
+        json meta = {{"mode", "stream"}, {"input", text}, {"gp", gp_to_json(gp)}, {"chunk_frames", chunk_frames}};
+        return send_speech_locked(meta.dump(), {}, true, on_chunk, out);
+    }
+    const int N = 8;  // higgs n_codebooks (fixed); child re-derives N = ref_cnt/ref_T
+    std::vector<int32_t> codes(ref_codes_TN, ref_codes_TN + (size_t)ref_T * N);
+    // mode=clone + stream=true → child runs synthesize_stream_with_ref (progressive
+    // cloned-voice read-along). Same blob/meta as the buffered clone path + stream.
+    json meta = {{"mode", "clone"}, {"stream", true}, {"input", text}, {"gp", gp_to_json(gp)},
+                 {"chunk_frames", chunk_frames}, {"ref_T", ref_T}, {"ref_text", ref_text},
+                 {"ref_cnt", (int)codes.size()}};
+    return send_speech_locked(meta.dump(), codes, true, on_chunk, out);
+}
+
 bool HiggsWorkerSession::trial_codes(const std::string & text, const gen_params & gp,
                                      std::vector<int32_t> & out_codes, int & out_T, int & out_N) {
     std::lock_guard<std::mutex> lock(io_mutex_);
@@ -509,7 +529,9 @@ int run_higgs_worker_loop(int fd) {
                 std::string mode  = req.value("mode", std::string{"plain"});
                 std::string input = req.value("input", std::string{});
                 gen_params gp = gp_from_json(req.value("gp", json::object()));
-                const bool streaming = (mode == "stream");
+                // streaming = the zero-shot stream mode OR a clone with stream:true
+                // (the read-along cloned-voice path) — both relay AUDIO_FRAMEs.
+                const bool streaming = (mode == "stream") || req.value("stream", false);
 
                 tts.clear_cancel();
                 ctrl.active_req.store(hdr.req_id, std::memory_order_release);
@@ -530,7 +552,12 @@ int run_higgs_worker_loop(int fd) {
                 } else if (mode == "clone") {
                     int ref_T = req.value("ref_T", 0);
                     std::string ref_text = req.value("ref_text", std::string{});
-                    ok = tts.synthesize_with_ref(input, codes, ref_T, ref_text, gp, r, true);
+                    if (req.value("stream", false)) {
+                        int chunk_frames = req.value("chunk_frames", 25);
+                        ok = tts.synthesize_stream_with_ref(input, codes, ref_T, ref_text, gp, chunk_frames, on_chunk, r);
+                    } else {
+                        ok = tts.synthesize_with_ref(input, codes, ref_T, ref_text, gp, r, true);
+                    }
                 } else if (mode == "long") {
                     int buffer = req.value("buffer", 2);
                     int chunk_words = req.value("chunk_words", 100);
