@@ -12,6 +12,7 @@
 #include "qwen3_tts.h"
 #include "audio/ffmpeg_encode.h"
 #include "worker_session.h"
+#include "fa_session.h"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -748,8 +749,8 @@ static bool parse_args(int argc, char ** argv, server_params & sp) {
             // Don't advertise in --help; users shouldn't need to pass it.
             if (++i >= argc) { fprintf(stderr, "error: missing worker fd\n"); return false; }
             sp.worker_fd = std::stoi(argv[i]);
-        } else if (arg == "--worker-aligner") {
-            // Internal flag — Phase 2 streaming-alignment sibling worker.
+        } else if (arg == "--fa-aligner") {
+            // Internal flag — shared streaming-alignment sibling (fa::AlignerSession).
             if (++i >= argc) { fprintf(stderr, "error: missing aligner-worker fd\n"); return false; }
             sp.aligner_worker_fd = std::stoi(argv[i]);
         } else {
@@ -817,7 +818,7 @@ int main(int argc, char ** argv) {
         return qwen3_tts::run_worker_loop(sp.worker_fd);
     }
     if (sp.aligner_worker_fd >= 0) {
-        return qwen3_tts::run_aligner_worker_loop(sp.aligner_worker_fd);
+        return fa::run_aligner_loop(sp.aligner_worker_fd);
     }
 
     // resolve --hf-repo to local file paths
@@ -859,12 +860,11 @@ int main(int argc, char ** argv) {
     // (not just the in-process heap buffers). Default off until P5
     // verifies bench parity vs the in-process path.
     std::unique_ptr<qwen3_tts::WorkerSession> worker_session;
-    // Phase-2 streaming alignment: aligner-only sibling subprocess. Lazy-
-    // spawned on first /v1/audio/speech request with align_stream=partial.
-    // Sharing the same `aligner_only=true` WorkerSession instance avoids
-    // per-paragraph fork+exec + FA cold-load — model lives in VRAM across
-    // paragraphs (idle-unload reclaims after inactivity, same as main).
-    std::unique_ptr<qwen3_tts::WorkerSession> aligner_session;
+    // Streaming alignment: the shared fa::AlignerSession sibling subprocess
+    // (src/fa_session.h, also used by higgs-server). Lazy-spawned on the first
+    // /v1/audio/speech request with align_stream=partial; the FA model lives in
+    // VRAM across paragraphs (idle-unload reclaims after inactivity).
+    std::unique_ptr<fa::AlignerSession> aligner_session;
     std::mutex aligner_session_mutex; // serialises spawn + cross-paragraph use
     bool worker_iso = false;
     if (const char * env = std::getenv("QWEN3_TTS_WORKER_ISOLATION")) {
@@ -882,9 +882,8 @@ int main(int argc, char ** argv) {
         }
         worker_session = std::make_unique<qwen3_tts::WorkerSession>(argv[0], child_argv);
         // Aligner sibling reuses the same child_argv (it ignores model /
-        // vocoder / spk_enc); --hf-repo-fa propagates through LOAD_REQ.
-        aligner_session = std::make_unique<qwen3_tts::WorkerSession>(
-            argv[0], child_argv, /*aligner_only=*/true);
+        // vocoder / spk_enc); the FA model path propagates through LOAD_REQ.
+        aligner_session = std::make_unique<fa::AlignerSession>(argv[0], child_argv);
         fprintf(stderr, "worker-isolation: ENABLED (model loads in subprocess on first request)\n");
         // The parent process never touches CUDA; lazy_load is implicit.
         // We still call set_model_paths on the parent's Qwen3TTS so the
@@ -1025,16 +1024,11 @@ int main(int argc, char ** argv) {
         return cfg;
     };
 
-    // Aligner-only sibling worker config: just the FA GGUF path. The
-    // aligner subprocess's run_aligner_worker_loop ignores model /
-    // vocoder / spk_enc anyway, but keeping them empty makes intent
-    // explicit and helps the cache-hit check in ensure_loaded.
-    auto make_aligner_cfg = [&]() {
-        qwen3_tts::WorkerLoadConfig cfg;
-        cfg.aligner_model      = sp.aligner_model;
-        cfg.lazy_load          = true; // run_aligner_worker_loop does its own lazy
-        cfg.aligner_only       = true;
-        return cfg;
+    // The shared fa::AlignerSession::ensure_loaded() just wants the FA GGUF
+    // path; it spawns the sibling + LOAD_REQs the model. (Kept as a lambda so
+    // the existing &make_aligner_cfg captures below stay valid.)
+    auto make_aligner_cfg = [&]() -> std::string {
+        return sp.aligner_model;
     };
 
     // Worker-isolation eager warm-up. Deferred from the early init block
@@ -2223,7 +2217,7 @@ int main(int argc, char ** argv) {
                                     while (!partial_reader_stop.load(std::memory_order_relaxed)) {
                                         bool ok = aligner_session->drain_partial_alignments(
                                             [&](int64_t audio_seen_ms,
-                                                const std::vector<qwen3_tts::AlignedWord> & words) {
+                                                const std::vector<fa::AlignedWord> & words) {
                                                 json wj = json::array();
                                                 for (size_t i = 0; i < words.size(); i++) {
                                                     wj.push_back({
@@ -2465,8 +2459,8 @@ int main(int argc, char ** argv) {
                         partial_reader_stop.store(true, std::memory_order_relaxed);
                         if (partial_reader_thread.joinable()) partial_reader_thread.join();
                         const int64_t total_ms = audio_offset_ms.load(std::memory_order_relaxed);
-                        std::vector<qwen3_tts::AlignedWord> aligned;
-                        qwen3_tts::AlignProfile prof;
+                        std::vector<fa::AlignedWord> aligned;
+                        fa::AlignProfile prof;
                         const bool ok = aligner_session->finalize_streaming_align(
                             /*tail_pcm=*/nullptr, /*n_tail_samples=*/0,
                             total_ms, aligned, prof);

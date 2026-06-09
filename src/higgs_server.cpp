@@ -26,7 +26,7 @@
 #include "higgs_tts.h"
 #include "higgs_voices.h"
 #include "higgs_worker_session.h"
-#include "higgs_fa_session.h"
+#include "fa_session.h"
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -188,7 +188,7 @@ struct ServerCtx {
     // first aligned-stream request and SIGKILLed on idle / unload (VRAM true-0).
     // `aligner_model` empty ⇒ FA disabled (align requests fall back to plain SSE
     // audio with no highlight). Held across a whole request via `aligner_mtx`.
-    higgs::HiggsAlignerSession * aligner = nullptr;
+    fa::AlignerSession * aligner = nullptr;
     std::string                  aligner_model;
     std::mutex                   aligner_mtx;
     std::atomic<int64_t>         aligner_last_activity_ms{0};
@@ -429,7 +429,7 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                             reader_thread = std::thread([&]() {
                                 while (!reader_stop.load(std::memory_order_relaxed)) {
                                     cx.aligner->drain_partial_alignments(
-                                        [&](int64_t seen, const std::vector<higgs::AlignedWord> & ws) {
+                                        [&](int64_t seen, const std::vector<fa::AlignedWord> & ws) {
                                             json wj = json::array();
                                             for (size_t i = 0; i < ws.size(); i++)
                                                 wj.push_back({{"word_index",(int)i},{"text",ws[i].text},
@@ -493,7 +493,7 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                     // ── finalize alignment ──
                     if (partial_active) {
                         const int64_t total_ms = audio_offset_ms.load();
-                        std::vector<higgs::AlignedWord> aligned; higgs::AlignProfile prof;
+                        std::vector<fa::AlignedWord> aligned; fa::AlignProfile prof;
                         const bool fok = cx.aligner->finalize_streaming_align(nullptr, 0, total_ms, aligned, prof);
                         if (fok) {
                             json wj = json::array();
@@ -643,13 +643,13 @@ static bool trial_voice(higgs::HiggsWorkerSession * eng, const std::string & tex
 
 int main(int argc, char ** argv) {
     // Worker-isolation child: when "--higgs-worker <fd>" is passed we ARE the
-    // GPU synth subprocess. "--higgs-aligner <fd>" → the FA aligner sibling.
+    // GPU synth subprocess. "--fa-aligner <fd>" → the shared FA aligner sibling.
     // Either way we run a dispatch loop and never start the HTTP server.
     for (int i = 1; i < argc - 1; ++i) {
         if (!strcmp(argv[i], "--higgs-worker"))
             return higgs::run_higgs_worker_loop(atoi(argv[i+1]));
-        if (!strcmp(argv[i], "--higgs-aligner"))
-            return higgs::run_higgs_aligner_worker_loop(atoi(argv[i+1]));
+        if (!strcmp(argv[i], "--fa-aligner"))
+            return fa::run_aligner_loop(atoi(argv[i+1]));
     }
 
     std::string bb = argval(argc,argv,"--backbone","");
@@ -694,9 +694,9 @@ int main(int argc, char ** argv) {
     // Forced-alignment sibling (its own subprocess + CUDA context). Lazy-spawned
     // on the first aligned-stream request; SIGKILLed on idle / unload. Works in
     // both isolation and in-process modes (it never shares the synth context).
-    std::unique_ptr<higgs::HiggsAlignerSession> aligner;
+    std::unique_ptr<fa::AlignerSession> aligner;
     if (!fa_model.empty()) {
-        aligner = std::make_unique<higgs::HiggsAlignerSession>(argv[0]);
+        aligner = std::make_unique<fa::AlignerSession>(argv[0]);
         cx.aligner = aligner.get();
         cx.aligner_model = fa_model;
         fprintf(stderr, "higgs-server: forced-alignment enabled (fa=%s, aligner idle-unload %ds)\n",

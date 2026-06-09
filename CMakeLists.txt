@@ -453,6 +453,7 @@ if(QWEN3_TTS_SERVER)
         PkgConfig::LIBAV
     )
     if(QWEN3_TTS_FORCED_ALIGNMENT)
+        target_sources(qwen3-tts-server PRIVATE src/fa_session.cpp)  # shared FA aligner sibling
         target_link_libraries(qwen3-tts-server PRIVATE qwen3_fa)
         target_compile_definitions(qwen3-tts-server PRIVATE QWEN3_TTS_HAS_FORCED_ALIGNMENT=1)
     endif()
@@ -475,7 +476,7 @@ if(QWEN3_TTS_SERVER)
         src/higgs_server.cpp
         src/higgs_worker_ipc.cpp
         src/higgs_worker_session.cpp
-        src/higgs_fa_session.cpp
+        src/fa_session.cpp          # shared engine-agnostic FA aligner sibling
     )
     target_include_directories(higgs-server PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src

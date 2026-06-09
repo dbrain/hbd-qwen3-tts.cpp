@@ -73,16 +73,11 @@ class WorkerSession {
 public:
     // Configure but don't spawn yet. argv0 must be argv[0] of the
     // running process — used for execv() so the child runs the same
-    // binary in --worker mode.
-    //
-    // `aligner_only` makes this session spawn a sibling aligner-only
-    // subprocess (--worker-aligner). Only the streaming-alignment
-    // methods (begin/push/drain/finalize_streaming_align) are valid
-    // on aligner-only sessions; synthesize* / extract* / encode* /
-    // save_voice_warmup will return failure.
+    // binary in --worker mode. (Streaming forced-alignment now lives in the
+    // engine-agnostic fa::AlignerSession; this class is synth-only. The
+    // one-shot align_words() below still runs in the synth worker.)
     WorkerSession(const char * argv0,
-                  std::vector<std::string> extra_argv = {},
-                  bool aligner_only = false);
+                  std::vector<std::string> extra_argv = {});
     ~WorkerSession();
 
     // Spawn the worker if it isn't running. If `cfg` differs from the
@@ -192,40 +187,8 @@ public:
                      std::vector<AlignedWord>        & out_words,
                      AlignProfile                    & out_profile);
 
-    // ── Streaming alignment (P2) — parent-side handle for an aligner-only
-    // sibling worker. The flow is:
-    //   1. begin_streaming_align(words) — reset worker's PCM accumulator,
-    //      stash the word list. Sets req_id_ for subsequent calls.
-    //   2. push_partial_pcm(pcm, n, audio_seen_ms) — send PCM delta,
-    //      worker re-encodes accumulated audio, returns updated word
-    //      timings on the same fd. Caller services responses via
-    //      `drain_partial_alignments` (single-threaded) or starts a
-    //      reader thread externally.
-    //   3. finalize_streaming_align(pcm, n, audio_total_ms, ...) — last
-    //      call with the tail PCM; blocks until ALIGN_FINAL_RESP arrives.
-    //
-    // Single in-flight streaming session per WorkerSession. Caller must
-    // serialize externally if multiple concurrent paragraphs are needed.
-    // Returns false on IPC error / aligner load failure; last_error() has
-    // the detail.
-    bool begin_streaming_align(const std::vector<std::string> & words,
-                               int pcm_sample_rate);
-
-    bool push_partial_pcm(const float * pcm, size_t n_samples,
-                          int64_t audio_seen_ms);
-
-    // Drain any pending ALIGN_PARTIAL_RESP frames non-blocking. Pushes
-    // each response (parsed words list + audio_seen_ms) through `cb`.
-    // Returns false on IPC error. `cb` should NOT block the caller.
-    using PartialAlignCallback = std::function<void(
-        int64_t audio_seen_ms,
-        const std::vector<AlignedWord> & words)>;
-    bool drain_partial_alignments(const PartialAlignCallback & cb);
-
-    bool finalize_streaming_align(const float * tail_pcm, size_t n_tail_samples,
-                                  int64_t audio_total_ms,
-                                  std::vector<AlignedWord> & out_words,
-                                  AlignProfile & out_profile);
+    // (Streaming partial-highlight alignment moved to fa::AlignerSession — see
+    // src/fa_session.h. It is engine-agnostic and shared with higgs-server.)
 
     // Send CANCEL_REQ to the worker for the currently in-flight synth.
     // Idempotent: if no synth is in flight, this is a no-op. Safe to
@@ -261,7 +224,6 @@ private:
     std::vector<std::string>   extra_argv_;
     WorkerLoadConfig           loaded_cfg_;
     bool                       loaded_ok_ = false;
-    bool                       aligner_only_ = false;
 
     pid_t                      pid_ = -1;
     int                        fd_  = -1;
@@ -280,15 +242,6 @@ private:
     // Read by cancel_in_flight() to know which req_id to target. 0 means
     // no synth in flight → cancel is a no-op.
     std::atomic<uint32_t>      current_synth_req_id_{0};
-
-    // Phase-2 streaming-alignment session state. Set by
-    // begin_streaming_align; reset on finalize. Holds the parent-side
-    // word list (echoed in the FA worker's response so the client can
-    // index by word_index without trusting the order).
-    std::vector<std::string>   stream_align_words_;
-    int                        stream_align_pcm_sr_ = 0;
-    bool                       stream_align_active_ = false;
-    bool                       stream_align_has_sent_any_ = false;
 };
 
 // Worker-side dispatch loop. Called from main() when --worker <fd> is
@@ -297,16 +250,6 @@ private:
 //
 // Returns the process exit code (0 on clean shutdown).
 int run_worker_loop(int fd);
-
-// Aligner-only dispatch loop. Called from main() when --worker-aligner
-// <fd> is passed. Skips talker/vocoder/spk-encoder loads and only
-// services ALIGN_PARTIAL_REQ / ALIGN_FINAL_REQ / LOAD_REQ / PING /
-// SHUTDOWN. Sibling subprocess of the full worker; lets streaming
-// alignment run concurrently with synth on the same GPU (separate CUDA
-// context per process avoids cross-stream contention).
-//
-// Returns the process exit code (0 on clean shutdown).
-int run_aligner_worker_loop(int fd);
 
 } // namespace qwen3_tts
 
