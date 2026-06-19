@@ -181,6 +181,7 @@ struct ServerCtx {
     std::atomic<int>          inflight{0};
     std::function<bool()>     ensure;     // load engine if needed (spawn in isolation); true=ready
     std::function<bool()>     is_loaded;  // engine currently resident?
+    std::function<std::string()> worker_gpu;  // UUID the resident worker is pinned to ("" if none)
     std::function<void()>     unload;     // release the engine's GPU (SIGKILL child in isolation)
     std::function<void(const std::string&)> set_gpu;  // per-request GPU target (UUID) for placement
 
@@ -226,6 +227,14 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
     srv.Get("/health", [&cx](const httplib::Request&, httplib::Response& res){
         res.set_content(json({{"status","ok"},{"model",cx.model_id},
                               {"loaded", cx.is_loaded()}}).dump(), "application/json");
+    });
+    // GPU residency announce for the koblem gate.
+    srv.Get("/v1/gpu/status", [&cx](const httplib::Request&, httplib::Response& res){
+        const bool loaded = cx.is_loaded();
+        const std::string gpu = (loaded && cx.worker_gpu) ? cx.worker_gpu() : std::string();
+        json body = {{"loaded", loaded}};
+        if (!gpu.empty()) body["gpu"] = gpu; else body["gpu"] = nullptr;
+        res.set_content(body.dump(), "application/json");
     });
     srv.Get("/v1/models", [&cx](const httplib::Request&, httplib::Response& res){
         res.set_content(json({{"object","list"},{"data",{{{"id",cx.model_id},{"object","model"}}}}}).dump(), "application/json");
@@ -728,6 +737,7 @@ int main(int argc, char ** argv) {
         cx.ensure     = [&]{ return session->ensure_loaded(wcfg); };
         cx.set_gpu    = [&](const std::string & g){ session->set_next_gpu(g); };
         cx.is_loaded  = [&]{ return session->is_alive(); };
+        cx.worker_gpu = [&]{ return session->is_alive() ? session->worker_gpu() : std::string(); };
         // unload also drops the aligner sibling (the gate swaps the whole TTS
         // engine out; the aligner's ~0.6-1.1 GB shouldn't linger). io_mutex_-
         // level SIGKILL — no deadlock with the request-level aligner_mtx.
@@ -762,6 +772,7 @@ int main(int argc, char ** argv) {
         inproc->lm().log_vram("ready");
         cx.ensure    = []{ return true; };
         cx.is_loaded = []{ return true; };
+        cx.worker_gpu = []{ return std::string(); };  // in-process: inherits container CVD
         // in-process: synth model stays resident, but the aligner sibling can
         // still be reclaimed (own subprocess).
         cx.unload    = [&]{ if (cx.aligner) cx.aligner->shutdown(); };

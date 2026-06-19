@@ -49,6 +49,8 @@ public:
     pid_t pid() const      { return pid_; }
     int   sample_rate() const { return sample_rate_; }
     const std::string & get_error() const { return last_error_; }
+    // GPU (UUID) the live worker is pinned to. Empty if never spawned.
+    const std::string & worker_gpu() const { return worker_gpu_; }
 
     // GPU placement: default card (UUID) for un-targeted requests + a pending
     // per-request override. next ensure_loaded() relocates if it differs.

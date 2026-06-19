@@ -91,6 +91,8 @@ public:
     bool is_alive() const { return pid_ > 0; }
     pid_t pid() const     { return pid_; }
     const std::string & last_error() const { return last_error_; }
+    // GPU (UUID) the live worker is pinned to. Empty if never spawned.
+    const std::string & worker_gpu() const { return worker_gpu_; }
 
     // Default GPU (UUID) for un-targeted/direct requests. Empty = inherit
     // container CUDA_VISIBLE_DEVICES. Standard env across kob services.

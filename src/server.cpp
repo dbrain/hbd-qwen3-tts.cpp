@@ -1149,6 +1149,17 @@ int main(int argc, char ** argv) {
         res.set_content(health.dump(), "application/json");
     });
 
+    // --- GET /v1/gpu/status --- GPU residency announce for the koblem gate.
+    svr.Get("/v1/gpu/status", [&tts, &worker_session](const httplib::Request &, httplib::Response & res) {
+        const bool loaded = worker_session ? worker_session->is_alive() : tts.is_loaded();
+        json body = {{"loaded", loaded}};
+        if (loaded && worker_session && !worker_session->worker_gpu().empty())
+            body["gpu"] = worker_session->worker_gpu();
+        else
+            body["gpu"] = nullptr;
+        res.set_content(body.dump(), "application/json");
+    });
+
     // --- POST /v1/admin/unload --- release model GPU/CPU buffers.
     // In worker-isolation mode this SIGKILLs the worker subprocess →
     // ALL VRAM (incl. CUDA primary context, cuBLAS workspace, kernel
