@@ -145,16 +145,24 @@ bool HiggsWorkerSession::send_load_req_locked(const HiggsWorkerConfig & cfg) {
 
 bool HiggsWorkerSession::ensure_loaded(const HiggsWorkerConfig & cfg) {
     std::lock_guard<std::mutex> lock(io_mutex_);
+    const std::string want_gpu = next_gpu_.empty() ? default_gpu_ : next_gpu_;
     if (pid_ > 0 && loaded_ok_
+        && worker_gpu_ == want_gpu
         && loaded_cfg_.backbone == cfg.backbone && loaded_cfg_.aux == cfg.aux
         && loaded_cfg_.n_ctx == cfg.n_ctx && loaded_cfg_.kv == cfg.kv
         && loaded_cfg_.aux_enc == cfg.aux_enc) {
         return true;
     }
-    if (pid_ > 0) kill_worker_locked();
+    if (pid_ > 0) {
+        if (worker_gpu_ != want_gpu)
+            fprintf(stderr, "higgs-session: relocating worker '%s' -> '%s'\n",
+                    worker_gpu_.c_str(), want_gpu.c_str());
+        kill_worker_locked();
+    }
 
     const int64_t t0 = now_ms();
-    pid_t child = spawn_worker(argv0_.c_str(), extra_argv_, &fd_, "--higgs-worker");
+    pid_t child = spawn_worker(argv0_.c_str(), extra_argv_, &fd_, "--higgs-worker", want_gpu);
+    worker_gpu_ = want_gpu;
     if (child < 0) { last_error_ = "spawn_worker failed"; return false; }
     pid_ = child;
 

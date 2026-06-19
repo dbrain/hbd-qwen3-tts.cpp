@@ -50,6 +50,13 @@ public:
     int   sample_rate() const { return sample_rate_; }
     const std::string & get_error() const { return last_error_; }
 
+    // GPU placement: default card (UUID) for un-targeted requests + a pending
+    // per-request override. next ensure_loaded() relocates if it differs.
+    void set_default_gpu(std::string gpu) { default_gpu_ = std::move(gpu); }
+    void set_next_gpu(const std::string & gpu) {
+        if (!gpu.empty()) { std::lock_guard<std::mutex> lk(io_mutex_); next_gpu_ = gpu; }
+    }
+
     // ── synth surface mirroring HiggsTTS (engine-agnostic server handler) ──
     bool synthesize(const std::string & text, const gen_params & gp, gen_result & out);
 
@@ -109,6 +116,9 @@ private:
     std::vector<std::string> extra_argv_;
     HiggsWorkerConfig        loaded_cfg_;
     bool                     loaded_ok_ = false;
+    std::string              default_gpu_;   // CVD for un-targeted spawns
+    std::string              next_gpu_;      // pending per-request target
+    std::string              worker_gpu_;    // GPU the live worker is pinned to
 
     pid_t                    pid_ = -1;
     int                      fd_  = -1;

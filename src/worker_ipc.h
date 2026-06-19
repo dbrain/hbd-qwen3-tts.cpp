@@ -162,7 +162,8 @@ bool unpack_audio_payload(const std::vector<uint8_t> & payload,
 pid_t spawn_worker(const char * self_argv0,
                    const std::vector<std::string> & extra_argv,
                    int * out_parent_fd,
-                   const char * role_flag = "--worker");
+                   const char * role_flag = "--worker",
+                   const std::string & cuda_visible_devices = "");
 
 } // namespace qwen3_tts
 

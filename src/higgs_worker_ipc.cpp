@@ -139,7 +139,8 @@ bool unpack_payload(const std::vector<uint8_t> & payload,
 pid_t spawn_worker(const char * self_argv0,
                    const std::vector<std::string> & extra_argv,
                    int * out_parent_fd,
-                   const char * role_flag) {
+                   const char * role_flag,
+                   const std::string & cuda_visible_devices) {
     int sv[2];
     if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
         fprintf(stderr, "higgs spawn_worker: socketpair failed: %s\n", strerror(errno));
@@ -157,6 +158,9 @@ pid_t spawn_worker(const char * self_argv0,
     }
     if (pid == 0) {
         ::close(parent_fd);
+        if (!cuda_visible_devices.empty()) {
+            ::setenv("CUDA_VISIBLE_DEVICES", cuda_visible_devices.c_str(), 1);
+        }
         char fd_buf[16];
         std::snprintf(fd_buf, sizeof(fd_buf), "%d", worker_fd);
         std::vector<std::string> owned;

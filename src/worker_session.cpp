@@ -354,7 +354,9 @@ bool WorkerSession::ensure_loaded(const WorkerLoadConfig & cfg) {
     // If config matches and worker is alive, we're good. voice_archive_dir
     // and model_id aren't part of the cache key — they only affect the
     // worker's startup warmup scan, which is idempotent on respawn.
+    const std::string want_gpu = next_gpu_.empty() ? default_gpu_ : next_gpu_;
     if (pid_ > 0 && loaded_ok_
+        && worker_gpu_ == want_gpu
         && loaded_cfg_.model == cfg.model
         && loaded_cfg_.vocoder == cfg.vocoder
         && loaded_cfg_.speaker_encoder == cfg.speaker_encoder
@@ -362,11 +364,17 @@ bool WorkerSession::ensure_loaded(const WorkerLoadConfig & cfg) {
         return true;
     }
 
-    // Different config (or first load) → kill any existing worker, respawn.
-    if (pid_ > 0) kill_worker_locked();
+    // Different config/GPU (or first load) → kill any existing worker, respawn.
+    if (pid_ > 0) {
+        if (worker_gpu_ != want_gpu)
+            fprintf(stderr, "worker-session[synth]: relocating worker '%s' -> '%s'\n",
+                    worker_gpu_.c_str(), want_gpu.c_str());
+        kill_worker_locked();
+    }
 
     const int64_t t_spawn_start = ggml_time_ms();
-    pid_t child = spawn_worker(argv0_.c_str(), extra_argv_, &fd_, "--worker");
+    pid_t child = spawn_worker(argv0_.c_str(), extra_argv_, &fd_, "--worker", want_gpu);
+    worker_gpu_ = want_gpu;
     if (child < 0) {
         last_error_ = "spawn_worker failed";
         return false;

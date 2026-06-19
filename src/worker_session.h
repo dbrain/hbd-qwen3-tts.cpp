@@ -92,6 +92,16 @@ public:
     pid_t pid() const     { return pid_; }
     const std::string & last_error() const { return last_error_; }
 
+    // Default GPU (UUID) for un-targeted/direct requests. Empty = inherit
+    // container CUDA_VISIBLE_DEVICES. Standard env across kob services.
+    void set_default_gpu(std::string gpu) { default_gpu_ = std::move(gpu); }
+    // Per-request GPU override (from the request's `gpu` field). Only updates
+    // on a non-empty value, so a worker stays put for un-targeted requests.
+    // The next ensure_loaded() relocates (kill+respawn) if it differs.
+    void set_next_gpu(const std::string & gpu) {
+        if (!gpu.empty()) { std::lock_guard<std::mutex> lk(io_mutex_); next_gpu_ = gpu; }
+    }
+
     // Vocoder output sample rate, populated from LOAD_RESP. The parent
     // doesn't have a Qwen3TTS instance to query directly. Returns 0 if
     // the worker hasn't loaded yet.
@@ -224,6 +234,9 @@ private:
     std::vector<std::string>   extra_argv_;
     WorkerLoadConfig           loaded_cfg_;
     bool                       loaded_ok_ = false;
+    std::string                default_gpu_;   // CVD for un-targeted spawns
+    std::string                next_gpu_;      // pending per-request target
+    std::string                worker_gpu_;    // GPU the live worker is pinned to
 
     pid_t                      pid_ = -1;
     int                        fd_  = -1;

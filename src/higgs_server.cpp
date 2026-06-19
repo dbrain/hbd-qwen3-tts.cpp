@@ -182,6 +182,7 @@ struct ServerCtx {
     std::function<bool()>     ensure;     // load engine if needed (spawn in isolation); true=ready
     std::function<bool()>     is_loaded;  // engine currently resident?
     std::function<void()>     unload;     // release the engine's GPU (SIGKILL child in isolation)
+    std::function<void(const std::string&)> set_gpu;  // per-request GPU target (UUID) for placement
 
     // ── forced-alignment (word-highlight read-along) sibling ──
     // The aligner is a SEPARATE subprocess (own CUDA context) lazy-spawned on the
@@ -353,6 +354,8 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
 
         const bool long_form = body.value("long", false);
         higgs::gen_params gp; fill_params(body, gp, long_form);
+        // Per-request GPU target (gate placement) before ensure() relocates.
+        if (cx.set_gpu) cx.set_gpu(body.value("gpu", std::string()));
         // Activity BEFORE ensure() — see trial-save note (cold-start load race).
         Activity act(cx);
         if (!cx.ensure()) return err_json(res,503,"engine load failed");
@@ -718,7 +721,12 @@ int main(int argc, char ** argv) {
 
     if (isolation) {
         session = std::make_unique<higgs::HiggsWorkerSession>(argv[0]);
+        if (const char * g = std::getenv("WORKER_DEFAULT_GPU")) {
+            session->set_default_gpu(g);
+            fprintf(stderr, "higgs worker-isolation: default GPU = %s\n", g);
+        }
         cx.ensure     = [&]{ return session->ensure_loaded(wcfg); };
+        cx.set_gpu    = [&](const std::string & g){ session->set_next_gpu(g); };
         cx.is_loaded  = [&]{ return session->is_alive(); };
         // unload also drops the aligner sibling (the gate swaps the whole TTS
         // engine out; the aligner's ~0.6-1.1 GB shouldn't linger). io_mutex_-

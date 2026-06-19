@@ -881,6 +881,12 @@ int main(int argc, char ** argv) {
             child_argv.push_back(a);
         }
         worker_session = std::make_unique<qwen3_tts::WorkerSession>(argv[0], child_argv);
+        // Default GPU (UUID) for un-targeted/direct requests; per-request `gpu`
+        // field overrides. Standard env across kob services.
+        if (const char * g = std::getenv("WORKER_DEFAULT_GPU")) {
+            worker_session->set_default_gpu(g);
+            fprintf(stderr, "worker-isolation: default GPU = %s\n", g);
+        }
         // Aligner sibling reuses the same child_argv (it ignores model /
         // vocoder / spk_enc); the FA model path propagates through LOAD_REQ.
         aligner_session = std::make_unique<fa::AlignerSession>(argv[0], child_argv);
@@ -1710,6 +1716,10 @@ int main(int argc, char ** argv) {
                             "application/json");
             return;
         }
+
+        // Per-request GPU target (gate placement). The next ensure_loaded()
+        // relocates the worker if this differs from where it's resident.
+        if (worker_session) worker_session->set_next_gpu(body.value("gpu", std::string()));
 
         // Input length cap. OpenAI's spec says 4096, but qwen3-tts has a
         // 4096-token context, and English averages ~3.5 chars/token, so we
