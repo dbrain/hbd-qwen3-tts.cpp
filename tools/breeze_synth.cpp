@@ -7,10 +7,12 @@
 //                [--temp 0.9] [--seed 42] [--repeat 5] [--stream 12] -o out.wav
 
 #include "breeze_tts.h"
+#include "audio_tokenizer_decoder.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -122,6 +124,146 @@ int main(int argc, char ** argv) {
                std::chrono::steady_clock::now() - t0).count());
     eng.log_vram("loaded");
 
+    // --roundtrip: encode a wav with our Mimi encoder and decode it straight
+    // back. Splits "our codec is wrong" from "everything upstream is wrong"
+    // without needing any reference intermediates -- feed it audio that is
+    // KNOWN good and see whether the codec alone can carry it.
+    const std::string rt = argval(argc, argv, "--roundtrip", "");
+    if (!rt.empty()) {
+        std::vector<float> pcm;
+        if (!read_wav_24k(rt, pcm)) { fprintf(stderr, "cannot read %s\n", rt.c_str()); return 1; }
+        std::vector<int32_t> codes; int T = 0;
+        if (!eng.encode_voice(pcm.data(), (int) pcm.size(), codes, T)) {
+            fprintf(stderr, "encode: %s\n", eng.get_error().c_str()); return 1;
+        }
+        std::vector<float> out;
+        if (!eng.decode_codes(codes.data(), T, out)) {
+            fprintf(stderr, "decode: %s\n", eng.get_error().c_str()); return 1;
+        }
+        printf("roundtrip: %zu samples -> %d frames -> %zu samples\n", pcm.size(), T, out.size());
+        write_wav(outp, out, eng.sample_rate());
+        printf("wrote %s\n", outp.c_str());
+        return 0;
+    }
+
+    // --tf-bin: teacher-force on a raw int32 [T,16] code matrix (e.g. dumped from
+    // the reference). Same statistic as --teacher-force but with no encoder in
+    // the loop, so it compares OUR backbone against the reference's directly.
+    const std::string tb = argval(argc, argv, "--tf-bin", "");
+    if (!tb.empty()) {
+        FILE * f = fopen(tb.c_str(), "rb");
+        if (!f) { fprintf(stderr, "cannot read %s\n", tb.c_str()); return 1; }
+        fseek(f, 0, SEEK_END); long nb = ftell(f); fseek(f, 0, SEEK_SET);
+        std::vector<int32_t> codes(nb / 4);
+        if (fread(codes.data(), 1, nb, f) != (size_t) nb) { fclose(f); return 1; }
+        fclose(f);
+        const int T = (int) (codes.size() / 16);
+        std::vector<int> ranks; std::vector<float> lps;
+        if (!eng.teacher_force(text, gp, codes.data(), T, ranks, lps)) {
+            fprintf(stderr, "teacher_force: %s\n", eng.get_error().c_str()); return 1;
+        }
+        double mr = 0, mlp = 0; int top1 = 0, top10 = 0;
+        for (size_t i = 0; i < ranks.size(); ++i) {
+            mr += ranks[i]; mlp += lps[i];
+            if (ranks[i] == 0) top1++;
+            if (ranks[i] < 10) top10++;
+        }
+        const int n = (int) ranks.size();
+        printf("tf-bin over %d frames: mean rank %.1f  top1 %.1f%%  top10 %.1f%%  mean logprob %.3f\n",
+               n, mr / n, 100.0 * top1 / n, 100.0 * top10 / n, mlp / n);
+        printf("  first 16 ranks:");
+        for (int i = 0; i < std::min(16, n); ++i) printf(" %d", ranks[i]);
+        printf("\n");
+        return 0;
+    }
+
+    // --encode-bin: encode a wav to Mimi codes and dump raw int32 [T,16].
+    const std::string eb = argval(argc, argv, "--encode-bin", "");
+    if (!eb.empty()) {
+        std::vector<float> pcm;
+        if (!read_wav_24k(eb, pcm)) { fprintf(stderr, "cannot read %s\n", eb.c_str()); return 1; }
+        std::vector<int32_t> codes; int T = 0;
+        if (!eng.encode_voice(pcm.data(), (int) pcm.size(), codes, T)) {
+            fprintf(stderr, "encode: %s\n", eng.get_error().c_str()); return 1;
+        }
+        FILE * f = fopen(outp.c_str(), "wb");
+        fwrite(codes.data(), 4, codes.size(), f); fclose(f);
+        printf("encode-bin: %d frames -> %s\n", T, outp.c_str());
+        return 0;
+    }
+
+    // --tokenizer <gguf>: decode the codes with the REAL Qwen3-TTS 12.5 Hz audio
+    // tokenizer (audio_tokenizer/model.safetensors) instead of the Mimi that ships
+    // inside the Breeze checkpoint. The checkpoint's `codec_model` is a decoy: the
+    // backbone emits codes in THIS codec's space, and Mimi turns them into fluent
+    // speech that says the wrong words.
+    // --decode-bin: decode a raw int32 [T,16] frame-major code matrix (e.g. dumped
+    // from the reference AR loop) with our codec. Isolates "whose codes" from
+    // "whose codec".
+    const std::string db = argval(argc, argv, "--decode-bin", "");
+    if (!db.empty()) {
+        FILE * f = fopen(db.c_str(), "rb");
+        if (!f) { fprintf(stderr, "cannot read %s\n", db.c_str()); return 1; }
+        fseek(f, 0, SEEK_END); long nb = ftell(f); fseek(f, 0, SEEK_SET);
+        std::vector<int32_t> codes(nb / 4);
+        if (fread(codes.data(), 1, nb, f) != (size_t) nb) { fclose(f); return 1; }
+        fclose(f);
+        const int T = (int) (codes.size() / 16);
+        std::vector<float> out;
+        const std::string tokg = argval(argc, argv, "--tokenizer", "");
+        int sr = eng.sample_rate();
+        if (!tokg.empty()) {
+            qwen3_tts::AudioTokenizerDecoder dec;
+            if (!dec.load_model(tokg)) { fprintf(stderr, "tokenizer load failed\n"); return 1; }
+            if (!dec.decode(codes.data(), T, out)) { fprintf(stderr, "tokenizer decode failed\n"); return 1; }
+            sr = 24000;
+        } else if (!eng.decode_codes(codes.data(), T, out)) {
+            fprintf(stderr, "decode: %s\n", eng.get_error().c_str()); return 1;
+        }
+        printf("decode-bin: %d frames -> %zu samples (%.2f s)\n", T, out.size(),
+               out.size() / (double) sr);
+        write_wav(outp, out, sr);
+        printf("wrote %s\n", outp.c_str());
+        return 0;
+    }
+
+    // --teacher-force: take KNOWN-GOOD audio, encode it to codes, then ask our
+    // model how well it predicts those codes given our prompt. If the text
+    // conditioning works the true codebook-0 code should rank near the top at
+    // every step; if the conditioning is broken the ranks are ~uniform over
+    // 2048 and the model is simply talking to itself.
+    const std::string tf = argval(argc, argv, "--teacher-force", "");
+    if (!tf.empty()) {
+        std::vector<float> pcm;
+        if (!read_wav_24k(tf, pcm)) { fprintf(stderr, "cannot read %s\n", tf.c_str()); return 1; }
+        std::vector<int32_t> codes; int T = 0;
+        if (!eng.encode_voice(pcm.data(), (int) pcm.size(), codes, T)) {
+            fprintf(stderr, "encode: %s\n", eng.get_error().c_str()); return 1;
+        }
+        std::vector<int> ranks;
+        std::vector<float> lps;
+        if (!eng.teacher_force(text, gp, codes.data(), T, ranks, lps)) {
+            fprintf(stderr, "teacher_force: %s\n", eng.get_error().c_str()); return 1;
+        }
+        double mr = 0, mlp = 0; int top1 = 0, top10 = 0;
+        for (size_t i = 0; i < ranks.size(); ++i) {
+            mr += ranks[i]; mlp += lps[i];
+            if (ranks[i] == 0) top1++;
+            if (ranks[i] < 10) top10++;
+        }
+        const int n = (int) ranks.size();
+        printf("teacher-force over %d frames of KNOWN-GOOD codes:\n", n);
+        printf("  mean rank of the true code : %8.1f   (uniform over 2048 would be ~1024)\n", mr / n);
+        printf("  top-1 hit rate             : %8.1f%%\n", 100.0 * top1 / n);
+        printf("  top-10 hit rate            : %8.1f%%\n", 100.0 * top10 / n);
+        printf("  mean log-prob of true code : %8.3f   (uniform would be %.3f)\n",
+               mlp / n, -std::log(2048.0));
+        printf("  first 16 ranks             :");
+        for (int i = 0; i < std::min(16, n); ++i) printf(" %d", ranks[i]);
+        printf("\n");
+        return 0;
+    }
+
     breeze::ref_voice ref;
     const std::string refw = argval(argc, argv, "--ref-wav", "");
     if (!refw.empty()) {
@@ -175,6 +317,15 @@ int main(int argc, char ** argv) {
     }
     breeze::prof_dump_all();   // BREEZE_PROF=1
     eng.log_vram("after");
+
+    // --dump-codes: write the raw int32 [T,16] frames we generated, so they can be
+    // decoded by a reference codec and compared independently of our vocoder.
+    const std::string dc = argval(argc, argv, "--dump-codes", "");
+    if (!dc.empty()) {
+        FILE * cf = fopen(dc.c_str(), "wb");
+        if (cf) { fwrite(r.codes.data(), 4, r.codes.size(), cf); fclose(cf);
+                  printf("dumped %d frames to %s\n", r.T, dc.c_str()); }
+    }
 
     write_wav(outp, r.pcm, eng.sample_rate());
     printf("wrote %s (%zu samples)\n", outp.c_str(), r.pcm.size());
