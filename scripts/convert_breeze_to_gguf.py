@@ -7,7 +7,17 @@ Breeze is four models in one checkpoint:
   text_encoder      T5Gemma2 encoder, 26 layers, 1152 hidden, GQA 4/1, head_dim 256
   backbone_model    Qwen3ForCausalLM, 28 layers, 2048 hidden, GQA 16/8, QK-norm
   depth_decoder     12 layers, 1024 hidden, 16 codebooks, NO QK-norm
-  codec_model       Mimi, 12.5 Hz / 24 kHz, 32 quantizers (16 valid)
+  audio_tokenizer   Qwen3TTSTokenizerV2, 12.5 Hz / 24 kHz, 16 codebooks -- THE codec
+
+The `codec_model.*` tensors inside model-0000?-of-00002.safetensors are a decoy: a
+complete standalone Mimi that the backbone does NOT emit codes for. The real audio
+tokenizer is a SEPARATE 682 MB file, `audio_tokenizer/model.safetensors`, which the
+HF "Files" list shows but a naive top-level download misses. Decoding Breeze codes
+with the bundled Mimi yields fluent, correctly-paced speech that says the wrong
+words -- it reads as a text-conditioning bug and is not one. So we drop `codec.*`
+entirely and emit the audio tokenizer under the same `tok_enc.*` / `tok_dec.*`
+names that src/audio_tokenizer_decoder.cpp and src/audio_codec_encoder.cpp already
+read for qwen3-tts.
 
 Naming follows scripts/convert_tts_to_gguf.py: flat, llama.cpp-ish, one prefix per
 subsystem -- text_enc.* / backbone.* / depth.* / codec.*.
@@ -41,6 +51,14 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
 
 ARCH = "breeze-tts"
+
+# The audio tokenizer IS the qwen3-tts 12.5 Hz tokenizer, tensor-for-tensor, so its
+# name mapping lives in one place: convert_tokenizer_to_gguf.py. Importing the class
+# keeps the two converters from drifting apart.
+def _tok_converter(at_dir):
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from convert_tokenizer_to_gguf import Qwen3TTSTokenizerConverter
+    return Qwen3TTSTokenizerConverter(at_dir, Path("/dev/null"), "f16")
 
 # ---------------------------------------------------------------------------
 # Tensors we deliberately do not emit.
@@ -110,6 +128,11 @@ class SafeTensorsShard:
 
 def _drop(name: str) -> bool:
     if name in DROP_EXACT:
+        return True
+    # The checkpoint's `codec_model.*` is a standalone Mimi that the backbone does
+    # NOT emit codes for -- see the module docstring. Never emit it; the real codec
+    # comes from audio_tokenizer/ via _emit_audio_tokenizer().
+    if name.startswith("codec_model."):
         return True
     m = re.match(r"codec_model\.quantizer\.acoustic_residual_vector_quantizer\.layers\.(\d+)\.", name)
     if m and int(m.group(1)) >= N_VALID_ACOUSTIC:
@@ -205,9 +228,11 @@ def map_name(hf: str) -> str | None:
 #       normalized_codebook = embed_sum / max(cluster_usage, 1e-5)
 #   at load; quantizing either side wrecks the division.
 #   conv weights: our ggml_conv_1d_direct CUDA kernel asserts F16 weights.
-# gguf-py can only *write* the legacy quants (no K-quants), which is fine: the
-# depth decoder and backbone are bandwidth-bound at batch 1, so what matters is
-# bytes-per-weight, and Q4_0/Q5_0 have well-tuned CUDA MMVQ kernels.
+# gguf-py can only *write* the legacy quants -- it has no K-quant encoder at all.
+# That is a gap in this script, NOT a design choice: house standard is Q8_0 or a
+# K-quant, never a legacy qN_0 (Q4_0's weight relerr is 0.086 against Q4_K's
+# ~0.03). Emit f16/q8_0 here and requantise with tools/gguf_requant for anything
+# 4- or 5-bit.
 _QUANTS = {
     "f32":  None, "f16": None,
     "q8_0": "Q8_0", "q5_1": "Q5_1", "q5_0": "Q5_0", "q4_1": "Q4_1", "q4_0": "Q4_0",
@@ -221,6 +246,10 @@ def pick_dtype(name, arr, out_type):
         return arr.astype(np.float32), gguf.GGMLQuantizationType.F32
     if name.endswith((".cluster_usage", ".embed_sum")):
         return arr.astype(np.float32), gguf.GGMLQuantizationType.F32
+    # Vocoder codebooks and per-channel activation params (Snake alpha/beta,
+    # ConvNeXt gamma, LayerScale) are tiny and quantisation-sensitive.
+    if name.endswith((".codebook", ".usage", ".alpha", ".beta", ".gamma")) or ".norm." in name:
+        return arr.astype(np.float16), gguf.GGMLQuantizationType.F16
     if ".conv." in name or name.endswith(".conv.weight"):
         # conv-1d-direct.cu: GGML_ASSERT(a->type == GGML_TYPE_F16)
         return arr.astype(np.float16), gguf.GGMLQuantizationType.F16
@@ -289,6 +318,64 @@ def _emit_tokenizer(writer, model_dir, log):
              n_vocab, len(merges), len(added))
 
 
+def _emit_audio_tokenizer(writer, at_dir, out_type, sub_type, log):
+    """Emit audio_tokenizer/model.safetensors as tok_enc.* / tok_dec.*.
+
+    Codebooks are stored as `embed_sum` + `cluster_usage` and must be divided, not
+    written raw -- same rule as the qwen3-tts converter.
+    """
+    import numpy as np
+    import gguf
+    from safetensors import safe_open
+
+    conv = _tok_converter(at_dir)
+    files = sorted(at_dir.glob("*.safetensors"))
+    if not files:
+        raise FileNotFoundError(f"no safetensors in {at_dir}")
+
+    writer.add_array("qwen3-tts-tokenizer.upsample_rates",
+                     [int(x) for x in conv.upsample_rates])
+    writer.add_uint32("qwen3-tts-tokenizer.sample_rate", int(conv.sample_rate))
+    writer.add_uint32("qwen3-tts-tokenizer.num_codebooks", int(conv.decoder_num_quantizers))
+    writer.add_uint32("qwen3-tts-tokenizer.codebook_size", int(conv.decoder_codebook_size))
+    writer.add_uint32("qwen3-tts-tokenizer.semantic_codebook_size",
+                      int(conv.decoder_semantic_codebook_size))
+    writer.add_uint32("qwen3-tts-tokenizer.encoder_valid_num_quantizers",
+                      int(conv.encoder_valid_quantizers))
+
+    raw = {}
+    for f in files:
+        with safe_open(f, framework="pt", device="cpu") as h:
+            for k in h.keys():
+                raw[k] = h.get_tensor(k)
+
+    SUMS = ("embedding_sum", "embed_sum")
+    def sum_suffix(n):
+        for suf in SUMS:
+            if suf in n:
+                return suf
+        return None
+
+    n = 0
+    for hf in sorted(raw):
+        name = conv._map_tensor_name(hf)
+        if name is None or "cluster_usage" in hf:
+            continue
+        t = raw[hf]
+        suf = sum_suffix(hf)
+        if suf:
+            usage = raw.get(hf.replace(suf, "cluster_usage"))
+            if usage is None:
+                raise RuntimeError(f"{hf} has no paired cluster_usage; codebook would be wrong")
+            t = t / usage.clamp(min=1e-5).unsqueeze(1)
+        arr = t.float().numpy() if t.dtype.is_floating_point else t.numpy()
+        data, dt = pick_dtype(name, arr, sub_type(name))
+        writer.add_tensor(name, data, raw_dtype=dt)
+        n += 1
+    log.info("audio tokenizer: %d tensors (tok_enc.* / tok_dec.*)", n)
+    return n
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -298,8 +385,11 @@ def main() -> int:
     # Per-subsystem overrides. The depth decoder is re-read 15x per 80 ms frame
     # and the backbone once, so their bytes-per-weight dominates RTF; the text
     # encoder runs once per request and only costs VRAM.
-    for sub in ("text-enc", "backbone", "depth", "codec"):
+    for sub in ("text-enc", "backbone", "depth", "codec", "tok-enc", "tok-dec"):
         ap.add_argument(f"--type-{sub}", default=None, choices=list(_QUANTS))
+    ap.add_argument("--audio-tokenizer", type=Path, default=None,
+                    help="audio_tokenizer/ directory (default: <input>/audio_tokenizer). "
+                         "This is THE codec; a checkout without it cannot make audio.")
     ap.add_argument("--dry-run", action="store_true",
                     help="validate the name mapping without reading tensor data")
     args = ap.parse_args()
@@ -353,7 +443,8 @@ def main() -> int:
         return 0
 
     subs = {"text_enc.": args.type_text_enc, "backbone.": args.type_backbone,
-            "depth.": args.type_depth, "codec.": args.type_codec}
+            "depth.": args.type_depth, "codec.": args.type_codec,
+            "tok_enc.": args.type_tok_enc, "tok_dec.": args.type_tok_dec}
 
     def sub_type(name):
         for pfx, t in subs.items():
@@ -511,6 +602,14 @@ def main() -> int:
     data, dt = pick_dtype("depth.codebooks_head.weight", head_t, sub_type("depth.codebooks_head.weight"))
     writer.add_tensor("depth.codebooks_head.weight", data, raw_dtype=dt)
 
+    at_dir = args.audio_tokenizer or (args.input / "audio_tokenizer")
+    if not (at_dir / "config.json").is_file():
+        log.error("no audio tokenizer at %s -- download audio_tokenizer/ from the HF repo "
+                  "(model.safetensors is a SEPARATE 682 MB file). Without it the GGUF "
+                  "produces fluent speech that says the wrong words.", at_dir)
+        return 1
+    n_at = _emit_audio_tokenizer(writer, at_dir, args.type, sub_type, log)
+
     shards = sorted({weight_map[h] for h in mapped})
     log.info("reading %d shard(s)", len(shards))
     n = 0
@@ -528,7 +627,7 @@ def main() -> int:
                     log.info("  %s  %d/%d", shard, i, len(todo))
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    log.info("writing %s (%d tensors)", args.output, n)
+    log.info("writing %s (%d tensors + %d audio-tokenizer)", args.output, n, n_at)
     writer.write_header_to_file(path=args.output)
     writer.write_kv_data_to_file()
     writer.write_tensors_to_file(progress=True)

@@ -1187,12 +1187,18 @@ struct ggml_tensor * AudioTokenizerDecoder::apply_decoder_block(struct ggml_cont
      int64_t new_seq_len = x_2d->ne[0];
      x = ggml_reshape_3d(ctx, x_2d, new_seq_len, out_channels, 1);
 
-     // Python CausalTransConvNet: left_pad = right_pad = kernel_size - stride.
-     // For Qwen decoder blocks kernel = 2*stride so left_pad == right_pad == stride.
+     // Qwen3TTSTokenizerV2CausalTransConvNet trims the RIGHT ONLY:
+     //     pad = kernel_size - stride;  self.left_pad = 0;  self.right_pad = pad
+     //     hidden_state[..., : L - self.right_pad]
+     // This used to set left_pad = pad as well, which silently dropped `stride`
+     // output samples per block. Cost at the waveform: with strides [8,5,4,3]
+     // that is 8*(5*4*3) + 5*(4*3) + 4*3 + 3 = 480+60+12+3 = 555 samples of the
+     // head, 23 ms at 24 kHz, on every utterance. Output length is now the
+     // exact frames * 1920 the reference produces.
      int pad = kernel_size - upsample_rate;
-     int left_pad = pad;
+     int left_pad = 0;
      int right_pad = pad;
-     int64_t out_seq_len = new_seq_len - left_pad - right_pad;
+     int64_t out_seq_len = new_seq_len - right_pad;
 
      if (!streaming_mode_) {
          x = ggml_view_3d(ctx, x, out_seq_len, out_channels, 1,
@@ -1252,6 +1258,8 @@ struct ggml_tensor * AudioTokenizerDecoder::apply_decoder_block(struct ggml_cont
              raw->nb[1], raw->nb[2], raw->nb[3], 0);
          // emit [left_pad : new_seq_len - s] on the first chunk (n_past==0),
          // else [0 : new_seq_len - s]. right-tail (last s) is always held back.
+         // left_pad is 0 now (causal: trim right only), so the first chunk keeps
+         // its head — which is what makes streaming and buffered agree.
          int64_t emit_start = (n_past_ == 0) ? (int64_t) left_pad : 0;
          int64_t emit_len = (new_seq_len - s) - emit_start;
          x = ggml_view_3d(ctx, raw_acc, emit_len, out_channels, 1,

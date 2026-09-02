@@ -22,7 +22,15 @@
 #include "breeze_text_enc.h"
 #include "breeze_lm.h"
 #include "breeze_depth.h"
-#include "breeze_codec.h"
+// The codec is the Qwen3-TTS 12.5 Hz audio tokenizer, NOT the Mimi that ships
+// inside the Breeze checkpoint under `codec_model.*`. That Mimi is a decoy: the
+// backbone emits codes in the tokenizer's space, and decoding them with Mimi
+// gives fluent, correctly-paced speech that says the wrong words. Both halves
+// already existed in this repo for qwen3-tts, so we reuse them verbatim --
+// including the decoder's true streaming state (KV cache + causal-conv tails),
+// which replaces the old prefix-re-decode loop.
+#include "audio_tokenizer_decoder.h"
+#include "audio_codec_encoder.h"
 
 #include <atomic>
 #include <chrono>
@@ -84,6 +92,17 @@ public:
 
     // 24 kHz mono in -> Mimi codes, for voice cloning.
     bool encode_voice(const float * pcm, int n_samples, std::vector<int32_t> & codes, int & T);
+    // Mimi codes -> 24 kHz mono. Exposed so a caller can round-trip known-good
+    // audio through the codec alone and isolate it from the AR loop.
+    bool decode_codes(const int32_t * codes, int T, std::vector<float> & pcm);
+
+    // Diagnostic: prefill `text`'s prompt, then walk the given TRUE code frames
+    // through the backbone, reporting for each frame the rank and log-prob our
+    // lm_head assigns to the true codebook-0 code. Localises "the model is not
+    // conditioned on the text" versus "the sampler or the loop is wrong".
+    bool teacher_force(const std::string & text, const gen_params & gp,
+                       const int32_t * codes, int T,
+                       std::vector<int> & ranks, std::vector<float> & logprobs);
 
     void request_cancel() { cancel_.store(true, std::memory_order_relaxed); }
     void clear_cancel()   { cancel_.store(false, std::memory_order_relaxed); }
@@ -110,7 +129,8 @@ private:
     TextEncoder   te_;
     Backbone      bb_;
     DepthDecoder  dd_;
-    MimiCodec     cc_;
+    qwen3_tts::AudioTokenizerDecoder cc_;
+    qwen3_tts::AudioCodecEncoder      ce_;
     bool loaded_ = false;
     std::atomic<bool> cancel_{false};
     std::string error_msg_;

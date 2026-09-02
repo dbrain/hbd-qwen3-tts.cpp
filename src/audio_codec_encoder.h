@@ -118,6 +118,14 @@ public:
                 std::vector<int32_t> & codes, int32_t & n_frames);
 
     const codec_encoder_config & get_config() const { return model_.config; }
+
+    size_t weights_bytes() const {
+        return model_.buffer ? ggml_backend_buffer_get_size(model_.buffer) : 0;
+    }
+    size_t sched_bytes() const {
+        return (state_.sched && state_.backend)
+                   ? ggml_backend_sched_get_buffer_size(state_.sched, state_.backend) : 0;
+    }
     const std::string & get_error() const { return error_msg_; }
 
 private:

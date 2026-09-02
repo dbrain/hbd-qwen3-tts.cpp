@@ -66,13 +66,19 @@ bool BreezeTTS::load(const std::string & path, int n_ctx) {
     if (!te_.init(&w_))        { error_msg_ = te_.get_error(); return false; }
     if (!bb_.init(&w_, n_ctx)) { error_msg_ = bb_.get_error(); return false; }
     if (!dd_.init(&w_))        { error_msg_ = dd_.get_error(); return false; }
-    if (!cc_.init(&w_))        { error_msg_ = cc_.get_error(); return false; }
+    // Same GGUF, opened again by the vocoder/encoder: they own their own ggml
+    // context and backend (the decoder runs on a dedicated low-priority stream),
+    // and each reads only its own `tok_dec.*` / `tok_enc.*` prefix.
+    if (!cc_.load_model(path))  { error_msg_ = "audio tokenizer decoder failed to load"; return false; }
+    if (!ce_.load_model(path))  { error_msg_ = ce_.get_error(); return false; }
     loaded_ = true;
     return true;
 }
 
 void BreezeTTS::unload() {
     loaded_ = false;
+    cc_.unload_model();
+    ce_.unload_model();
     w_.unload();
 }
 
@@ -156,6 +162,10 @@ bool BreezeTTS::run_ar(const gen_params & gp, int chunk_frames, const pcm_cb * o
     hidden = std::move(prefill_hidden_);
     logits = std::move(prefill_logits_);
 
+    // Frames are [T, NC] row-major; the vocoder takes the same layout.
+    const int n_cb = NC;
+    if (on_chunk && chunk_frames > 0) cc_.stream_reset(gp.max_new_frames);
+
     auto t_dec = clk::now();
     int emitted_frames = 0;
     int next_chunk = chunk_frames > 0 ? chunk_frames : 0;
@@ -191,23 +201,25 @@ bool BreezeTTS::run_ar(const gen_params & gp, int chunk_frames, const pcm_cb * o
         out.codes.insert(out.codes.end(), frame.begin(), frame.end());
         out.T++;
 
-        // Mimi decode is fully causal, so decoding a PREFIX reproduces the
-        // earlier samples exactly -- no cross-chunk artifacts, no hold-back.
-        // The cost is that each emit re-decodes everything so far, which is
-        // O(n^2) at a fixed chunk size. Keep the first chunk small (that IS the
-        // TTFA) and then double up to a cap: same exact audio, ~5x less codec
-        // work on a long paragraph.
+        // The vocoder carries real streaming state (pre-transformer KV slab +
+        // causal-conv tail rings), so each chunk decodes only its OWN frames and
+        // still produces bit-identical audio to a single decode(). The previous
+        // Mimi path re-decoded the whole prefix every emit, which was O(n^2) in
+        // frames and made a long audiobook paragraph quadratically expensive.
         if (on_chunk && chunk_frames > 0 && out.T - emitted_frames >= next_chunk) {
             auto t_c = clk::now();
-            std::vector<float> pcm;
-            if (!cc_.decode(out.codes.data(), out.T, pcm)) { error_msg_ = cc_.get_error(); return false; }
-            out.codec_ms += ms_since(t_c);
-            const size_t done = (size_t) emitted_frames * w_.cfg().cc.samples_per_frame();
-            if (pcm.size() > done) {
-                (*on_chunk)(pcm.data() + done, (int) (pcm.size() - done), false);
-                if (first_chunk) { out.ttfa_ms = ms_since(t_start); first_chunk = false; }
+            std::vector<float> chunk;
+            const int n_new = out.T - emitted_frames;
+            if (!cc_.stream_decode(out.codes.data() + (size_t) emitted_frames * n_cb,
+                                   n_new, chunk)) {
+                error_msg_ = "vocoder stream_decode failed"; return false;
             }
-            out.pcm = std::move(pcm);
+            out.codec_ms += ms_since(t_c);
+            if (!chunk.empty()) {
+                (*on_chunk)(chunk.data(), (int) chunk.size(), false);
+                if (first_chunk) { out.ttfa_ms = ms_since(t_start); first_chunk = false; }
+                out.pcm.insert(out.pcm.end(), chunk.begin(), chunk.end());
+            }
             emitted_frames = out.T;
             next_chunk = std::min(next_chunk * 2, max_chunk);
         }
@@ -223,18 +235,29 @@ bool BreezeTTS::run_ar(const gen_params & gp, int chunk_frames, const pcm_cb * o
     auto t_c = clk::now();
     if (out.T > 0) {
         std::vector<float> pcm;
-        if (!cc_.decode(out.codes.data(), out.T, pcm)) { error_msg_ = cc_.get_error(); return false; }
+        if (on_chunk) {
+            const int n_new = out.T - emitted_frames;
+            if (n_new > 0 && !cc_.stream_decode(out.codes.data() + (size_t) emitted_frames * n_cb,
+                                                n_new, pcm)) {
+                error_msg_ = "vocoder stream_decode failed"; return false;
+            }
+        } else if (!cc_.decode(out.codes.data(), out.T, pcm)) {
+            error_msg_ = "vocoder decode failed"; return false;
+        }
         out.codec_ms += ms_since(t_c);
         if (on_chunk) {
-            const size_t done = (size_t) emitted_frames * w_.cfg().cc.samples_per_frame();
-            if (pcm.size() > done) {
-                (*on_chunk)(pcm.data() + done, (int) (pcm.size() - done), true);
+            if (!pcm.empty()) {
+                (*on_chunk)(pcm.data(), (int) pcm.size(), true);
                 if (first_chunk) { out.ttfa_ms = ms_since(t_start); first_chunk = false; }
             } else {
                 (*on_chunk)(nullptr, 0, true);
             }
+            // Streaming decodes each chunk once, so out.pcm is built by
+            // appending -- assigning here would keep only the final chunk.
+            out.pcm.insert(out.pcm.end(), pcm.begin(), pcm.end());
+        } else {
+            out.pcm = std::move(pcm);
         }
-        out.pcm = std::move(pcm);
     } else if (on_chunk) {
         (*on_chunk)(nullptr, 0, true);
     }
@@ -270,22 +293,69 @@ bool BreezeTTS::synthesize_stream(const std::string & text, const gen_params & g
     return run_ar(gp, chunk_frames, on_chunk ? &on_chunk : nullptr, out);
 }
 
+bool BreezeTTS::teacher_force(const std::string & text, const gen_params & gp,
+                              const int32_t * codes, int T,
+                              std::vector<int> & ranks, std::vector<float> & logprobs) {
+    ranks.clear(); logprobs.clear();
+    if (!loaded_) { error_msg_ = "engine not loaded"; return false; }
+    bb_.reset();
+    std::vector<int32_t> ids;
+    std::vector<float> embeds;
+    double te_ms = 0;
+    if (!build_prompt(text, gp, nullptr, ids, embeds, te_ms)) return false;
+
+    const int NC = w_.cfg().bb.n_codebooks;
+    const int LM = w_.cfg().bb.lm_head_size;
+    std::vector<float> hidden, logits;
+    if (!bb_.prefill_embeds(embeds.data(), (int) ids.size(), hidden, logits)) {
+        error_msg_ = bb_.get_error(); return false;
+    }
+    for (int t = 0; t < T; ++t) {
+        const int true_c0 = codes[(size_t) t * NC];
+        double mx = -1e30;
+        for (int i = 0; i < LM; ++i) mx = std::max(mx, (double) logits[i]);
+        double sum = 0;
+        int rank = 0;
+        for (int i = 0; i < LM; ++i) {
+            sum += std::exp(logits[i] - mx);
+            if (logits[i] > logits[true_c0]) ++rank;
+        }
+        ranks.push_back(rank);
+        logprobs.push_back((float) (logits[true_c0] - mx - std::log(sum)));
+        if (t + 1 < T) {
+            if (!bb_.decode_frame(codes + (size_t) t * NC, hidden, logits)) {
+                error_msg_ = bb_.get_error(); return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool BreezeTTS::decode_codes(const int32_t * codes, int T, std::vector<float> & pcm) {
+    if (!cc_.decode(codes, T, pcm)) { error_msg_ = "vocoder decode failed"; return false; }
+    return true;
+}
+
 bool BreezeTTS::encode_voice(const float * pcm, int n, std::vector<int32_t> & codes, int & T) {
-    if (!cc_.encode(pcm, n, codes, T)) { error_msg_ = cc_.get_error(); return false; }
+    int32_t nf = 0;
+    if (!ce_.encode(pcm, n, codes, nf)) { error_msg_ = ce_.get_error(); return false; }
+    T = (int) nf;
     return true;
 }
 
 void BreezeTTS::log_vram(const char * label) const {
     const double w = w_.weights_bytes() / (1024.0 * 1024.0);
     const double kv = (bb_.kv_bytes() + dd_.kv_bytes()) / (1024.0 * 1024.0);
-    const double sc = (bb_.sched_bytes() + dd_.sched_bytes() + cc_.sched_bytes()) / (1024.0 * 1024.0);
+    const double sc = (bb_.sched_bytes() + dd_.sched_bytes() + cc_.sched_bytes()
+                       + ce_.sched_bytes() + cc_.stream_kv_bytes()) / (1024.0 * 1024.0);
     fprintf(stderr, "  [vram-breeze %-10s] weights=%.1f kv=%.1f sched=%.1f total=%.1f MiB\n",
             label, w, kv, sc, w + kv + sc);
     if (getenv("BREEZE_PROF")) {
         const double M = 1024.0 * 1024.0;
         fprintf(stderr, "  [vram-breeze %-10s]   sched: backbone=%.1f depth=%.1f codec=%.1f "
                 "text_enc=%.1f MiB | kv: backbone=%.1f depth=%.1f MiB\n", label,
-                bb_.sched_bytes() / M, dd_.sched_bytes() / M, cc_.sched_bytes() / M,
+                bb_.sched_bytes() / M, dd_.sched_bytes() / M,
+                (cc_.sched_bytes() + ce_.sched_bytes() + cc_.stream_kv_bytes()) / M,
                 te_.sched_bytes() / M, bb_.kv_bytes() / M, dd_.kv_bytes() / M);
         dd_.log_sched_detail();
     }

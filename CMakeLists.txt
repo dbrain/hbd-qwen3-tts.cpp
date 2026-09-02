@@ -158,6 +158,7 @@ target_link_libraries(audio_codec_encoder PUBLIC
 # Audio tokenizer decoder library (GGML-based)
 add_library(audio_tokenizer_decoder STATIC
     src/audio_tokenizer_decoder.cpp
+    src/audio_codec_encoder.cpp
     src/gguf_loader.cpp
 )
 target_include_directories(audio_tokenizer_decoder PUBLIC
@@ -322,7 +323,14 @@ target_include_directories(breeze_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${GGML_DIR}/include
 )
-target_link_libraries(breeze_core PUBLIC ggml Threads::Threads)
+# The codec halves are the qwen3-tts audio tokenizer, shared verbatim -- link the
+# existing targets rather than compiling the sources a second time.
+target_link_libraries(breeze_core PUBLIC
+    ggml
+    Threads::Threads
+    audio_tokenizer_decoder
+    audio_codec_encoder
+)
 
 # Qwen3 Forced Aligner library — vendored from parakeet.cpp's qwen3-asr +
 # crisp_audio + core helpers. Drives the optional word-timing pass behind
@@ -518,6 +526,11 @@ if(QWEN3_TTS_SERVER)
     endif()
 
     add_executable(breeze_synth tools/breeze_synth.cpp)
+
+# GGUF -> GGUF requantizer (K-quants). gguf-py cannot write them; this can.
+add_executable(gguf_quantize tools/gguf_quantize.cpp)
+target_link_libraries(gguf_quantize PRIVATE ggml)
+target_include_directories(gguf_quantize PRIVATE ${GGML_DIR}/include)
     target_link_libraries(breeze_synth PRIVATE breeze_core)
 
     # Minimal Higgs-Audio-v3 TTS HTTP server (/v1/audio/speech) + fork/IPC

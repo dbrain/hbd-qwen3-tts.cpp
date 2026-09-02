@@ -197,6 +197,18 @@ public:
     // Load model from GGUF file (tokenizer model)
     bool load_model(const std::string & model_path);
 
+    // VRAM accounting for callers that report a per-subsystem breakdown.
+    size_t weights_bytes() const {
+        return model_.buffer ? ggml_backend_buffer_get_size(model_.buffer) : 0;
+    }
+    size_t sched_bytes() const {
+        return (state_.sched && state_.backend)
+                   ? ggml_backend_sched_get_buffer_size(state_.sched, state_.backend) : 0;
+    }
+    size_t stream_kv_bytes() const {
+        return state_.stream_kv.buffer ? ggml_backend_buffer_get_size(state_.stream_kv.buffer) : 0;
+    }
+
     // Release all model/runtime resources
     void unload_model();
     
@@ -212,6 +224,11 @@ public:
     // calls. Call stream_reset() between independent utterances.
     // On the first call (n_past == 0) with the same codes this produces
     // bit-identical PCM to decode(); subsequent chunks continue the stream.
+    // Across a MULTI-chunk stream it is equivalent, not bit-identical: the
+    // carried KV slab and conv tails reassociate the arithmetic, so a 115-frame
+    // utterance at 4-frame chunks differs from the buffered decode by up to
+    // ~2.4e-2 on ~90% of frames (measured, and unchanged since before the
+    // causal-trim fix — it is inherent to the carry, not a regression).
     bool stream_decode(const int32_t * codes, int32_t n_frames,
                        std::vector<float> & samples);
 
