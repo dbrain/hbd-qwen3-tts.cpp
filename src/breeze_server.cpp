@@ -197,7 +197,12 @@ static void fill_params(const json & body, breeze::gen_params & gp) {
     gp.max_new_frames     = body.value("max_new_frames",
                               body.value("max_new_tokens", body.value("max_audio_tokens", 750)));
     gp.speaker            = body.value("speaker", std::string{"S0"});
-    gp.instruction        = body.value("instruction", body.value("voice_description", std::string{}));
+    // kobbler and koblem both send "instructions" (plural) -- qwen3-tts's
+    // spelling. Accepting only the singular silently dropped every voice-design
+    // string with a 200 OK, which is the worst kind of incompatibility.
+    gp.instruction        = body.value("instruction",
+                              body.value("instructions",
+                                body.value("voice_description", std::string{})));
 }
 
 struct ServerCtx {
@@ -252,6 +257,21 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                         "application/json");
     });
 
+    // GET /v1/audio/languages — qwen3-tts parity. Breeze is bilingual by
+    // design ("Generates natural English and Chinese speech with a single
+    // model"), and unlike qwen3-tts it takes no language_id: the id column is
+    // reported as null so a client cannot mistake it for a selectable knob.
+    // The language is inferred from the text, and the vocal-event syntax
+    // differs per language — (laugh) in English, [笑] in Chinese.
+    srv.Get("/v1/audio/languages", [](const httplib::Request &, httplib::Response & res) {
+        json langs = json::array();
+        for (const auto & [code, name] : std::vector<std::pair<std::string, std::string>>{
+                 {"en", "English"}, {"zh", "Chinese"}}) {
+            langs.push_back({{"code", code}, {"id", nullptr}, {"name", name}});
+        }
+        res.set_content(json({{"languages", langs}}).dump(), "application/json");
+    });
+
     // ---- voice library (filesystem; GPU-free — works while the worker is unloaded) ----
     srv.Get("/v1/audio/voices", [&cx](const httplib::Request &, httplib::Response & res) {
         std::lock_guard<std::mutex> lk(cx.mtx);
@@ -259,7 +279,16 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
         for (const auto & v : cx.voices->list())
             arr.push_back({{"id",v.id},{"frames",v.T},{"codebooks",v.N},
                            {"has_ref_text",v.has_ref_text},{"has_sample",v.has_sample}});
-        res.set_content(json({{"model_id",cx.model_id},{"voices",arr}}).dump(), "application/json");
+        // Two shapes in one body. qwen3-tts answers `{"<model_id>": ["default",
+        // "alice", ...]}` and kobbler's parse_voices_body expects exactly that,
+        // so emit it under the model-id key for drop-in compatibility while
+        // keeping our richer {id, frames, codebooks, ...} objects under
+        // "voices". A client that understands either shape works unchanged.
+        json flat = json::array({"default"});
+        for (const auto & v : cx.voices->list()) flat.push_back(v.id);
+        json body_out = {{"model_id", cx.model_id}, {"voices", arr}};
+        body_out[cx.model_id] = flat;
+        res.set_content(body_out.dump(), "application/json");
     });
 
     srv.Post("/v1/audio/voices", [&cx, eng, err_json](const httplib::Request & req, httplib::Response & res) {
@@ -343,6 +372,54 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
         res.set_content("{}", "application/json");
     });
 
+    // ---- standalone forced alignment ----
+    // Align an EXISTING clip against known text, with no synthesis. The SSE
+    // speech path can only align audio it just generated, and the TTS sampler
+    // is not bit-reproducible across runs, so aligner A/B work there compares
+    // two different waveforms. This route pins the audio so aligner changes are
+    // the only variable; it is also what a reader client wants when it already
+    // has the audio cached. Multipart: file=<wav>, text=<transcript>.
+    srv.Post("/v1/audio/alignment", [&cx, err_json](const httplib::Request & req, httplib::Response & res) {
+        if (!cx.aligner || cx.aligner_model.empty())
+            return err_json(res, 400, "no aligner: server started without --aligner-model");
+        const std::string wav = req.has_file("file") ? req.get_file_value("file").content : std::string();
+        const std::string text = req.has_file("text") ? req.get_file_value("text").content
+                               : req.has_param("text") ? req.get_param_value("text") : std::string();
+        if (wav.empty()) return err_json(res, 400, "missing file (wav)");
+        if (text.empty()) return err_json(res, 400, "missing text");
+        std::vector<float> pcm; int sr = 24000;
+        if (!wav_decode(wav, pcm, sr) || pcm.empty())
+            return err_json(res, 400, "could not decode WAV (need PCM s16/f32)");
+        const std::vector<std::string> words = whitespace_split_for_align(text);
+        if (words.empty()) return err_json(res, 400, "no words in text");
+
+        std::lock_guard<std::mutex> lk(cx.aligner_mtx);
+        cx.aligner_inflight.fetch_add(1);
+        cx.aligner_last_activity_ms.store(now_ms());
+        std::vector<fa::AlignedWord> aligned;
+        fa::AlignProfile prof;
+        bool ok = cx.aligner->ensure_loaded(cx.aligner_model)
+               && cx.aligner->begin_streaming_align(words, sr)
+               && cx.aligner->finalize_streaming_align(pcm.data(), pcm.size(),
+                                                       (int64_t) pcm.size() * 1000 / (sr > 0 ? sr : 1),
+                                                       aligned, prof);
+        const std::string err = ok ? std::string() : cx.aligner->last_error();
+        cx.aligner_inflight.fetch_sub(1);
+        cx.aligner_last_activity_ms.store(now_ms());
+        if (!ok) return err_json(res, 500, err.empty() ? "alignment failed" : err);
+        json wj = json::array();
+        for (size_t i = 0; i < aligned.size(); i++)
+            wj.push_back({{"word_index",(int)i},{"text",aligned[i].text},
+                          {"t0_ms",aligned[i].t0_ms},{"t1_ms",aligned[i].t1_ms},
+                          {"confidence",aligned[i].confidence}});
+        res.set_content(json({{"audio_total_ms", (int64_t) pcm.size() * 1000 / (sr > 0 ? sr : 1)},
+                              {"sample_rate", sr},
+                              {"words", std::move(wj)},
+                              {"profile", {{"t_load_ms",prof.t_load_ms},{"t_resample_ms",prof.t_resample_ms},
+                                           {"t_aligner_ms",prof.t_aligner_ms},{"t_total_ms",prof.t_total_ms},
+                                           {"n_words",prof.n_words}}}}).dump(), "application/json");
+    });
+
     srv.Post("/v1/admin/unload", [&cx](const httplib::Request &, httplib::Response & res) {
         std::lock_guard<std::mutex> lk(cx.mtx);
         const bool was = cx.is_loaded();
@@ -381,21 +458,38 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
         }
         const bool have_voice = ref.T > 0;
 
+        // Alignment is only produced on the SSE path, interleaved with the audio
+        // deltas — a buffered response has nowhere to put it. Silently dropping
+        // the flag made a caller think alignment was on when no aligner ever ran,
+        // so refuse instead.
+        if (body.value("align", false)
+            && body.value("stream_format", std::string()) != "sse") {
+            return err_json(res, 400,
+                            "align requires stream_format=\"sse\"; word timings are delivered as "
+                            "interleaved speech.audio.alignment.* events, not in a buffered body");
+        }
+
         // ---- SSE streaming + optional interleaved forced alignment ----
         // The path kobbler's BookReader takes: stream_format="sse",
         // response_format="pcm", align=true, align_stream="partial".
         if (body.value("stream_format", std::string()) == "sse") {
             const bool do_align      = body.value("align", false);
             const std::string a_mode = body.value("align_stream", std::string("final-only"));
-            const bool do_partial    = do_align && a_mode == "partial"
-                                       && cx.aligner && !cx.aligner_model.empty();
+            // align_stream only chooses whether the INCREMENTAL events reach the
+            // client; it used to gate the aligner itself, so the documented
+            // default ("final-only") ran no aligner and emitted nothing at all.
+            // The internal partial pass still runs in final-only mode — it is
+            // how PCM reaches the aligner subprocess, and an undrained
+            // PARTIAL_RESP left in the socket would desync the FINAL handshake.
+            const bool do_align_run  = do_align && cx.aligner && !cx.aligner_model.empty();
+            const bool emit_partials = do_align_run && a_mode == "partial";
             const int chunk_frames   = body.value("chunk_frames", 6);
             std::vector<std::string> words = whitespace_split_for_align(input);
 
             res.set_header("Content-Type", "text/event-stream");
             res.set_header("X-Accel-Buffering", "no");
             res.set_chunked_content_provider("text/event-stream",
-                [eng, &cx, input, gp, do_partial, have_voice, chunk_frames,
+                [eng, &cx, input, gp, do_align_run, emit_partials, have_voice, chunk_frames,
                  ref = std::move(ref), words = std::move(words)]
                 (size_t, httplib::DataSink & sink) mutable -> bool {
                     Activity act_stream(cx);
@@ -411,7 +505,7 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                     std::thread reader_thread;
                     std::atomic<bool> reader_stop{false};
                     std::atomic<int64_t> audio_offset_ms{0};
-                    if (do_partial) {
+                    if (do_align_run) {
                         aligner_lock = std::unique_lock<std::mutex>(cx.aligner_mtx);
                         cx.aligner_inflight.fetch_add(1);
                         cx.aligner_last_activity_ms.store(now_ms());
@@ -433,6 +527,7 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                                 while (!reader_stop.load(std::memory_order_relaxed)) {
                                     cx.aligner->drain_partial_alignments(
                                         [&](int64_t seen, const std::vector<fa::AlignedWord> & ws) {
+                                            if (!emit_partials) return;  // final-only: drain, don't publish
                                             json wj = json::array();
                                             for (size_t i = 0; i < ws.size(); i++)
                                                 wj.push_back({{"word_index",(int)i},{"text",ws[i].text},
