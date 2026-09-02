@@ -295,6 +295,24 @@ static bool qwen3_asr_load_model(qwen3_asr_model& model, qwen3_asr_vocab& vocab,
         if (!gctx)
             return false;
 
+        // Architecture gate. Every hparam below is read with a default, so a
+        // GGUF that is not a qwen3asr-layout file silently loads with stock
+        // defaults, finds none of its tensors, and used to fault on the first
+        // null bind (`l.output_w->ne[1]`). Sentinel-read one mandatory key to
+        // tell "wrong file" from "our file" before we get that far — e.g. the
+        // audio.cpp `audiocpp` container carries the same weights under HF
+        // names (`thinker.model.layers.N.*`) and none of the qwen3asr.* keys.
+        if (core_gguf::kv_u32(gctx, "qwen3asr.llm.n_layers", 0) == 0) {
+            const std::string arch = core_gguf::kv_str(gctx, "general.architecture", "(none)");
+            fprintf(stderr,
+                    "qwen3_asr: %s is not a qwen3asr GGUF (general.architecture='%s', no "
+                    "qwen3asr.llm.n_layers key). Reconvert it with "
+                    "models/convert-qwen3-asr-to-gguf.py.\n",
+                    path, arch.c_str());
+            core_gguf::free_metadata(gctx);
+            return false;
+        }
+
         auto& hp = model.hparams;
         hp.sample_rate = core_gguf::kv_u32(gctx, "qwen3asr.sample_rate", hp.sample_rate);
         hp.n_mels = core_gguf::kv_u32(gctx, "qwen3asr.n_mels", hp.n_mels);
@@ -478,6 +496,13 @@ static bool qwen3_asr_load_model(qwen3_asr_model& model, qwen3_asr_vocab& vocab,
     l.token_embd_w = require(model, "token_embd.weight");
     l.output_norm_w = require(model, "output_norm.weight");
     l.output_w = require(model, "output.weight");
+    // require() logs and returns null rather than throwing, so a GGUF that is
+    // missing any of these three reaches the `l.output_w->ne[1]` read below
+    // with a null pointer. Fail the load instead of segfaulting the worker.
+    if (!l.token_embd_w || !l.output_norm_w || !l.output_w) {
+        fprintf(stderr, "qwen3_asr: %s is missing mandatory LLM tensors; aborting load\n", path);
+        return false;
+    }
     // Read the actual lm_head output dimension from the loaded tensor
     // shape rather than asserting it equals vocab_size. The standard
     // Qwen3-ASR-{0.6B,1.7B} models have lm_head = (vocab, d), but the
@@ -2173,16 +2198,66 @@ static inline int qwen3_fa_softmax_window() {
 // Confidence threshold for LIS anchor gating (lever #3). Positions with
 // top-1 softmax probability below this threshold are demoted out of the
 // LIS chain so their values are reconstructed by interpolation from
-// surrounding high-confidence anchors. Default 0 = gate disabled. Set
-// QWEN3_FA_LIS_CONF_THRESHOLD=0.4 to activate.
+// surrounding high-confidence anchors. Default 0.4 — the model's wrong
+// timestamps are reliably low-confidence (median top-1 0.51 on the words it
+// misplaces vs 0.86 on the rest), so demoting them cuts the >200 ms tail
+// from 6.1% to 4.7% of words at no cost to the median.
+// QWEN3_FA_LIS_CONF_THRESHOLD=0 restores the ungated chain.
 static inline float qwen3_fa_lis_conf_threshold() {
     static const float T = []() {
         const char* e = std::getenv("QWEN3_FA_LIS_CONF_THRESHOLD");
-        if (!e || !*e) return 0.0f;
+        if (!e || !*e) return 0.4f;
         const float v = (float)std::atof(e);
         return v < 0.0f ? 0.0f : v;
     }();
     return T;
+}
+
+// Run-aware onset repair. The model's residual error is concentrated on
+// words next to a punctuation pause: it parks their onset INSIDE the pause
+// (median confidence 0.51 there vs 0.86 elsewhere), 200-500 ms off. Neither
+// the +-W bin walk nor the quietest-bin gap bridge can reach that far, and
+// both operate on single bins rather than on speech runs. This pass works on
+// runs instead:
+//   * onset sitting in silence      -> start of the loud run it belongs to
+//   * onset separated from the last
+//     word by a gap that is LOUD    -> close the gap on the left (t1[w-1]),
+//                                      i.e. trust the end prediction, which
+//                                      is the accurate one of the two
+// Both moves are clamped to [t1[w-1], t0[w]] so a repair can never reorder
+// words or push an onset later. QWEN3_FA_AUDIO_REFINE_RUNSNAP=0 disables.
+static inline bool qwen3_fa_audio_refine_runsnap() {
+    static const bool R = []() {
+        const char* e = std::getenv("QWEN3_FA_AUDIO_REFINE_RUNSNAP");
+        return !(e && *e && std::atoi(e) == 0);
+    }();
+    return R;
+}
+
+// Which logits row is read for each <|timestamp|> placeholder, relative to
+// the placeholder's own position. 0 = read AT the placeholder (the shipped
+// behaviour, inherited from the upstream CrispASR port). -1 = read the row
+// BEFORE it, which is what a causal LM's next-token convention would imply
+// if the head was trained to emit the timestamp as the token FOLLOWING the
+// word. Diagnostic knob for that hypothesis; default keeps shipped output
+// bit-identical.
+static inline int qwen3_fa_ts_read_offset() {
+    static const int O = []() {
+        const char* e = std::getenv("QWEN3_FA_TS_READ_OFFSET");
+        return (e && *e) ? std::atoi(e) : 0;
+    }();
+    return O;
+}
+
+// Dump the raw (pre-LIS) argmax class per placeholder to stderr when
+// QWEN3_FA_DUMP_CLASSES=1 — the only way to see whether the model's own
+// prediction is bad or the post-processing is.
+static inline bool qwen3_fa_dump_classes() {
+    static const bool D = []() {
+        const char* e = std::getenv("QWEN3_FA_DUMP_CLASSES");
+        return e && *e && std::atoi(e) > 0;
+    }();
+    return D;
 }
 
 // Audio-aware post-LIS boundary refinement (HANDOFF-aligner-audio-peaks).
@@ -2190,12 +2265,20 @@ static inline float qwen3_fa_lis_conf_threshold() {
 // 40 ms RMS energy and snap each boundary to the nearest speech onset
 // (for t0) or offset (for t1). Closes the "highlight in silence"
 // failure mode that bench_audio_peaks.py's low_energy_words metric
-// catches. Default W=6 (±240 ms) → quality fixes ship without operator
-// intervention; pass QWEN3_FA_AUDIO_REFINE=0 to opt out.
+// catches. Default W=1 (±40 ms); pass QWEN3_FA_AUDIO_REFINE=0 to opt out.
+//
+// W was 6 (±240 ms), tuned on isolated words ("One. Two. Three.") where
+// every word is fenced by silence. In CONNECTED prose — the ebook
+// read-along case — there is no silence between words, so the t1 walk runs
+// 240 ms into the next word, the monotonicity sweep below then drags that
+// word's t0 along with it, and the error cascades down the sentence: median
+// absolute onset error 97 ms, only 17% of words within 50 ms. At W=1 the walk
+// still fixes a boundary sitting just off the speech edge but cannot cross a
+// word: 27 ms median, 76% within 50 ms (n=690, confirmed on held-out text).
 static inline int qwen3_fa_audio_refine_window() {
     static const int W = []() {
         const char* e = std::getenv("QWEN3_FA_AUDIO_REFINE");
-        if (!e || !*e) return 6;
+        if (!e || !*e) return 1;
         const int v = std::atoi(e);
         return v < 0 ? 0 : v;
     }();
@@ -2241,9 +2324,9 @@ static inline int qwen3_fa_audio_refine_bin_ms() {
 static inline int qwen3_fa_audio_refine_gap_min_ms() {
     static const int M = []() {
         const char* e = std::getenv("QWEN3_FA_AUDIO_REFINE_GAP_MIN_MS");
-        if (!e || !*e) return 200;
+        if (!e || !*e) return 120;   // 120 measured better than 200 for the run-aware repair
         const int v = std::atoi(e);
-        return v < 0 ? 200 : v;
+        return v < 0 ? 120 : v;
     }();
     return M;
 }
@@ -2265,12 +2348,16 @@ static inline float qwen3_fa_audio_refine_gap_loud() {
 // many ms before emitting. Compensates for human-perceptual playback
 // lag (audio reaches the ear a few frames after the playhead reports
 // it) so the highlight feels "in sync" rather than chasing the audio.
-// Default 80 ms — empirical sweet spot on browser audio + AGC tail.
+// Default 0. It was 80 ms, which cancelled the late bias the old W=6 refine
+// window was itself creating; with W=1 the emitted boundaries are already
+// centred (median onset error -9 ms against a 20 ms-frame wav2vec2 reference),
+// so a further 80 ms shift only makes the highlight early. If a real playback
+// lead is wanted, tune it against playback, not against aligner bias.
 // Boundaries clamp to >= 0 so leading silence words still start at 0.
 static inline int qwen3_fa_audio_refine_lead_ms() {
     static const int L = []() {
         const char* e = std::getenv("QWEN3_FA_AUDIO_REFINE_LEAD_MS");
-        if (!e) return 80;        // env unset → default lead
+        if (!e) return 0;         // env unset → no shift
         if (!*e) return 0;        // env set to empty → off
         const int v = std::atoi(e);
         return v < 0 ? 0 : v;
@@ -2395,6 +2482,41 @@ static void qwen3_fa_audio_refine_bounds(const float* samples, int n_samples, in
     // the gap so playback never falls between words.
     const int   gap_min_ms = qwen3_fa_audio_refine_gap_min_ms();
     const float gap_loud_f = qwen3_fa_audio_refine_gap_loud();
+    // Run-aware onset repair (see qwen3_fa_audio_refine_runsnap).
+    if (qwen3_fa_audio_refine_runsnap()) {
+        // Start index of the loud run covering bin b, or -1 when b is quiet.
+        auto run_start_of = [&](int b) -> int {
+            if (!loud_at(b)) return -1;
+            int i = b;
+            while (i > 0 && loud_at(i - 1)) i--;
+            return i;
+        };
+        for (int w = 0; w < n_words; w++) {
+            const int64_t floor_ms = (w > 0) ? out_end_ms[w - 1] : 0;
+            const int t0_bin = bin_of(out_start_ms[w]);
+            int64_t cand = -1;
+            if (!loud_at(t0_bin)) {
+                // In silence: walk back to the nearest loud bin, then to that
+                // run's start. Bounded by the previous word's end.
+                int i = t0_bin;
+                while (i > 0 && !loud_at(i) && (int64_t) i * bin_ms > floor_ms) i--;
+                const int rs = run_start_of(i);
+                if (rs >= 0) cand = (int64_t) rs * bin_ms;
+            } else if (w > 0 && out_start_ms[w] - floor_ms >= gap_min_ms) {
+                // Loud gap between the previous word's end and this onset:
+                // the pause the model inserted is not in the audio.
+                const int lo = bin_of(floor_ms), hi = t0_bin;
+                int n_loud = 0, n_tot = 0;
+                for (int i = lo; i < hi; i++) { n_tot++; if (loud_at(i)) n_loud++; }
+                if (n_tot > 0 && (float) n_loud / (float) n_tot >= gap_loud_f) cand = floor_ms;
+            }
+            if (cand >= floor_ms && cand < out_start_ms[w]) {
+                out_start_ms[w] = cand;
+                if (out_end_ms[w] <= out_start_ms[w]) out_end_ms[w] = out_start_ms[w] + bin_ms;
+            }
+        }
+    }
+
     if (gap_min_ms > 0 && gap_loud_f > 0.0f) {
         for (int w = 1; w < n_words; w++) {
             const int64_t gap_start = out_end_ms[w - 1];
@@ -2621,10 +2743,11 @@ extern "C" int qwen3_asr_align_words(struct qwen3_asr_context* ctx, const float*
     std::vector<float> ts_confs;
     ts_classes.reserve((size_t)(n_words * 2));
     ts_confs.reserve((size_t)(n_words * 2));
+    const int rd_off = qwen3_fa_ts_read_offset();
     for (int t = 0; t < T_prompt; t++) {
         if (ids[t] != TIMESTAMP_TOKEN_ID)
             continue;
-        const float* row = logits + (size_t)t * H;
+        const float* row = logits + (size_t)(t + rd_off < 0 ? 0 : t + rd_off) * H;
         float conf = 0.0f;
         const int cls = qwen3_fa_pick_row_class(row, H, &conf);
         ts_classes.push_back(cls);
@@ -2910,12 +3033,20 @@ static int qwen3_fa_extract_word_timings(const float* logits, int /*n_logit_rows
     std::vector<float> ts_confs;
     ts_classes.reserve(ts_logit_rows.size());
     ts_confs.reserve(ts_logit_rows.size());
+    const int rd_off = qwen3_fa_ts_read_offset();
     for (int row : ts_logit_rows) {
-        const float* r = logits + (size_t)row * H;
+        const int rr = row + rd_off < 0 ? 0 : row + rd_off;
+        const float* r = logits + (size_t)rr * H;
         float conf = 0.0f;
         const int cls = qwen3_fa_pick_row_class(r, H, &conf);
         ts_classes.push_back(cls);
         ts_confs.push_back(conf);
+    }
+    if (qwen3_fa_dump_classes()) {
+        fprintf(stderr, "  [fa-cls off=%d]", rd_off);
+        for (size_t i = 0; i < ts_classes.size(); i++)
+            fprintf(stderr, " %s%d(%.2f)", (i % 2) ? "" : "| ", ts_classes[i], ts_confs[i]);
+        fprintf(stderr, "\n");
     }
     qwen3_fa_lis_monotonize(ts_classes, n_words, &ts_confs);
     for (int w = 0; w < n_words; w++) {

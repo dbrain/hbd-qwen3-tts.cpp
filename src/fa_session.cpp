@@ -14,7 +14,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <cstring>
+#include <vector>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -522,13 +524,64 @@ int run_aligner_loop(int fd) {
                 const int n_in  = (int) acc_pcm.size();
                 const int n_out = (int) ((double) n_in / ratio);
                 samples_16k.resize((size_t) n_out);
-                for (int i = 0; i < n_out; i++) {
-                    const double src = i * ratio;
-                    const int idx0 = (int) src, idx1 = idx0 + 1;
-                    const double frac = src - idx0;
-                    const float a = acc_pcm[idx0];
-                    const float b = (idx1 < n_in) ? acc_pcm[idx1] : a;
-                    samples_16k[i] = (float) ((1.0 - frac) * a + frac * b);
+                // Decimating without a low-pass folds everything above the new
+                // Nyquist back into the band the aligner's mel actually reads:
+                // at 24k -> 16k that is all TTS energy above 8 kHz landing on
+                // top of the 4-8 kHz fricative region, which is exactly where
+                // word onsets live. Windowed-sinc kernel, cutoff at the OUTPUT
+                // Nyquist expressed in input cycles/sample. QWEN3_FA_RESAMPLE_AA=0
+                // restores the old linear path for A/B.
+                static const bool aa = []() {
+                    const char * e = std::getenv("QWEN3_FA_RESAMPLE_AA");
+                    return !(e && *e && std::atoi(e) == 0);
+                }();
+                if (aa && ratio > 1.0) {
+                    constexpr int kHalf = 16;                     // taps each side, at input rate
+                    constexpr int kTaps = 2 * kHalf;
+                    constexpr int kPhase = 256;                   // sub-sample phase buckets
+                    const double fc = 0.5 / ratio;                // 8 kHz at 24 kHz in cycles/sample
+                    // Precompute one normalised kernel per phase bucket. Doing the
+                    // sinc/window per output sample instead cost 146 ms on a 17 s
+                    // clip (vs 0 ms for the linear path) and the partial-align pass
+                    // re-resamples the whole accumulator every time, so it has to
+                    // be a table lookup rather than transcendentals in the loop.
+                    std::vector<float> ker((size_t) kPhase * kTaps);
+                    for (int ph = 0; ph < kPhase; ph++) {
+                        const double frac = (double) ph / kPhase;
+                        double wsum = 0.0;
+                        float * row = ker.data() + (size_t) ph * kTaps;
+                        for (int m = 0; m < kTaps; m++) {
+                            const double t = (double) (m - kHalf + 1) - frac;
+                            const double x = 2.0 * M_PI * fc * t;
+                            const double sinc = (std::fabs(x) < 1e-9) ? 1.0 : std::sin(x) / x;
+                            const double win  = 0.5 + 0.5 * std::cos(M_PI * t / kHalf);  // Hann
+                            const double w = (std::fabs(t) >= kHalf) ? 0.0 : sinc * win;
+                            row[m] = (float) w; wsum += w;
+                        }
+                        if (wsum != 0.0) for (int m = 0; m < kTaps; m++) row[m] = (float) (row[m] / wsum);
+                    }
+                    for (int i = 0; i < n_out; i++) {
+                        const double src = i * ratio;
+                        const int    c   = (int) std::floor(src);
+                        const int    ph  = (int) ((src - c) * kPhase) & (kPhase - 1);
+                        const float * row = ker.data() + (size_t) ph * kTaps;
+                        double acc = 0.0;
+                        for (int m = 0; m < kTaps; m++) {
+                            const int j = c - kHalf + 1 + m;
+                            const int k = j < 0 ? 0 : (j >= n_in ? n_in - 1 : j);
+                            acc += (double) row[m] * (double) acc_pcm[k];
+                        }
+                        samples_16k[i] = (float) acc;
+                    }
+                } else {
+                    for (int i = 0; i < n_out; i++) {
+                        const double src = i * ratio;
+                        const int idx0 = (int) src, idx1 = idx0 + 1;
+                        const double frac = src - idx0;
+                        const float a = acc_pcm[idx0];
+                        const float b = (idx1 < n_in) ? acc_pcm[idx1] : a;
+                        samples_16k[i] = (float) ((1.0 - frac) * a + frac * b);
+                    }
                 }
             }
             t_resample_ms = std::chrono::duration_cast<std::chrono::milliseconds>(clk::now() - t0).count();
