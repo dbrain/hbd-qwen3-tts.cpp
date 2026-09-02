@@ -85,6 +85,14 @@ bool DepthDecoder::init(BreezeWeights * w) {
             error_msg_ = "depth: missing tensor in blk " + std::to_string(i);
             return false;
         }
+        char nm[64];
+        snprintf(nm, sizeof(nm), "depth.blk.%d.ffn_gate_up.weight", i);
+        L.ffn_gate_up = w->fuse_rows(L.ffn_gate, L.ffn_up, nm);
+        snprintf(nm, sizeof(nm), "depth.blk.%d.attn_qk.weight", i);
+        if (struct ggml_tensor * qk = w->fuse_rows(L.wq, L.wk, nm)) {
+            snprintf(nm, sizeof(nm), "depth.blk.%d.attn_qkv.weight", i);
+            L.wqkv = w->fuse_rows(qk, L.wv, nm);
+        }
     }
 
     // llama3 RoPE, as the divisor ggml_rope_ext applies per frequency pair.
@@ -135,6 +143,18 @@ size_t DepthDecoder::sched_bytes() const {
     for (const auto & g : step_)
         if (g.sched) n += ggml_backend_sched_get_buffer_size(g.sched, w_->backend());
     return n;
+}
+
+void DepthDecoder::log_sched_detail() const {
+    if (!w_) return;
+    const double M = 1024.0 * 1024.0;
+    const double pre = pre_.sched
+        ? ggml_backend_sched_get_buffer_size(pre_.sched, w_->backend()) / M : 0.0;
+    double each = 0.0; int n = 0;
+    for (const auto & g : step_)
+        if (g.sched) { each += ggml_backend_sched_get_buffer_size(g.sched, w_->backend()) / M; ++n; }
+    fprintf(stderr, "  [vram-breeze depth-sched] prefill=%.2f MiB + %d step graphs = %.2f MiB "
+            "(%.2f MiB each)\n", pre, n, each, n ? each / n : 0.0);
 }
 
 bool DepthDecoder::init_slot(graph_slot & g, int n, int n_past, int head_idx) {
@@ -189,9 +209,21 @@ struct ggml_cgraph * DepthDecoder::build_graph(struct ggml_context * c, int n,
         struct ggml_tensor * res = x;
         struct ggml_tensor * h = ggml_mul(c, ggml_rms_norm(c, x, cfg_.rms_eps), L.attn_norm);
 
-        struct ggml_tensor * q = ggml_reshape_3d(c, ggml_mul_mat(c, L.wq, h), hd, nh,  n);
-        struct ggml_tensor * k = ggml_reshape_3d(c, ggml_mul_mat(c, L.wk, h), hd, nkv, n);
-        struct ggml_tensor * v = ggml_reshape_3d(c, ggml_mul_mat(c, L.wv, h), hd, nkv, n);
+        struct ggml_tensor * q, * k, * v;
+        if (L.wqkv && n == 1) {
+            // One MMVQ + one q8_1 quantisation of `h` instead of three. n == 1
+            // leaves each slice contiguous, so the reshapes need no ggml_cont.
+            struct ggml_tensor * qkv = ggml_mul_mat(c, L.wqkv, h);
+            const size_t es = ggml_type_size(qkv->type);
+            const int64_t nq = hd * nh, nk = hd * nkv;
+            q = ggml_reshape_3d(c, ggml_view_2d(c, qkv, nq, n, nq * es, 0), hd, nh, n);
+            k = ggml_reshape_3d(c, ggml_view_2d(c, qkv, nk, n, nk * es, (size_t) nq * es), hd, nkv, n);
+            v = ggml_reshape_3d(c, ggml_view_2d(c, qkv, nk, n, nk * es, (size_t) (nq + nk) * es), hd, nkv, n);
+        } else {
+            q = ggml_reshape_3d(c, ggml_mul_mat(c, L.wq, h), hd, nh,  n);
+            k = ggml_reshape_3d(c, ggml_mul_mat(c, L.wk, h), hd, nkv, n);
+            v = ggml_reshape_3d(c, ggml_mul_mat(c, L.wv, h), hd, nkv, n);
+        }
         // No q_norm/k_norm here: the depth decoder is Qwen2-style attention.
         q = ggml_rope_ext(c, q, pos, rope_ff_, hd, GGML_ROPE_TYPE_NEOX, 0,
                           cfg_.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
@@ -221,8 +253,19 @@ struct ggml_cgraph * DepthDecoder::build_graph(struct ggml_context * c, int n,
         x = ggml_add(c, res, attn);
         res = x;
         h = ggml_mul(c, ggml_rms_norm(c, x, cfg_.rms_eps), L.ffn_norm);
-        struct ggml_tensor * g = ggml_silu(c, ggml_mul_mat(c, L.ffn_gate, h));
-        struct ggml_tensor * u = ggml_mul_mat(c, L.ffn_up, h);
+        struct ggml_tensor * g, * u;
+        if (L.ffn_gate_up && n == 1) {
+            // One MMVQ over [n_embd, 2*ffn] instead of two, and one q8_1
+            // quantisation of `h` instead of two. n == 1 keeps both halves
+            // contiguous, so no ggml_cont is needed to split them.
+            struct ggml_tensor * gu = ggml_mul_mat(c, L.ffn_gate_up, h);
+            const int64_t F = L.ffn_gate->ne[1];
+            g = ggml_silu(c, ggml_view_2d(c, gu, F, n, gu->nb[1], 0));
+            u = ggml_view_2d(c, gu, F, n, gu->nb[1], (size_t) F * gu->nb[0]);
+        } else {
+            g = ggml_silu(c, ggml_mul_mat(c, L.ffn_gate, h));
+            u = ggml_mul_mat(c, L.ffn_up, h);
+        }
         h = ggml_mul_mat(c, L.ffn_down, ggml_mul(c, g, u));
         x = ggml_add(c, res, h);
     }

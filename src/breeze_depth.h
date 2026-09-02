@@ -34,14 +34,20 @@ public:
 
     size_t kv_bytes() const { return kv_buf_ ? ggml_backend_buffer_get_size(kv_buf_) : 0; }
     size_t sched_bytes() const;
+    void   log_sched_detail() const;
     const std::string & get_error() const { return error_msg_; }
 
 private:
     struct layer {
         struct ggml_tensor * attn_norm = nullptr;
         struct ggml_tensor * wq = nullptr, * wk = nullptr, * wv = nullptr, * wo = nullptr;
+        // wq||wk||wv as one tensor when the three are adjacent in the weight buffer.
+        struct ggml_tensor * wqkv = nullptr;
         struct ggml_tensor * ffn_norm = nullptr;
         struct ggml_tensor * ffn_gate = nullptr, * ffn_up = nullptr, * ffn_down = nullptr;
+        // ffn_gate||ffn_up as one tensor when the two are adjacent in the weight
+        // buffer; halves the MMVQ launches and the q8_1 activation quantisation.
+        struct ggml_tensor * ffn_gate_up = nullptr;
     };
 
     void free_state();

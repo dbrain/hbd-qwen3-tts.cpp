@@ -33,6 +33,15 @@ public:
     // printf-style convenience for the blk.%d.* names.
     struct ggml_tensor * getf(const char * fmt, ...) const;
 
+    // Zero-copy row-concat of two weight tensors that the loader happened to
+    // place back-to-back in the one weight buffer (ffn_gate/ffn_up are adjacent
+    // in the GGUF, so this costs no VRAM). Returns a descriptor spanning both,
+    // or nullptr when they are not adjacent / not the same shape+type, in which
+    // case the caller keeps the two-matmul path. Row-concat is exact for any
+    // block-quantised type because the quant blocks run along ne[0].
+    struct ggml_tensor * fuse_rows(struct ggml_tensor * a, struct ggml_tensor * b,
+                                   const char * name);
+
     const breeze_config & cfg() const { return cfg_; }
     const Tokenizer & tok() const { return tok_; }
     ggml_backend_t backend() const { return backend_; }

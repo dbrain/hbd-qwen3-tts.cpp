@@ -52,9 +52,14 @@ private:
     struct layer {
         struct ggml_tensor * attn_norm = nullptr;
         struct ggml_tensor * wq = nullptr, * wk = nullptr, * wv = nullptr, * wo = nullptr;
+        // wq||wk||wv as one tensor when the three are adjacent in the weight buffer.
+        struct ggml_tensor * wqkv = nullptr;
         struct ggml_tensor * q_norm = nullptr, * k_norm = nullptr;
         struct ggml_tensor * ffn_norm = nullptr;
         struct ggml_tensor * ffn_gate = nullptr, * ffn_up = nullptr, * ffn_down = nullptr;
+        // ffn_gate||ffn_up as one tensor when the two are adjacent in the weight
+        // buffer; halves the MMVQ launches and the q8_1 activation quantisation.
+        struct ggml_tensor * ffn_gate_up = nullptr;
     };
 
     void free_state();

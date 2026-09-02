@@ -2,7 +2,11 @@
 #include "gguf_loader.h"
 
 #include <cstdarg>
+#include <cstring>
+#include <set>
+#include <vector>
 #include <cstdio>
+#include <cstdlib>
 
 namespace breeze {
 
@@ -26,6 +30,37 @@ struct ggml_tensor * BreezeWeights::getf(const char * fmt, ...) const {
     vsnprintf(nm, sizeof(nm), fmt, ap);
     va_end(ap);
     return get(nm);
+}
+
+struct ggml_tensor * BreezeWeights::fuse_rows(struct ggml_tensor * a, struct ggml_tensor * b,
+                                              const char * name) {
+    if (!ctx_ || !a || !b) return nullptr;
+    const bool ok = a->type == b->type &&
+                    a->ne[0] == b->ne[0] &&
+                    a->ne[2] == 1 && a->ne[3] == 1 && b->ne[2] == 1 && b->ne[3] == 1 &&
+                    a->nb[1] == b->nb[1] &&
+                    ggml_is_contiguous(a) && ggml_is_contiguous(b) &&
+                    a->buffer && a->buffer == b->buffer &&
+                    (char *) b->data == (char *) a->data + ggml_nbytes(a);
+    if (!ok) {
+        // Not fatal -- the caller keeps the unfused path -- but it silently
+        // costs ~7% of decode, so say so rather than regressing quietly.
+        static int warned = 0;
+        if (warned++ < 4)
+            fprintf(stderr, "  Breeze: %s not fused (%s / %s are not adjacent in the "
+                    "weight buffer); falling back to separate matmuls\n",
+                    name, ggml_get_name(a), ggml_get_name(b));
+        return nullptr;
+    }
+
+    struct ggml_tensor * t = ggml_new_tensor_2d(ctx_, a->type, a->ne[0], a->ne[1] + b->ne[1]);
+
+    if (!t) return nullptr;
+    t->data   = a->data;
+    t->buffer = a->buffer;
+    ggml_set_name(t, name);
+    tensors_[name] = t;
+    return t;
 }
 
 bool BreezeWeights::load(const std::string & path) {
@@ -52,16 +87,55 @@ bool BreezeWeights::load(const std::string & path) {
     }
 
     const int64_t nt = ld.get_n_tensors();
-    struct ggml_init_params p = { ggml_tensor_overhead() * (size_t) (nt + 16), nullptr, true };
+    struct ggml_init_params p = { ggml_tensor_overhead() * (size_t) (nt + 128), nullptr, true };
     ctx_ = ggml_init(p);
     if (!ctx_) { error_msg_ = "ggml_init failed"; return false; }
-    for (int64_t i = 0; i < nt; ++i) {
-        const char * name = ld.get_tensor_name(i);
-        struct ggml_tensor * mt = ggml_get_tensor(meta, name);
-        if (!mt) continue;
-        struct ggml_tensor * t = ggml_dup_tensor(ctx_, mt);
-        ggml_set_name(t, name);
-        tensors_[name] = t;
+    // ggml_backend_alloc_ctx_tensors lays tensors out in ctx-creation order, and
+    // load_tensor_data_from_file fills them by name, so the creation order is a
+    // free choice of buffer layout. Emit attn_q/attn_k/attn_v back-to-back and
+    // ffn_gate/ffn_up back-to-back so fuse_rows() can span them with a plain
+    // descriptor -- one MMVQ and one q8_1 activation quantisation instead of
+    // three (QKV) / two (gate+up), at zero extra VRAM and bit-identical output.
+    // The GGUF's own order is alphabetical within a block, which separates them.
+    {
+        std::vector<std::string> order;
+        std::set<std::string> done;
+        order.reserve((size_t) nt);
+        auto push = [&](const std::string & nm) {
+            if (!done.count(nm) && ggml_get_tensor(meta, nm.c_str())) {
+                order.push_back(nm); done.insert(nm);
+            }
+        };
+        // Hitting ANY member of a group emits the whole group, in group order --
+        // the GGUF lists them alphabetically (attn_k, attn_output, attn_q,
+        // attn_v), so keying off the first member alone would not reorder them.
+        static const char * const kGroups[][3] = {
+            { ".attn_q.weight",   ".attn_k.weight", ".attn_v.weight" },
+            { ".ffn_gate.weight", ".ffn_up.weight", nullptr },
+        };
+        for (int64_t i = 0; i < nt; ++i) {
+            const std::string name = ld.get_tensor_name(i);
+            if (!ggml_get_tensor(meta, name.c_str())) continue;
+            bool grouped = false;
+            for (const auto & grp : kGroups) {
+                for (int j = 0; j < 3 && grp[j]; ++j) {
+                    const size_t sfx = strlen(grp[j]);
+                    if (name.size() <= sfx || name.compare(name.size() - sfx, sfx, grp[j]) != 0)
+                        continue;
+                    const std::string stem = name.substr(0, name.size() - sfx);
+                    for (int m = 0; m < 3 && grp[m]; ++m) push(stem + grp[m]);
+                    grouped = true;
+                    break;
+                }
+                if (grouped) break;
+            }
+            if (!grouped) push(name);
+        }
+        for (const auto & name : order) {
+            struct ggml_tensor * t = ggml_dup_tensor(ctx_, ggml_get_tensor(meta, name.c_str()));
+            ggml_set_name(t, name.c_str());
+            tensors_[name] = t;
+        }
     }
     if (!load_tensor_data_from_file(path, gc, ctx_, tensors_, buffer_, error_msg_, dev_type_))
         return false;

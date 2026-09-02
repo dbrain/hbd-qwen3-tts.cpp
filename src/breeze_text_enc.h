@@ -35,6 +35,10 @@ public:
     // Un-projected encoder output (parity fixtures / debugging).
     bool encode_hidden(const std::vector<int32_t> & ids, std::vector<float> & out_hidden);
 
+    size_t sched_bytes() const {
+        return (sched_ && w_) ? ggml_backend_sched_get_buffer_size(sched_, w_->backend()) : 0;
+    }
+
     const std::string & get_error() const { return error_msg_; }
 
 private:

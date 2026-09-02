@@ -73,6 +73,14 @@ bool Backbone::init(BreezeWeights * w, int n_ctx) {
             error_msg_ = "backbone: missing tensor in blk " + std::to_string(i);
             return false;
         }
+        char nm[64];
+        snprintf(nm, sizeof(nm), "backbone.blk.%d.ffn_gate_up.weight", i);
+        L.ffn_gate_up = w->fuse_rows(L.ffn_gate, L.ffn_up, nm);
+        snprintf(nm, sizeof(nm), "backbone.blk.%d.attn_qk.weight", i);
+        if (struct ggml_tensor * qk = w->fuse_rows(L.wq, L.wk, nm)) {
+            snprintf(nm, sizeof(nm), "backbone.blk.%d.attn_qkv.weight", i);
+            L.wqkv = w->fuse_rows(qk, L.wv, nm);
+        }
     }
 
     n_ctx_ = std::min(n_ctx, cfg_.max_pos);
@@ -186,9 +194,21 @@ struct ggml_cgraph * Backbone::build_graph(struct ggml_context * c, int n, bool 
         struct ggml_tensor * res = x;
         struct ggml_tensor * h = ggml_mul(c, ggml_rms_norm(c, x, cfg_.rms_eps), L.attn_norm);
 
-        struct ggml_tensor * q = ggml_reshape_3d(c, ggml_mul_mat(c, L.wq, h), hd, nh,  n);
-        struct ggml_tensor * k = ggml_reshape_3d(c, ggml_mul_mat(c, L.wk, h), hd, nkv, n);
-        struct ggml_tensor * v = ggml_reshape_3d(c, ggml_mul_mat(c, L.wv, h), hd, nkv, n);
+        struct ggml_tensor * q, * k, * v;
+        if (L.wqkv && n == 1) {
+            // One MMVQ + one q8_1 quantisation of `h` instead of three. n == 1
+            // leaves each slice contiguous, so the reshapes need no ggml_cont.
+            struct ggml_tensor * qkv = ggml_mul_mat(c, L.wqkv, h);
+            const size_t es = ggml_type_size(qkv->type);
+            const int64_t nq = hd * nh, nk = hd * nkv;
+            q = ggml_reshape_3d(c, ggml_view_2d(c, qkv, nq, n, nq * es, 0), hd, nh, n);
+            k = ggml_reshape_3d(c, ggml_view_2d(c, qkv, nk, n, nk * es, (size_t) nq * es), hd, nkv, n);
+            v = ggml_reshape_3d(c, ggml_view_2d(c, qkv, nk, n, nk * es, (size_t) (nq + nk) * es), hd, nkv, n);
+        } else {
+            q = ggml_reshape_3d(c, ggml_mul_mat(c, L.wq, h), hd, nh,  n);
+            k = ggml_reshape_3d(c, ggml_mul_mat(c, L.wk, h), hd, nkv, n);
+            v = ggml_reshape_3d(c, ggml_mul_mat(c, L.wv, h), hd, nkv, n);
+        }
         q = ggml_mul(c, ggml_rms_norm(c, q, cfg_.rms_eps), L.q_norm);
         k = ggml_mul(c, ggml_rms_norm(c, k, cfg_.rms_eps), L.k_norm);
         q = ggml_rope_ext(c, q, pos, nullptr, hd, GGML_ROPE_TYPE_NEOX, 0,
@@ -216,8 +236,19 @@ struct ggml_cgraph * Backbone::build_graph(struct ggml_context * c, int n, bool 
         x = ggml_add(c, res, attn);
         res = x;
         h = ggml_mul(c, ggml_rms_norm(c, x, cfg_.rms_eps), L.ffn_norm);
-        struct ggml_tensor * g = ggml_silu(c, ggml_mul_mat(c, L.ffn_gate, h));
-        struct ggml_tensor * u = ggml_mul_mat(c, L.ffn_up, h);
+        struct ggml_tensor * g, * u;
+        if (L.ffn_gate_up && n == 1) {
+            // One MMVQ over [n_embd, 2*ffn] instead of two, and one q8_1
+            // quantisation of `h` instead of two. n == 1 keeps both halves
+            // contiguous, so no ggml_cont is needed to split them.
+            struct ggml_tensor * gu = ggml_mul_mat(c, L.ffn_gate_up, h);
+            const int64_t F = L.ffn_gate->ne[1];
+            g = ggml_silu(c, ggml_view_2d(c, gu, F, n, gu->nb[1], 0));
+            u = ggml_view_2d(c, gu, F, n, gu->nb[1], (size_t) F * gu->nb[0]);
+        } else {
+            g = ggml_silu(c, ggml_mul_mat(c, L.ffn_gate, h));
+            u = ggml_mul_mat(c, L.ffn_up, h);
+        }
         h = ggml_mul_mat(c, L.ffn_down, ggml_mul(c, g, u));
         x = ggml_add(c, res, h);
     }

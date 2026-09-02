@@ -281,6 +281,14 @@ void BreezeTTS::log_vram(const char * label) const {
     const double sc = (bb_.sched_bytes() + dd_.sched_bytes() + cc_.sched_bytes()) / (1024.0 * 1024.0);
     fprintf(stderr, "  [vram-breeze %-10s] weights=%.1f kv=%.1f sched=%.1f total=%.1f MiB\n",
             label, w, kv, sc, w + kv + sc);
+    if (getenv("BREEZE_PROF")) {
+        const double M = 1024.0 * 1024.0;
+        fprintf(stderr, "  [vram-breeze %-10s]   sched: backbone=%.1f depth=%.1f codec=%.1f "
+                "text_enc=%.1f MiB | kv: backbone=%.1f depth=%.1f MiB\n", label,
+                bb_.sched_bytes() / M, dd_.sched_bytes() / M, cc_.sched_bytes() / M,
+                te_.sched_bytes() / M, bb_.kv_bytes() / M, dd_.kv_bytes() / M);
+        dd_.log_sched_detail();
+    }
 }
 
 } // namespace breeze
