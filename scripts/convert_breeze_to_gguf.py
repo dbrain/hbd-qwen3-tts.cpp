@@ -50,6 +50,9 @@ ARCH = "breeze-tts"
 # single largest size win available.
 DROP_EXACT = {
     "embed_text_tokens.weight",
+    # Re-emitted below as 15 transposed 2-D heads, so it must not also flow
+    # through the generic name map.
+    "depth_decoder.codebooks_head.weight",
 }
 
 # Mimi ships 32 quantizers (1 semantic + 31 acoustic) but only 16 are valid --
@@ -157,7 +160,6 @@ RULES: list[tuple[str, str]] = [
     (r"^backbone_model\.layers\.(\d+)\.mlp\.down_proj\.weight$",     r"backbone.blk.\1.ffn_down.weight"),
 
     # ---- depth decoder (NOTE: no q_norm/k_norm, unlike the backbone) -----
-    (r"^depth_decoder\.codebooks_head\.weight$",                       r"depth.codebooks_head.weight"),
     (r"^depth_decoder\.model\.embed_tokens\.weight$",                  r"depth.token_embd.weight"),
     (r"^depth_decoder\.model\.inputs_embeds_projector\.weight$",       r"depth.in_proj.weight"),
     (r"^depth_decoder\.model\.norm\.weight$",                          r"depth.output_norm.weight"),
@@ -203,6 +205,15 @@ def map_name(hf: str) -> str | None:
 #       normalized_codebook = embed_sum / max(cluster_usage, 1e-5)
 #   at load; quantizing either side wrecks the division.
 #   conv weights: our ggml_conv_1d_direct CUDA kernel asserts F16 weights.
+# gguf-py can only *write* the legacy quants (no K-quants), which is fine: the
+# depth decoder and backbone are bandwidth-bound at batch 1, so what matters is
+# bytes-per-weight, and Q4_0/Q5_0 have well-tuned CUDA MMVQ kernels.
+_QUANTS = {
+    "f32":  None, "f16": None,
+    "q8_0": "Q8_0", "q5_1": "Q5_1", "q5_0": "Q5_0", "q4_1": "Q4_1", "q4_0": "Q4_0",
+}
+
+
 def pick_dtype(name, arr, out_type):
     import numpy as np
     import gguf
@@ -217,15 +228,65 @@ def pick_dtype(name, arr, out_type):
         return arr.astype(np.float32), gguf.GGMLQuantizationType.F32
     if out_type == "f16":
         return arr.astype(np.float16), gguf.GGMLQuantizationType.F16
-    if out_type == "q8_0":
-        try:
-            return (gguf.quants.quantize(arr.astype(np.float32),
-                                         gguf.GGMLQuantizationType.Q8_0),
-                    gguf.GGMLQuantizationType.Q8_0)
-        except Exception as e:  # noqa: BLE001
-            log.warning("Q8_0 failed for %s (%s); keeping F16", name, e)
-            return arr.astype(np.float16), gguf.GGMLQuantizationType.F16
-    raise ValueError(f"unknown --type {out_type}")
+    qname = _QUANTS.get(out_type)
+    if qname is None:
+        raise ValueError(f"unknown --type {out_type}")
+    qt = getattr(gguf.GGMLQuantizationType, qname)
+    try:
+        return gguf.quants.quantize(arr.astype(np.float32), qt), qt
+    except Exception as e:  # noqa: BLE001
+        log.warning("%s failed for %s (%s); keeping F16", qname, name, e)
+        return arr.astype(np.float16), gguf.GGMLQuantizationType.F16
+
+
+# ---------------------------------------------------------------------------
+# Gemma BPE tokenizer -> GGUF.
+#
+# tokenizer.json is a `tokenizers` BPE with byte_fallback, a Replace(" " ->
+# "\u2581") normalizer and NO pre-tokenizer regex (the Split on " " is a no-op
+# after normalisation). 262144 BPE entries + 14 added ids on top = 262158.
+# `added_tokens` (6428 of them) are matched literally on the RAW text before
+# normalisation, so they are carried in their own array rather than inferred.
+def _emit_tokenizer(writer, model_dir, log):
+    tj = json.loads((model_dir / "tokenizer.json").read_text())
+    model = tj["model"]
+    vocab = model["vocab"]
+    added = tj["added_tokens"]
+
+    n_vocab = max(max(vocab.values()), max(a["id"] for a in added)) + 1
+    tokens = [""] * n_vocab
+    ttype  = [1] * n_vocab          # 1 = normal, 3 = control/added, 6 = byte
+    for tok, i in vocab.items():
+        tokens[i] = tok
+        if tok.startswith("<0x") and tok.endswith(">") and len(tok) == 6:
+            ttype[i] = 6
+    for a in added:
+        tokens[a["id"]] = a["content"]
+        ttype[a["id"]] = 3
+    missing = [i for i, t in enumerate(tokens) if t == ""]
+    if missing:
+        raise SystemExit(f"tokenizer: {len(missing)} unfilled ids, first {missing[:5]}")
+
+    merges = ["%s %s" % (a, b) for a, b in model["merges"]]
+
+    writer.add_tokenizer_model("bpe-gemma")
+    writer.add_token_list(tokens)
+    writer.add_token_types(ttype)
+    writer.add_token_merges(merges)
+    writer.add_bos_token_id(tj["post_processor"]["special_tokens"]["<bos>"]["ids"][0])
+    writer.add_eos_token_id(1)
+    writer.add_pad_token_id(0)
+    writer.add_unk_token_id(3)
+    # The literal set the pre-normalisation splitter matches. Kept separate
+    # from token_type so the C++ side never has to guess which ids are added.
+    writer.add_array(f"{ARCH}.tokenizer.added_tokens",
+                     [a["content"] for a in added])
+    writer.add_array(f"{ARCH}.tokenizer.added_ids",
+                     [int(a["id"]) for a in added])
+    writer.add_string(f"{ARCH}.tokenizer.metaspace", "\u2581")
+    writer.add_uint32(f"{ARCH}.tokenizer.byte_fallback", 1)
+    log.info("tokenizer: %d tokens, %d merges, %d added",
+             n_vocab, len(merges), len(added))
 
 
 def main() -> int:
@@ -233,17 +294,23 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--input", required=True, type=Path, help="HF model directory")
     ap.add_argument("--output", required=True, type=Path)
-    ap.add_argument("--type", default="q8_0", choices=["f32", "f16", "q8_0"])
+    ap.add_argument("--type", default="q8_0", choices=list(_QUANTS))
+    # Per-subsystem overrides. The depth decoder is re-read 15x per 80 ms frame
+    # and the backbone once, so their bytes-per-weight dominates RTF; the text
+    # encoder runs once per request and only costs VRAM.
+    for sub in ("text-enc", "backbone", "depth", "codec"):
+        ap.add_argument(f"--type-{sub}", default=None, choices=list(_QUANTS))
     ap.add_argument("--dry-run", action="store_true",
                     help="validate the name mapping without reading tensor data")
     args = ap.parse_args()
 
     if not args.dry_run:
-        import numpy as np  # noqa: F401
+        import numpy as np
         GGUF_PY_PATH = Path(__file__).resolve().parents[1] / "gguf-py"
         if GGUF_PY_PATH.exists():
             sys.path.insert(0, str(GGUF_PY_PATH))
         import gguf
+        globals()["np"] = np
 
     cfg = json.loads((args.input / "config.json").read_text())
     te = cfg.get("text_encoder_config", {})
@@ -285,13 +352,30 @@ def main() -> int:
         log.info("dry run OK -- every tensor maps to a unique target name")
         return 0
 
+    subs = {"text_enc.": args.type_text_enc, "backbone.": args.type_backbone,
+            "depth.": args.type_depth, "codec.": args.type_codec}
+
+    def sub_type(name):
+        for pfx, t in subs.items():
+            if t and name.startswith(pfx):
+                return t
+        return args.type
+
+    if any(subs.values()):
+        log.info("per-subsystem types: %s (default %s)",
+                 {k: v for k, v in subs.items() if v}, args.type)
+
     writer = gguf.GGUFWriter(path=None, arch=ARCH)
     writer.add_name("Breeze-TTS-2")
     writer.add_type(gguf.GGUFType.MODEL)
     writer.add_quantization_version(gguf.GGML_QUANT_VERSION)
-    writer.add_file_type({"f32": gguf.LlamaFileType.ALL_F32,
-                          "f16": gguf.LlamaFileType.MOSTLY_F16,
-                          "q8_0": gguf.LlamaFileType.MOSTLY_Q8_0}[args.type])
+    writer.add_file_type({"f32":  gguf.LlamaFileType.ALL_F32,
+                          "f16":  gguf.LlamaFileType.MOSTLY_F16,
+                          "q8_0": gguf.LlamaFileType.MOSTLY_Q8_0,
+                          "q5_1": gguf.LlamaFileType.MOSTLY_Q5_1,
+                          "q5_0": gguf.LlamaFileType.MOSTLY_Q5_0,
+                          "q4_1": gguf.LlamaFileType.MOSTLY_Q4_1,
+                          "q4_0": gguf.LlamaFileType.MOSTLY_Q4_0}[args.type])
 
     def u32(k, v):
         if v is not None:
@@ -300,6 +384,10 @@ def main() -> int:
     def f32(k, v):
         if v is not None:
             writer.add_float32(f"{ARCH}.{k}", float(v))
+
+    def sstr(k, v):
+        if v is not None:
+            writer.add_string(f"{ARCH}.{k}", str(v))
 
     # text encoder -- layer_types drives the per-layer RoPE theta split and is
     # the single easiest thing to get wrong, so it is carried explicitly.
@@ -312,13 +400,24 @@ def main() -> int:
     u32("text_enc.vocab_size",    te.get("vocab_size"))
     u32("text_enc.sliding_window", te.get("sliding_window"))
     u32("text_enc.query_pre_attn_scalar", te.get("query_pre_attn_scalar"))
+    f32("text_enc.rms_norm_eps",  te.get("rms_norm_eps") or 1e-6)
+    u32("text_enc.eoi_token_index", te.get("eoi_token_index") or 256000)
     lt = te.get("layer_types") or []
     if lt:
         writer.add_array(f"{ARCH}.text_enc.layer_types", lt)
         writer.add_array(f"{ARCH}.text_enc.layer_is_full",
                          [1 if t == "full_attention" else 0 for t in lt])
-    f32("text_enc.rope_theta_sliding", 10000.0)
-    f32("text_enc.rope_theta_full",    1000000.0)
+    # rope_parameters is per layer-type. full_attention here is rope_type
+    # "linear" with factor 8 -- inv_freq /= 8. Missing that silently detunes
+    # every 6th layer, so both thetas AND the scale factor are carried.
+    rp = te.get("rope_parameters") or {}
+    slid = rp.get("sliding_attention") or {}
+    full = rp.get("full_attention") or {}
+    f32("text_enc.rope_theta_sliding", slid.get("rope_theta") or 10000.0)
+    f32("text_enc.rope_theta_full",    full.get("rope_theta") or 1000000.0)
+    sstr("text_enc.rope_type_sliding", slid.get("rope_type") or "default")
+    sstr("text_enc.rope_type_full",    full.get("rope_type") or "default")
+    f32("text_enc.rope_factor_full",   full.get("factor") or 1.0)
 
     for pfx, c in (("backbone", bb), ("depth", dd)):
         u32(f"{pfx}.block_count",   c.get("num_hidden_layers"))
@@ -329,9 +428,25 @@ def main() -> int:
         u32(f"{pfx}.head_dim",      c.get("head_dim"))
         f32(f"{pfx}.rope_theta",    c.get("rope_theta"))
         f32(f"{pfx}.rms_norm_eps",  c.get("rms_norm_eps"))
+        # rope_scaling: the backbone's is null (plain NeoX); the depth
+        # decoder's is llama3 with original_max_position_embeddings=16, which
+        # rewrites 35 of its 64 inv_freq entries. Silently skipping it detunes
+        # every codebook past the first few.
+        rs = c.get("rope_scaling") or {}
+        sstr(f"{pfx}.rope_scaling_type", rs.get("rope_type") or "none")
+        if rs:
+            f32(f"{pfx}.rope_scaling_factor",       rs.get("factor"))
+            f32(f"{pfx}.rope_scaling_low_freq",     rs.get("low_freq_factor"))
+            f32(f"{pfx}.rope_scaling_high_freq",    rs.get("high_freq_factor"))
+            u32(f"{pfx}.rope_scaling_orig_ctx",     rs.get("original_max_position_embeddings"))
+        u32(f"{pfx}.max_position", c.get("max_position_embeddings"))
     u32("depth.num_codebooks", dd.get("num_codebooks") or 16)
+    u32("depth.vocab_size",    dd.get("vocab_size") or 2051)
+    u32("backbone.audio_vocab_size", cfg.get("vocab_size") or 2051)
+    u32("backbone.lm_head_size",     (cfg.get("vocab_size") or 2051) + 1)
+    u32("backbone.num_codebooks",    cfg.get("num_codebooks") or 16)
 
-    # codec: upsample_rates is read by audio_tokenizer_decoder at load time, so
+    # codec: upsample_rates is read by the Mimi decoder at load time, so
     # Breeze's [8,6,5,4] vs our vocoder's [8,5,4,3] is DATA, not code.
     ur = cc.get("upsampling_ratios") or [8, 6, 5, 4]
     writer.add_array(f"{ARCH}.codec.upsample_rates", [int(x) for x in ur])
@@ -340,7 +455,61 @@ def main() -> int:
     u32("codec.codebook_size", cc.get("codebook_size") or 2048)
     u32("codec.codebook_dim",  cc.get("codebook_dim") or 256)
     u32("codec.num_quantizers", N_VALID_ACOUSTIC + 1)
-    f32("codec.frame_rate",    cc.get("frame_rate") or 12.5)
+    f32("codec.frame_rate",    cc.get("_frame_rate") or cc.get("frame_rate") or 12.5)
+    u32("codec.num_tfm_layers", cc.get("num_hidden_layers") or 8)
+    u32("codec.num_heads",     cc.get("num_attention_heads") or 8)
+    u32("codec.head_dim",      cc.get("head_dim") or 64)
+    u32("codec.ffn_dim",       cc.get("intermediate_size") or 2048)
+    u32("codec.sliding_window", cc.get("sliding_window") or 250)
+    f32("codec.norm_eps",      cc.get("norm_eps") or 1e-5)
+    f32("codec.rope_theta",    cc.get("rope_theta") or 10000.0)
+    u32("codec.num_filters",   cc.get("num_filters") or 64)
+    u32("codec.kernel_size",   cc.get("kernel_size") or 7)
+    u32("codec.last_kernel_size", cc.get("last_kernel_size") or 3)
+    u32("codec.residual_kernel_size", cc.get("residual_kernel_size") or 3)
+    u32("codec.dilation_growth_rate", cc.get("dilation_growth_rate") or 2)
+    u32("codec.compress",      cc.get("compress") or 2)
+    u32("codec.num_residual_layers", cc.get("num_residual_layers") or 1)
+    u32("codec.upsample_groups", cc.get("upsample_groups") or 512)
+    u32("codec.causal",        1 if cc.get("use_causal_conv", True) else 0)
+    sstr("codec.pad_mode",     cc.get("pad_mode") or "constant")
+    f32("codec.trim_right_ratio", cc.get("trim_right_ratio") or 1.0)
+    f32("codec.layer_scale_initial", cc.get("layer_scale_initial_scale") or 0.01)
+
+    # special token ids -- read from config, never hardcoded downstream
+    stc = cfg.get("text_encoder_special_tokens_config", {}) or {}
+    tid = stc.get("token_ids", {}) or {}
+    u32("tokens.audio",         cfg.get("audio_token_id"))
+    u32("tokens.audio_eos",     cfg.get("audio_eos_token_id"))
+    u32("tokens.ins_bos",       tid.get("<ins_bos>"))
+    u32("tokens.ins_eos",       tid.get("<ins_eos>"))
+    u32("tokens.speaker_base",  tid.get("[S0]"))
+    u32("tokens.n_speakers",    len(stc.get("speaker_tokens") or []) or 10)
+    u32("tokens.bos",           cfg.get("bos_token_id"))
+    u32("tokens.codebook_eos",  cfg.get("codebook_eos_token_id"))
+    u32("tokens.codebook_pad",  cfg.get("codebook_pad_token_id"))
+    u32("tokens.text_vocab_size", cfg.get("text_vocab_size"))
+
+    _emit_tokenizer(writer, args.input, log)
+
+    # depth_decoder.codebooks_head is [15, 1024, 2051] -- one head per codebook.
+    # Emitted TRANSPOSED, as [15, 2051, 1024], for two reasons:
+    #   * ggml_mul_mat wants [in, out] per head, and the transpose done here is
+    #     free where doing it in the 15-step inner loop would be a 4 MB copy;
+    #   * the original's last dim is 2051, not a multiple of the Q8_0 block, so
+    #     it cannot be quantised at all. Transposed it ends in 1024 and can.
+    # Kept as ONE 3-D tensor so the depth graph can evaluate all heads with a
+    # single broadcast mul_mat and stay shape-static across the AR steps.
+    head_hf = "depth_decoder.codebooks_head.weight"
+    if head_hf not in weight_map:
+        log.error("checkpoint has no %s", head_hf)
+        return 1
+    with SafeTensorsShard(args.input / weight_map[head_hf]) as f:
+        head = f.get(head_hf)
+    head_t = np.ascontiguousarray(head.transpose(0, 2, 1))   # [n_heads, vocab, hidden]
+    log.info("codebooks_head %s -> %s (transposed)", head.shape, head_t.shape)
+    data, dt = pick_dtype("depth.codebooks_head.weight", head_t, sub_type("depth.codebooks_head.weight"))
+    writer.add_tensor("depth.codebooks_head.weight", data, raw_dtype=dt)
 
     shards = sorted({weight_map[h] for h in mapped})
     log.info("reading %d shard(s)", len(shards))
@@ -352,7 +521,7 @@ def main() -> int:
                 arr = f.get(hf)
                 if arr.dtype.name not in ("float32", "float16"):
                     arr = arr.astype("float32")
-                data, dt = pick_dtype(mapped[hf], arr, args.type)
+                data, dt = pick_dtype(mapped[hf], arr, sub_type(mapped[hf]))
                 writer.add_tensor(mapped[hf], data, raw_dtype=dt)
                 n += 1
                 if i % 100 == 0 or i == len(todo):

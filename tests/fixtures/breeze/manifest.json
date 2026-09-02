@@ -1,0 +1,151 @@
+{
+  "input_ids": {
+    "shape": [
+      19
+    ],
+    "dtype": "int32",
+    "sha256": "1b758ce001c896a8"
+  },
+  "text_ids_mask": {
+    "shape": [
+      19
+    ],
+    "dtype": "int32",
+    "sha256": "391f620aa9094768"
+  },
+  "text_ids_len": {
+    "shape": [
+      1
+    ],
+    "dtype": "int32",
+    "sha256": "eba09f2f48f209cf"
+  },
+  "text": "The quick brown fox jumps over the lazy dog.",
+  "instruction": "Speak clearly and naturally.",
+  "rendered": "<bos>[S0]<ins_bos>Speak clearly and naturally.<ins_eos>The quick brown fox jumps over the lazy dog.",
+  "text_enc_hidden": {
+    "shape": [
+      19,
+      1152
+    ],
+    "dtype": "float32",
+    "sha256": "74a5e591745eabea"
+  },
+  "text_enc_layer0_in": {
+    "shape": [
+      19,
+      1152
+    ],
+    "dtype": "float32",
+    "sha256": "521e586f92d4c6f7"
+  },
+  "text_enc_layer1_out": {
+    "shape": [
+      19,
+      1152
+    ],
+    "dtype": "float32",
+    "sha256": "ea27be69fb69958b"
+  },
+  "text_enc_proj": {
+    "shape": [
+      19,
+      2048
+    ],
+    "dtype": "float32",
+    "sha256": "1ea1f2e2920131c4"
+  },
+  "prompt_embeds": {
+    "shape": [
+      19,
+      2048
+    ],
+    "dtype": "float32",
+    "sha256": "1ea1f2e2920131c4"
+  },
+  "backbone_hidden": {
+    "shape": [
+      19,
+      2048
+    ],
+    "dtype": "float32",
+    "sha256": "1c6745bfdd715fa5"
+  },
+  "lm_logits_step0": {
+    "shape": [
+      2052
+    ],
+    "dtype": "float32",
+    "sha256": "6336009d6025c95e"
+  },
+  "greedy_c0_step0": 404,
+  "depth_logits_cb1": {
+    "shape": [
+      2051
+    ],
+    "dtype": "float32",
+    "sha256": "0deda4198f66659d"
+  },
+  "depth_logits_frame0_all": {
+    "shape": [
+      15,
+      2051
+    ],
+    "dtype": "float32",
+    "sha256": "04b73c06c165eaf1"
+  },
+  "frame0_codes": {
+    "shape": [
+      16
+    ],
+    "dtype": "int32",
+    "sha256": "5dfd3de82b033a5b"
+  },
+  "greedy_codes": {
+    "shape": [
+      24,
+      16
+    ],
+    "dtype": "int32",
+    "sha256": "d84064209a5cde95"
+  },
+  "codec_input_codes": {
+    "shape": [
+      24,
+      16
+    ],
+    "dtype": "int32",
+    "sha256": "d84064209a5cde95"
+  },
+  "codec_wav": {
+    "shape": [
+      46080
+    ],
+    "dtype": "float32",
+    "sha256": "d208880309d18ef7"
+  },
+  "codec_quant_emb": {
+    "shape": [
+      512,
+      24
+    ],
+    "dtype": "float32",
+    "sha256": "2b91a0dfd9ab2a84"
+  },
+  "codec_upsample": {
+    "shape": [
+      512,
+      48
+    ],
+    "dtype": "float32",
+    "sha256": "17c3b95a8913c98b"
+  },
+  "codec_dec_tfm": {
+    "shape": [
+      48,
+      512
+    ],
+    "dtype": "float32",
+    "sha256": "3411d808dc533ad1"
+  }
+}

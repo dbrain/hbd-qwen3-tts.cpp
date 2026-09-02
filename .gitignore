@@ -54,3 +54,8 @@ Thumbs.db
 debug_*.bin
 reference/decoder_debug/
 reference/debug/
+
+# Out-of-tree build dirs (build-breeze, build-m2, ...)
+build-*/
+build_*.log
+build_*.txt

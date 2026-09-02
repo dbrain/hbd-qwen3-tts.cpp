@@ -304,6 +304,26 @@ target_link_libraries(higgs_synth PRIVATE
     Threads::Threads
 )
 
+# ─── Breeze-TTS-2 ────────────────────────────────────────────────────────────
+# Four models in one GGUF (T5Gemma2 text encoder, Qwen3 backbone, depth decoder,
+# Mimi codec). Shares only gguf_loader with the qwen3-tts / higgs stacks.
+add_library(breeze_core STATIC
+    src/breeze_model.cpp
+    src/breeze_tts.cpp
+    src/breeze_tokenizer.cpp
+    src/breeze_weights.cpp
+    src/breeze_text_enc.cpp
+    src/breeze_lm.cpp
+    src/breeze_depth.cpp
+    src/breeze_codec.cpp
+    src/gguf_loader.cpp
+)
+target_include_directories(breeze_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${GGML_DIR}/include
+)
+target_link_libraries(breeze_core PUBLIC ggml Threads::Threads)
+
 # Qwen3 Forced Aligner library — vendored from parakeet.cpp's qwen3-asr +
 # crisp_audio + core helpers. Drives the optional word-timing pass behind
 # /v1/audio/speech?align=true. Sits in its own static library so the
@@ -469,6 +489,36 @@ if(QWEN3_TTS_SERVER)
     target_link_libraries(test_worker_ipc PRIVATE
         nlohmann_json::nlohmann_json
     )
+
+    # Per-stage parity harness against the PyTorch-reference fixtures.
+    add_executable(breeze_parity tools/breeze_parity.cpp)
+    target_link_libraries(breeze_parity PRIVATE
+        breeze_core
+        nlohmann_json::nlohmann_json
+    )
+
+    # Breeze HTTP server: same wire shape as qwen3-tts-server / higgs-server.
+    # Reuses higgs_worker_ipc (a generic socketpair frame transport) and the
+    # engine-agnostic qwen3_fa aligner sibling.
+    add_executable(breeze-server
+        src/breeze_server.cpp
+        src/breeze_voices.cpp
+        src/breeze_worker_session.cpp
+        src/higgs_worker_ipc.cpp
+        src/fa_session.cpp
+    )
+    target_include_directories(breeze-server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(breeze-server PRIVATE
+        breeze_core
+        httplib::httplib
+        nlohmann_json::nlohmann_json
+    )
+    if(QWEN3_TTS_FORCED_ALIGNMENT)
+        target_link_libraries(breeze-server PRIVATE qwen3_fa)
+    endif()
+
+    add_executable(breeze_synth tools/breeze_synth.cpp)
+    target_link_libraries(breeze_synth PRIVATE breeze_core)
 
     # Minimal Higgs-Audio-v3 TTS HTTP server (/v1/audio/speech) + fork/IPC
     # worker isolation (idle-VRAM→0 + cooperative cancellation).
