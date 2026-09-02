@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 
 #define BZ_CODEC_MAX_NODES 16384
 
@@ -281,6 +282,12 @@ bool MimiCodec::init(BreezeWeights * w) {
                                         host[i][ph].size() * sizeof(uint16_t));
     }
 
+    // Both are overridable so the exactness of the span decode stays testable:
+    // BREEZE_CODEC_CTX=0 must AUDIBLY break the output. If it does not, the
+    // left-context argument is wrong and the spans are exact by luck.
+    if (const char * e = std::getenv("BREEZE_CODEC_SPAN")) seanet_span_ = std::max(1, atoi(e));
+    if (const char * e = std::getenv("BREEZE_CODEC_CTX"))  seanet_ctx_  = std::max(0, atoi(e));
+
     std::vector<ggml_backend_t> backends = { w->backend() };
     if (w->backend_cpu()) backends.push_back(w->backend_cpu());
     sched_ = ggml_backend_sched_new(backends.data(), nullptr, (int) backends.size(),
@@ -347,7 +354,7 @@ struct ggml_tensor * MimiCodec::resnet_block(struct ggml_context * c, struct ggm
     return ggml_add(c, res, x);
 }
 
-struct ggml_cgraph * MimiCodec::build_decode_graph(struct ggml_context * c, int T) {
+struct ggml_cgraph * MimiCodec::build_latent_graph(struct ggml_context * c, int T) {
     struct ggml_cgraph * gf = ggml_new_graph_custom(c, BZ_CODEC_MAX_NODES, false);
     const int D = cfg_.codebook_dim, H = cfg_.hidden;
 
@@ -401,7 +408,20 @@ struct ggml_cgraph * MimiCodec::build_decode_graph(struct ggml_context * c, int 
         x = ggml_reshape_3d(c, ggml_cont(c, ggml_transpose(c, t)), S, H, 1);
     }
 
-    // ── SEANet decoder
+    ggml_set_name(x, "latents");
+    ggml_set_output(x);
+    ggml_build_forward_expand(gf, x);
+    return gf;
+}
+
+// The SEANet conv stack over `n_lat` latent frames -> n_lat * 960 samples.
+struct ggml_cgraph * MimiCodec::build_seanet_graph(struct ggml_context * c, int n_lat) {
+    struct ggml_cgraph * gf = ggml_new_graph_custom(c, BZ_CODEC_MAX_NODES, false);
+    const int H = cfg_.hidden;
+
+    struct ggml_tensor * x = ggml_new_tensor_3d(c, GGML_TYPE_F32, n_lat, H, 1);
+    ggml_set_name(x, "lat"); ggml_set_input(x);
+
     x = causal_conv(c, dec_in_w_, x, 1);
     x = add_bias(c, x, dec_in_b_, dec_in_w_->ne[2]);
     for (size_t i = 0; i < dec_up_w_.size(); ++i) {
@@ -438,34 +458,85 @@ bool MimiCodec::decode(const int32_t * codes, int T, std::vector<float> & pcm) {
     pcm.clear();
     if (T <= 0) return true;
     const int nq = cfg_.n_quantizers;
+    const int H  = cfg_.hidden;
+    const int S  = 2 * T;                       // latent frames, 25 Hz
+    const int spf = cfg_.samples_per_frame();   // 1920 samples per codec frame
+    const int spl = spf / 2;                    // 960 samples per latent frame
 
-    struct ggml_init_params p = { compute_meta_.size(), compute_meta_.data(), true };
-    struct ggml_context * c = ggml_init(p);
-    struct ggml_cgraph * gf = build_decode_graph(c, T);
-    if (!ggml_backend_sched_alloc_graph(sched_, gf)) {
-        error_msg_ = "codec: alloc decode graph"; ggml_free(c); return false;
-    }
-    std::vector<int32_t> col(T);
-    for (int q = 0; q < nq; ++q) {
-        char nm[16]; snprintf(nm, sizeof(nm), "code_%d", q);
-        for (int t = 0; t < T; ++t) col[t] = codes[(size_t) t * nq + q];
-        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, nm), col.data(), 0, T * sizeof(int32_t));
-    }
+    // ── graph A: codes -> transformer latents [S, H] ─────────────────────
+    std::vector<float> lat((size_t) S * H);
     {
-        std::vector<int32_t> posv(2 * T);
-        for (int i = 0; i < 2 * T; ++i) posv[i] = i;
+        struct ggml_init_params p = { compute_meta_.size(), compute_meta_.data(), true };
+        struct ggml_context * c = ggml_init(p);
+        struct ggml_cgraph * gf = build_latent_graph(c, T);
+        if (!ggml_backend_sched_alloc_graph(sched_, gf)) {
+            error_msg_ = "codec: alloc latent graph"; ggml_free(c); return false;
+        }
+        std::vector<int32_t> col(T);
+        for (int q = 0; q < nq; ++q) {
+            char nm[16]; snprintf(nm, sizeof(nm), "code_%d", q);
+            for (int t = 0; t < T; ++t) col[t] = codes[(size_t) t * nq + q];
+            ggml_backend_tensor_set(ggml_graph_get_tensor(gf, nm), col.data(), 0, T * sizeof(int32_t));
+        }
+        std::vector<int32_t> posv(S);
+        for (int i = 0; i < S; ++i) posv[i] = i;
         ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "pos"), posv.data(), 0,
                                 posv.size() * sizeof(int32_t));
+        if (ggml_backend_sched_graph_compute(sched_, gf) != GGML_STATUS_SUCCESS) {
+            error_msg_ = "codec: latent compute";
+            ggml_backend_sched_reset(sched_); ggml_free(c); return false;
+        }
+        struct ggml_tensor * o = ggml_graph_get_tensor(gf, "latents");
+        ggml_backend_tensor_get(o, lat.data(), 0, ggml_nbytes(o));
+        ggml_backend_sched_reset(sched_);
+        ggml_free(c);
     }
-    if (ggml_backend_sched_graph_compute(sched_, gf) != GGML_STATUS_SUCCESS) {
-        error_msg_ = "codec: decode compute";
-        ggml_backend_sched_reset(sched_); ggml_free(c); return false;
+
+    // ── graph B: the SEANet stack, in bounded spans ──────────────────────
+    // Every intermediate here is (latents x upsampled channels), so a
+    // whole-clip decode grows at ~1.5 MiB per codec frame and a 60 s
+    // paragraph would want over a gigabyte of scratch that ggml's allocator
+    // then never gives back. Spans cap it at a constant.
+    pcm.assign((size_t) T * spf, 0.0f);
+    const int span_lat = std::max(2, seanet_span_ * 2);
+    std::vector<float> in;
+    for (int s0 = 0; s0 < S; s0 += span_lat) {
+        const int s1   = std::min(S, s0 + span_lat);
+        const int warm = std::min(s0, seanet_ctx_);   // real history, not zeros
+        const int n_in = (s1 - s0) + warm;
+
+        struct ggml_init_params p = { compute_meta_.size(), compute_meta_.data(), true };
+        struct ggml_context * c = ggml_init(p);
+        struct ggml_cgraph * gf = build_seanet_graph(c, n_in);
+        if (!ggml_backend_sched_alloc_graph(sched_, gf)) {
+            error_msg_ = "codec: alloc seanet graph"; ggml_free(c); return false;
+        }
+        // [S, H] row-major over H -> the span's [n_in, H] block.
+        in.resize((size_t) n_in * H);
+        for (int ch = 0; ch < H; ++ch)
+            std::memcpy(in.data() + (size_t) ch * n_in,
+                        lat.data() + (size_t) ch * S + (s0 - warm),
+                        (size_t) n_in * sizeof(float));
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "lat"), in.data(), 0,
+                                in.size() * sizeof(float));
+        if (ggml_backend_sched_graph_compute(sched_, gf) != GGML_STATUS_SUCCESS) {
+            error_msg_ = "codec: seanet compute";
+            ggml_backend_sched_reset(sched_); ggml_free(c); return false;
+        }
+        struct ggml_tensor * o = ggml_graph_get_tensor(gf, "pcm");
+        const size_t got = ggml_nelements(o);
+        if (got != (size_t) n_in * spl) {
+            error_msg_ = "codec: seanet span produced the wrong sample count";
+            ggml_backend_sched_reset(sched_); ggml_free(c); return false;
+        }
+        std::vector<float> out(got);
+        ggml_backend_tensor_get(o, out.data(), 0, ggml_nbytes(o));
+        std::memcpy(pcm.data() + (size_t) s0 * spl,
+                    out.data() + (size_t) warm * spl,
+                    (size_t) (s1 - s0) * spl * sizeof(float));
+        ggml_backend_sched_reset(sched_);
+        ggml_free(c);
     }
-    struct ggml_tensor * o = ggml_graph_get_tensor(gf, "pcm");
-    pcm.resize(ggml_nelements(o));
-    ggml_backend_tensor_get(o, pcm.data(), 0, ggml_nbytes(o));
-    ggml_backend_sched_reset(sched_);
-    ggml_free(c);
     return true;
 }
 

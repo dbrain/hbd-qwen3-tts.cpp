@@ -64,7 +64,13 @@ private:
                                    int seq, struct ggml_tensor * pos);
     struct ggml_tensor * resnet_block(struct ggml_context * c, struct ggml_tensor * x,
                                       const resnet & r);
-    struct ggml_cgraph * build_decode_graph(struct ggml_context * c, int n_frames);
+    // The decode is split in two so the conv stack's scratch stops scaling with
+    // clip length. Graph A (quantiser -> upsample -> transformer) is O(S) in
+    // memory apart from its attention matrix and runs once; graph B (the SEANet
+    // conv stack, which is where ~1.5 MiB per codec frame of intermediates came
+    // from) runs over bounded spans of latents with a left-context warmup.
+    struct ggml_cgraph * build_latent_graph(struct ggml_context * c, int n_frames);
+    struct ggml_cgraph * build_seanet_graph(struct ggml_context * c, int n_latents);
     struct ggml_cgraph * build_encode_graph(struct ggml_context * c, int n_samples);
 
     BreezeWeights * w_ = nullptr;
@@ -101,6 +107,13 @@ private:
     // taps + anything we synthesise at load time live in their own tiny buffer
     struct ggml_context * aux_ctx_ = nullptr;
     ggml_backend_buffer_t aux_buf_ = nullptr;
+
+    // Codec frames of SEANet output per span, and the left context (in latent
+    // frames, i.e. post-x2-upsample) that makes a span bit-identical to a
+    // whole-clip decode. The conv stack is causal with a finite receptive
+    // field, so enough real history is indistinguishable from all of it.
+    int seanet_span_ = 64;
+    int seanet_ctx_  = 16;
 
     ggml_backend_sched_t sched_ = nullptr;
     std::vector<uint8_t> compute_meta_;
