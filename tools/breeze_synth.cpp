@@ -264,6 +264,28 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
+    // --long: rolling-context long-form. Renders the whole text in chunks, each
+    // conditioned on the previous chunk's generated audio, so the voice carries
+    // without needing a saved reference.
+    const int long_chunk = atoi(argval(argc, argv, "--long", "0"));
+    if (long_chunk > 0) {
+        const int ref_frames = atoi(argval(argc, argv, "--long-ref-frames", "250"));
+        breeze::gen_result r;
+        auto tw = std::chrono::steady_clock::now();
+        if (!eng.synthesize_long(text, gp, long_chunk, ref_frames, nullptr, r)) {
+            fprintf(stderr, "long: %s\n", eng.get_error().c_str()); return 1;
+        }
+        const double wall = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - tw).count();
+        const double dur = 1000.0 * r.pcm.size() / eng.sample_rate();
+        printf("long-form: %d frames, %.2f s audio | wall=%.0f ms | RTF=%.4f\n",
+               r.T, dur / 1000.0, wall, wall / dur);
+        eng.log_vram("after");
+        write_wav(outp, r.pcm, eng.sample_rate());
+        printf("wrote %s\n", outp.c_str());
+        return 0;
+    }
+
     breeze::ref_voice ref;
     const std::string refw = argval(argc, argv, "--ref-wav", "");
     if (!refw.empty()) {

@@ -336,6 +336,98 @@ bool BreezeTTS::decode_codes(const int32_t * codes, int T, std::vector<float> & 
     return true;
 }
 
+std::vector<std::string> BreezeTTS::chunk_text(const std::string & text, int chunk_words) {
+    if (chunk_words <= 0) chunk_words = 120;
+    // Split on sentence enders first so a seam never lands mid-clause; pack
+    // sentences up to the word budget. An over-long single sentence ships whole
+    // rather than being cut at an arbitrary word.
+    std::vector<std::string> sents;
+    size_t start = 0;
+    for (size_t i = 0; i < text.size(); ++i) {
+        const char c = text[i];
+        if (c == '.' || c == '!' || c == '?' || c == '\n') {
+            size_t j = i + 1;
+            while (j < text.size() && (text[j] == '"' || text[j] == '\'' || text[j] == ')')) ++j;
+            if (j >= text.size() || text[j] == ' ' || text[j] == '\n') {
+                std::string sn = text.substr(start, j - start);
+                size_t a = sn.find_first_not_of(" \t\r\n");
+                if (a != std::string::npos) sents.push_back(sn.substr(a));
+                start = j;
+            }
+        }
+    }
+    if (start < text.size()) {
+        std::string sn = text.substr(start);
+        size_t a = sn.find_first_not_of(" \t\r\n");
+        if (a != std::string::npos) sents.push_back(sn.substr(a));
+    }
+    if (sents.empty() && !text.empty()) sents.push_back(text);
+
+    auto words_in = [](const std::string & s) {
+        int n = 0; bool in = false;
+        for (char c : s) { const bool sp = (c==' '||c=='\t'||c=='\n'||c=='\r');
+                           if (!sp && !in) { ++n; in = true; } else if (sp) in = false; }
+        return n;
+    };
+    std::vector<std::string> out;
+    std::string cur; int cur_w = 0;
+    for (const auto & sn : sents) {
+        const int w = words_in(sn);
+        if (cur_w > 0 && cur_w + w > chunk_words) { out.push_back(cur); cur.clear(); cur_w = 0; }
+        if (!cur.empty()) cur += " ";
+        cur += sn; cur_w += w;
+    }
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+}
+
+bool BreezeTTS::synthesize_long(const std::string & text, const gen_params & gp,
+                                int chunk_words, int ref_max_frames,
+                                const pcm_cb & on_chunk, gen_result & out) {
+    if (!loaded_) { error_msg_ = "not loaded"; return false; }
+    if (ref_max_frames <= 0) ref_max_frames = 250;
+    const int NC = w_.cfg().bb.n_codebooks;
+
+    auto chunks = chunk_text(text, chunk_words);
+    if (chunks.empty()) { error_msg_ = "no chunks"; return false; }
+
+    out = gen_result{};
+    // Rolling history: the previous chunk's generated codes and its text, which
+    // together are exactly the clone template's (ref_text, ref_audio) pair.
+    ref_voice hist;
+    std::string hist_text;
+
+    for (size_t ci = 0; ci < chunks.size(); ++ci) {
+        if (cancelled()) break;
+        gen_result r;
+        const bool have_hist = hist.T > 0;
+        const int used_ref_T = have_hist ? hist.T : 0;
+        if (have_hist) { hist.ref_text = hist_text; }
+        if (!synthesize(chunks[ci], gp, have_hist ? &hist : nullptr, r)) {
+            error_msg_ = "chunk " + std::to_string(ci) + ": " + error_msg_;
+            return false;
+        }
+        if (on_chunk && !r.pcm.empty())
+            on_chunk(r.pcm.data(), (int) r.pcm.size(), ci + 1 == chunks.size());
+        out.pcm.insert(out.pcm.end(), r.pcm.begin(), r.pcm.end());
+        out.codes.insert(out.codes.end(), r.codes.begin(), r.codes.end());
+        out.T += r.T;
+        out.prefill_ms += r.prefill_ms; out.decode_ms += r.decode_ms;
+        out.codec_ms += r.codec_ms;     out.text_enc_ms += r.text_enc_ms;
+        if (ci == 0) out.ttfa_ms = r.ttfa_ms;
+
+        // Carry only the TAIL of this chunk. Prompt tokens + ref frames + new
+        // frames share n_ctx, so an unbounded history starves the generation.
+        const int keep = std::min(r.T, ref_max_frames);
+        hist.codes.assign(r.codes.end() - (size_t) keep * NC, r.codes.end());
+        hist.T = keep;
+        hist_text = chunks[ci];
+        fprintf(stderr, "  [breeze long-form] chunk %zu/%zu: %d frames (%.1fs), ref_T used=%d, carry=%d\n",
+                ci + 1, chunks.size(), r.T, r.T / 12.5, used_ref_T, keep);
+    }
+    return true;
+}
+
 bool BreezeTTS::encode_voice(const float * pcm, int n, std::vector<int32_t> & codes, int & T) {
     int32_t nf = 0;
     if (!ce_.encode(pcm, n, codes, nf)) { error_msg_ = ce_.get_error(); return false; }

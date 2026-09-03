@@ -90,6 +90,31 @@ public:
                            const ref_voice * ref, int chunk_frames,
                            const pcm_cb & on_chunk, gen_result & out);
 
+    // Rolling-context long-form. Chunk `text` at ~chunk_words words and render
+    // the chunks in sequence, feeding the PREVIOUS chunk's generated codes (and
+    // its text) back in as the reference for the next one. The prompt shape is
+    // the clone template -- [S0]{prev_text}<audio prev>[S0]{next_text} -- which
+    // is exactly a continuation, so the model carries intonation and pacing
+    // across the seam, not just speaker identity.
+    //
+    // Chunking is unavoidable: max_new_frames defaults to 750 and the model
+    // stops itself around 890-1100 frames whatever you set, so a book has to be
+    // split. Text cannot be streamed into an in-flight generation instead --
+    // the text sits BEFORE the audio frames in the sequence, so once frames are
+    // being emitted there is nowhere to put more text.
+    //
+    // ref_max_frames caps how much history is carried: prompt tokens + ref
+    // frames + new frames all share n_ctx (2048), so an unbounded reference
+    // eats the budget it is trying to protect. ~250 frames (20 s) is plenty to
+    // hold a voice.
+    bool synthesize_long(const std::string & text, const gen_params & gp,
+                         int chunk_words, int ref_max_frames,
+                         const pcm_cb & on_chunk, gen_result & out);
+
+    // Split text into ~chunk_words chunks on sentence boundaries. Exposed so a
+    // caller can align its own word offsets with what synthesize_long renders.
+    static std::vector<std::string> chunk_text(const std::string & text, int chunk_words);
+
     // 24 kHz mono in -> Mimi codes, for voice cloning.
     bool encode_voice(const float * pcm, int n_samples, std::vector<int32_t> & codes, int & T);
     // Mimi codes -> 24 kHz mono. Exposed so a caller can round-trip known-good
