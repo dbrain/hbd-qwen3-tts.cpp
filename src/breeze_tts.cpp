@@ -433,12 +433,23 @@ bool BreezeTTS::synthesize_long(const std::string & text, const gen_params & gp,
 
         // Carry only the TAIL of this chunk. Prompt tokens + ref frames + new
         // frames share n_ctx, so an unbounded history starves the generation.
+        // Carry only the TAIL of this chunk: prompt tokens, reference frames and
+        // new frames all share n_ctx, so an unbounded history starves the
+        // generation it is meant to protect.
         const int keep = std::min(r.T, ref_max_frames);
         hist.codes.assign(r.codes.end() - (size_t) keep * NC, r.codes.end());
         hist.T = keep;
-        hist_text = chunks[ci];
-        fprintf(stderr, "  [breeze long-form] chunk %zu/%zu: %d frames (%.1fs), ref_T used=%d, carry=%d\n",
-                ci + 1, chunks.size(), r.T, r.T / 12.5, used_ref_T, keep);
+        // The clone template pairs a transcript with THE AUDIO OF THAT
+        // TRANSCRIPT. Once the codes are trimmed to a tail, the chunk's full
+        // text no longer describes them, so pairing the two would hand the model
+        // a transcript for audio it cannot hear. Fall back to voice-only
+        // conditioning in that case -- an empty ref_text, which is what higgs
+        // does for its rolling context anyway.
+        hist_text = (keep == r.T) ? chunks[ci] : std::string();
+        fprintf(stderr, "  [breeze long-form] chunk %zu/%zu: prompt=%d tok -> %d frames (%.1fs), "
+                "ref_T used=%d%s, carry=%d\n",
+                ci + 1, chunks.size(), r.n_prompt_tokens, r.T, r.T / 12.5, used_ref_T,
+                used_ref_T && hist_text.empty() ? " (voice-only)" : "", keep);
     }
     return true;
 }
