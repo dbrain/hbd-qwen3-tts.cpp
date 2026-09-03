@@ -754,6 +754,9 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
             const bool raw_pcm = (sfmt == "pcm");
             const char * ctype = raw_pcm ? "audio/pcm" : "audio/wav";
             res.set_header("Content-Type", ctype);
+            // Announce the trailer up front; strict clients drop trailing headers
+            // they were not told to expect.
+            res.set_header("Trailer", "X-Truncated");
             const int chunk_frames = body.value("chunk_frames",
                                        body.value("stream_first_batch_size",
                                          body.value("stream_batch_size", 6)));
@@ -763,7 +766,13 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                 (size_t, httplib::DataSink & sink) mutable {
                     // Streaming WAV cannot know its length up front; 0xFFFFFFFF is
                     // the conventional placeholder here (unlike the buffered path,
-                    // which writes real sizes).
+                    // which writes real sizes). ffmpeg reads to EOF and decodes
+                    // correctly, but a client that TRUSTS the declared length
+                    // sees 2^31 frames -- Python's `wave` reports exactly that --
+                    // which shows up as a ~25-hour file and a broken seek bar.
+                    // That is why response_format="pcm" is the right default on
+                    // this transport, and why a length-trusting reader must not
+                    // be pointed at streaming WAV.
                     if (!raw_pcm) {
                         std::string h;
                         auto u32 = [&](uint32_t v) { h.append((const char *) &v, 4); };
@@ -810,7 +819,16 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                     if (ts) { sbuf.clear(); ts->flush(sbuf); write_pcm(sbuf.data(), sbuf.size()); }
                     wd_stop.store(true);
                     if (wd.joinable()) wd.join();
-                    sink.done();
+                    // Truncation is only known once generation ends, which on a
+                    // chunked response is long after the headers went out -- so
+                    // it ships as a TRAILER. That closes the hole where this
+                    // transport carried no truncation signal at all (no
+                    // speech.audio.done to hang it on, and X-Truncated belongs to
+                    // the buffered path). Trailers are correct HTTP but thinly
+                    // supported -- browser fetch() cannot read them at all -- so
+                    // this is a backstop, not a contract: a client that needs a
+                    // reliable signal should use stream_format="sse".
+                    sink.done_with_trailer({{"X-Truncated", r.truncated ? "1" : "0"}});
                     return ok;
                 });
             return;
