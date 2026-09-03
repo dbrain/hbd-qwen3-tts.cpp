@@ -69,6 +69,12 @@ struct gen_result {
     std::vector<float> pcm;       // 24 kHz mono
     int n_prompt_tokens = 0;
     double prefill_ms = 0, decode_ms = 0, codec_ms = 0, text_enc_ms = 0, ttfa_ms = 0;
+    // The decode loop ends either on EOS or by exhausting max_new_frames. The
+    // second case is a SILENT truncation -- the caller gets a short, valid,
+    // mid-sentence clip -- so it has to be reportable. With `long` on (the
+    // default) chunking keeps every chunk well inside the cap and this stays
+    // false; it fires on `long:false` with more text than ~60 s of speech.
+    bool truncated = false;
 };
 
 class BreezeTTS {

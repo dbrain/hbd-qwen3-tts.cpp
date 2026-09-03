@@ -467,6 +467,14 @@ int run_aligner_loop(int fd) {
     int64_t                  cached_audio_ms = -1;
     int                      cached_pcm_n    = -1;
     std::vector<std::string> cached_words;
+    // High-water mark of the emitted prefix. The aligner re-estimates the whole
+    // accumulator every partial, so the boundary can move BACKWARDS by a few
+    // words between passes (measured 474 -> 472 -> 468). Clients merge by
+    // word_index and never un-highlight, so a retraction is invisible to them
+    // but makes the stream contradict its own contract; clamping keeps it
+    // monotonic without hiding anything -- the clamped-in words are re-sent with
+    // their CURRENT timings, not stale ones.
+    size_t max_emitted = 0;
     std::vector<int64_t>     cached_t0, cached_t1;
     std::vector<float>       cached_conf;
 
@@ -519,7 +527,7 @@ int run_aligner_loop(int fd) {
         if (err.empty() && pcm_sr <= 0)   err = "ALIGN_*_REQ pcm_sample_rate missing";
 
         if (err.empty()) {
-            if (reset) { acc_pcm.clear(); acc_pcm_sr = pcm_sr; cached_valid = false; }
+            if (reset) { acc_pcm.clear(); acc_pcm_sr = pcm_sr; cached_valid = false; max_emitted = 0; }
             if (acc_pcm_sr == 0) acc_pcm_sr = pcm_sr;
             if (acc_pcm_sr != pcm_sr) err = "ALIGN_*_REQ pcm_sample_rate changed mid-stream";
             else if (!pcm_delta.empty()) acc_pcm.insert(acc_pcm.end(), pcm_delta.begin(), pcm_delta.end());
@@ -675,6 +683,11 @@ int run_aligner_loop(int fd) {
             // while leaving an interior dip alone.
             const float min_conf = partial_min_conf();
             while (n_emit > 0 && out_conf[n_emit - 1] < min_conf) n_emit--;
+
+            // Gate 3: never retract. Both gates above are re-derived from a fresh
+            // alignment each pass, so either can shrink the prefix.
+            if (n_emit < max_emitted) n_emit = std::min(max_emitted, words.size());
+            max_emitted = n_emit;
         }
 
         json resp;

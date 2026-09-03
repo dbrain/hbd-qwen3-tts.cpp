@@ -276,9 +276,15 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
     // ---- voice library (filesystem; GPU-free — works while the worker is unloaded) ----
     srv.Get("/v1/audio/voices", [&cx](const httplib::Request &, httplib::Response & res) {
         std::lock_guard<std::mutex> lk(cx.mtx);
-        json arr = json::array();
+        // "default" is a REAL selectable value -- /v1/audio/speech treats it as
+        // "no reference voice", i.e. the model's own narrator -- so it belongs in
+        // both shapes. Listing it only in the flat map made the two disagree
+        // (map said ["default"], array said []), which reads as a bug.
+        json arr = json::array({ {{"id","default"},{"builtin",true},{"frames",0},
+                                  {"codebooks",0},{"has_ref_text",false},
+                                  {"has_sample",false}} });
         for (const auto & v : cx.voices->list())
-            arr.push_back({{"id",v.id},{"frames",v.T},{"codebooks",v.N},
+            arr.push_back({{"id",v.id},{"builtin",false},{"frames",v.T},{"codebooks",v.N},
                            {"has_ref_text",v.has_ref_text},{"has_sample",v.has_sample}});
         // Two shapes in one body. qwen3-tts answers `{"<model_id>": ["default",
         // "alice", ...]}` and kobbler's parse_voices_body expects exactly that,
@@ -470,6 +476,21 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                             "interleaved speech.audio.alignment.* events, not in a buffered body");
         }
 
+        // `speed` is not implemented -- neither engine this replaces implemented
+        // it either. Accepting it and returning unchanged-rate audio is the worst
+        // option: the caller believes it worked. 1.0 is the OpenAI default and a
+        // genuine no-op, so let it through; anything else is refused with the
+        // fix, because resampling in the player is instant and also lets the
+        // client divide the alignment timestamps to match.
+        if (body.contains("speed") && body["speed"].is_number()) {
+            const double sp = body["speed"].get<double>();
+            if (std::fabs(sp - 1.0) > 1e-6)
+                return err_json(res, 400,
+                    "speed is not implemented server-side; set playbackRate on the audio "
+                    "element (with preservesPitch) and divide any alignment t0_ms/t1_ms by "
+                    "the same rate. Only speed=1.0 is accepted.");
+        }
+
         // ---- long-form knobs (higgs-server's spelling, so a client that already
         // drives higgs long-form works unchanged) ----
         // `buffer` is higgs's chunk-count history. Breeze caps by FRAMES instead:
@@ -644,9 +665,15 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                         if (aligner_lock.owns_lock()) aligner_lock.unlock();
                     }
 
+                    // `truncated` means the model never emitted EOS -- the text
+                    // ran past max_new_frames and the audio stops mid-sentence.
+                    // Without this the client ships a short clip believing it is
+                    // complete, which is the failure the migration doc warns
+                    // about at `long:false`.
                     emit_event("speech.audio.done",
                                {{"type","speech.audio.done"},{"frames",r.T},
-                                {"ttfa_ms",r.ttfa_ms},{"ok",ok}});
+                                {"ttfa_ms",r.ttfa_ms},{"ok",ok},
+                                {"truncated",r.truncated}});
                     sink.done();
                     return true;
                 });
@@ -724,6 +751,10 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
         res.set_header("X-Frames", std::to_string(r.T));
         const double busy = (r.text_enc_ms + r.prefill_ms + r.decode_ms + r.codec_ms) / 1000.0;
         if (secs > 0) res.set_header("X-RTF", std::to_string(busy / secs));
+        // A buffered body has no event to carry `truncated`, and a short clip is
+        // indistinguishable from a complete one, so signal it in a header. The
+        // SSE path reports the same thing on speech.audio.done.
+        res.set_header("X-Truncated", r.truncated ? "1" : "0");
 
         // kobbler's preview endpoint defaults to response_format=mp3 and then
         // labels the body audio/mpeg. Falling through to WAV shipped WAV bytes

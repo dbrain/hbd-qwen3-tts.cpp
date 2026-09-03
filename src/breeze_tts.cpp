@@ -173,8 +173,10 @@ bool BreezeTTS::run_ar(const gen_params & gp, int chunk_frames, const pcm_cb * o
     bool first_chunk = true;
     const auto t_start = t_ar_start_;
 
+    bool hit_eos = false;
     for (int step = 0; step < gp.max_new_frames; ++step) {
-        if (cancelled()) break;
+        if (cancelled()) { hit_eos = true; break; }   // a cancel is not a truncation
+
         if ((int) logits.size() < LM) { error_msg_ = "ar: short logits"; return false; }
 
         // GeneratedTokenRepetitionPenaltyLogitsProcessor: only over generated,
@@ -189,7 +191,7 @@ bool BreezeTTS::run_ar(const gen_params & gp, int chunk_frames, const pcm_cb * o
         for (int i = CB; i < V; ++i) logits[i] = -INFINITY;   // reserved codec ids
 
         const int c0 = sample_logits(logits, LM, gp.temperature, gp.top_k, gp.top_p, rng);
-        if (c0 == EOS) break;
+        if (c0 == EOS) { hit_eos = true; break; }
         c0_hist.push_back(c0);
 
         std::vector<int32_t> frame(NC, 0);
@@ -230,6 +232,11 @@ bool BreezeTTS::run_ar(const gen_params & gp, int chunk_frames, const pcm_cb * o
             }
         }
     }
+    out.truncated = !hit_eos;
+    if (out.truncated)
+        fprintf(stderr, "breeze: TRUNCATED at max_new_frames=%d (%.1f s) -- the text did not "
+                        "finish; use long-form chunking or raise max_new_frames\n",
+                gp.max_new_frames, gp.max_new_frames / 12.5);
     out.decode_ms = ms_since(t_dec) - out.codec_ms;
 
     auto t_c = clk::now();
@@ -439,6 +446,7 @@ bool BreezeTTS::synthesize_long(const std::string & text, const gen_params & gp,
         out.T += r.T;
         out.prefill_ms += r.prefill_ms; out.decode_ms += r.decode_ms;
         out.codec_ms += r.codec_ms;     out.text_enc_ms += r.text_enc_ms;
+        out.truncated |= r.truncated;   // any short chunk truncates the whole read
         if (ci == 0) out.ttfa_ms = r.ttfa_ms;
 
         // Carry only the TAIL of this chunk. Prompt tokens + ref frames + new
