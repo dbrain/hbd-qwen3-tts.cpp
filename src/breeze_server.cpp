@@ -22,7 +22,9 @@
 //   GET    /v1/audio/voices/<id>/sample.wav -> the reference clip
 //   GET    /v1/audio/voices/<id>/ref_text   -> the reference transcript
 //   DELETE /v1/audio/voices/<id>            -> {}
-//   POST   /v1/audio/speech                 -> wav|pcm|mp3 bytes, or SSE stream
+//   POST   /v1/audio/speech                 -> wav|pcm|mp3 bytes, or a stream:
+//              stream_format="sse"   -> events, the only path carrying alignment
+//              stream_format="audio" -> raw wav|pcm chunks in the response body
 //   POST   /v1/admin/load | /v1/admin/unload
 
 #include "audio/ffmpeg_encode.h"
@@ -466,12 +468,29 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
         }
         const bool have_voice = ref.T > 0;
 
+        // ---- stream_format ----
+        // Two OpenAI values: "sse" (events carrying base64 audio, the only path
+        // that can also carry alignment) and "audio" (raw audio chunks in the
+        // response body). tts-qwen3 implements both and 400s on anything else;
+        // breeze used to test only for "sse", so "audio" fell through to the
+        // BUFFERED path -- a silent loss of streaming, and the worst possible
+        // shape of it: the caller waits for the whole read with no signal.
+        std::string stream_format = body.value("stream_format", std::string());
+        // tts-qwen3 treats an explicit batch-size knob with no stream_format as
+        // a request to stream. Mirror it, or a client ported across engines
+        // silently loses streaming again.
+        if (stream_format.empty()
+            && (body.contains("stream_batch_size") || body.contains("stream_first_batch_size")))
+            stream_format = "audio";
+        if (!stream_format.empty() && stream_format != "sse" && stream_format != "audio")
+            return err_json(res, 400, "unsupported stream_format '" + stream_format +
+                                      "', supported: audio, sse");
+
         // Alignment is only produced on the SSE path, interleaved with the audio
         // deltas — a buffered response has nowhere to put it. Silently dropping
         // the flag made a caller think alignment was on when no aligner ever ran,
         // so refuse instead.
-        if (body.value("align", false)
-            && body.value("stream_format", std::string()) != "sse") {
+        if (body.value("align", false) && stream_format != "sse") {
             return err_json(res, 400,
                             "align requires stream_format=\"sse\"; word timings are delivered as "
                             "interleaved speech.audio.alignment.* events, not in a buffered body");
@@ -523,7 +542,7 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
         // ---- SSE streaming + optional interleaved forced alignment ----
         // The path kobbler's BookReader takes: stream_format="sse",
         // response_format="pcm", align=true, align_stream="partial".
-        if (body.value("stream_format", std::string()) == "sse") {
+        if (stream_format == "sse") {
             const bool do_align      = body.value("align", false);
             const std::string a_mode = body.value("align_stream", std::string("final-only"));
             // align_stream only chooses whether the INCREMENTAL events reach the
@@ -717,24 +736,43 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
             return;
         }
 
-        // ---- chunked-WAV streaming ----
-        if (body.value("stream", false)) {
-            res.set_header("Content-Type", "audio/wav");
-            const int chunk_frames = body.value("chunk_frames", 6);
-            res.set_chunked_content_provider("audio/wav",
+        // ---- chunked audio streaming (stream_format="audio") ----
+        // `stream: true` is the older boolean spelling; both land here.
+        if (stream_format == "audio" || body.value("stream", false)) {
+            // Honour response_format rather than always shipping WAV. mp3 needs a
+            // streaming encoder we do not have, and answering it with WAV bytes
+            // under audio/mpeg is exactly the silent mislabelling already fixed
+            // on the buffered path, so refuse it explicitly.
+            const std::string sfmt = body.value("response_format", std::string("wav"));
+            if (sfmt == "mp3")
+                return err_json(res, 400,
+                    "response_format=\"mp3\" cannot be streamed; use \"pcm\" or \"wav\" with "
+                    "stream_format=\"audio\", or request mp3 without streaming");
+            if (sfmt != "wav" && sfmt != "pcm")
+                return err_json(res, 400, "unsupported response_format '" + sfmt +
+                                          "' for stream_format=\"audio\"; use pcm or wav");
+            const bool raw_pcm = (sfmt == "pcm");
+            const char * ctype = raw_pcm ? "audio/pcm" : "audio/wav";
+            res.set_header("Content-Type", ctype);
+            const int chunk_frames = body.value("chunk_frames",
+                                       body.value("stream_first_batch_size",
+                                         body.value("stream_batch_size", 6)));
+            res.set_chunked_content_provider(ctype,
                 [eng, &cx, input, gp, have_voice, chunk_frames, long_form, chunk_words,
-                 long_ref_frames, gap_ms, speed, stretching, ref = std::move(ref)]
+                 long_ref_frames, gap_ms, speed, stretching, raw_pcm, ref = std::move(ref)]
                 (size_t, httplib::DataSink & sink) mutable {
                     // Streaming WAV cannot know its length up front; 0xFFFFFFFF is
                     // the conventional placeholder here (unlike the buffered path,
                     // which writes real sizes).
-                    std::string h;
-                    auto u32 = [&](uint32_t v) { h.append((const char *) &v, 4); };
-                    auto u16 = [&](uint16_t v) { h.append((const char *) &v, 2); };
-                    h.append("RIFF", 4); u32(0xFFFFFFFF); h.append("WAVE", 4);
-                    h.append("fmt ", 4); u32(16); u16(1); u16(1); u32(24000); u32(48000); u16(2); u16(16);
-                    h.append("data", 4); u32(0xFFFFFFFF);
-                    sink.write(h.data(), h.size());
+                    if (!raw_pcm) {
+                        std::string h;
+                        auto u32 = [&](uint32_t v) { h.append((const char *) &v, 4); };
+                        auto u16 = [&](uint16_t v) { h.append((const char *) &v, 2); };
+                        h.append("RIFF", 4); u32(0xFFFFFFFF); h.append("WAVE", 4);
+                        h.append("fmt ", 4); u32(16); u16(1); u16(1); u32(24000); u32(48000); u16(2); u16(16);
+                        h.append("data", 4); u32(0xFFFFFFFF);
+                        sink.write(h.data(), h.size());
+                    }
 
                     std::atomic<bool> wd_stop{false};
                     std::thread wd([&] {
