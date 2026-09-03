@@ -272,7 +272,7 @@ int main(int argc, char ** argv) {
         const int ref_frames = atoi(argval(argc, argv, "--long-ref-frames", "250"));
         breeze::gen_result r;
         auto tw = std::chrono::steady_clock::now();
-        if (!eng.synthesize_long(text, gp, long_chunk, ref_frames, nullptr, r)) {
+        if (!eng.synthesize_long(text, gp, long_chunk, ref_frames, 0, nullptr, r)) {
             fprintf(stderr, "long: %s\n", eng.get_error().c_str()); return 1;
         }
         const double wall = std::chrono::duration<double, std::milli>(

@@ -53,6 +53,12 @@ public:
 
     bool synthesize(const std::string & text, const gen_params & gp,
                     const ref_voice * ref, gen_result & out);
+    // Rolling-context long-form. Runs inside the worker so the per-chunk codes
+    // never have to cross the IPC.
+    bool synthesize_long(const std::string & text, const gen_params & gp,
+                         int chunk_words, int ref_max_frames,
+                         int stream_chunk_frames,
+                         const BreezeTTS::pcm_cb & on_chunk, gen_result & out);
     bool synthesize_stream(const std::string & text, const gen_params & gp,
                            const ref_voice * ref, int chunk_frames,
                            const BreezeTTS::pcm_cb & on_chunk, gen_result & out);

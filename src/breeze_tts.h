@@ -107,8 +107,12 @@ public:
     // frames + new frames all share n_ctx (2048), so an unbounded reference
     // eats the budget it is trying to protect. ~250 frames (20 s) is plenty to
     // hold a voice.
+    // stream_chunk_frames > 0 streams each text chunk's codec blocks through
+    // on_chunk as they are produced, so TTFA stays at the first block rather
+    // than the first whole chunk (~45 s in).
     bool synthesize_long(const std::string & text, const gen_params & gp,
                          int chunk_words, int ref_max_frames,
+                         int stream_chunk_frames,
                          const pcm_cb & on_chunk, gen_result & out);
 
     // Split text into ~chunk_words chunks on sentence boundaries. Exposed so a

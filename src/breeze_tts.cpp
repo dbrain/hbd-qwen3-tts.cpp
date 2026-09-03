@@ -383,6 +383,7 @@ std::vector<std::string> BreezeTTS::chunk_text(const std::string & text, int chu
 
 bool BreezeTTS::synthesize_long(const std::string & text, const gen_params & gp,
                                 int chunk_words, int ref_max_frames,
+                                int stream_chunk_frames,
                                 const pcm_cb & on_chunk, gen_result & out) {
     if (!loaded_) { error_msg_ = "not loaded"; return false; }
     if (ref_max_frames <= 0) ref_max_frames = 250;
@@ -403,12 +404,26 @@ bool BreezeTTS::synthesize_long(const std::string & text, const gen_params & gp,
         const bool have_hist = hist.T > 0;
         const int used_ref_T = have_hist ? hist.T : 0;
         if (have_hist) { hist.ref_text = hist_text; }
-        if (!synthesize(chunks[ci], gp, have_hist ? &hist : nullptr, r)) {
+        const bool last = (ci + 1 == chunks.size());
+        bool ok;
+        if (stream_chunk_frames > 0 && on_chunk) {
+            // Forward each codec block as it lands, but only report is_final on
+            // the last block of the last chunk -- a mid-document "final" would
+            // close the caller's stream early.
+            auto fwd = [&](const float * pcm, int n, bool fin) {
+                on_chunk(pcm, n, fin && last);
+            };
+            ok = synthesize_stream(chunks[ci], gp, have_hist ? &hist : nullptr,
+                                   stream_chunk_frames, fwd, r);
+        } else {
+            ok = synthesize(chunks[ci], gp, have_hist ? &hist : nullptr, r);
+            if (ok && on_chunk && !r.pcm.empty())
+                on_chunk(r.pcm.data(), (int) r.pcm.size(), last);
+        }
+        if (!ok) {
             error_msg_ = "chunk " + std::to_string(ci) + ": " + error_msg_;
             return false;
         }
-        if (on_chunk && !r.pcm.empty())
-            on_chunk(r.pcm.data(), (int) r.pcm.size(), ci + 1 == chunks.size());
         out.pcm.insert(out.pcm.end(), r.pcm.begin(), r.pcm.end());
         out.codes.insert(out.codes.end(), r.codes.begin(), r.codes.end());
         out.T += r.T;

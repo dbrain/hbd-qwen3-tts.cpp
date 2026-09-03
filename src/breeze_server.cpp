@@ -470,6 +470,22 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                             "interleaved speech.audio.alignment.* events, not in a buffered body");
         }
 
+        // ---- long-form knobs (higgs-server's spelling, so a client that already
+        // drives higgs long-form works unchanged) ----
+        // `buffer` is higgs's chunk-count history. Breeze caps by FRAMES instead:
+        // prompt tokens, reference frames and new frames all share n_ctx, so a
+        // 2-chunk history would be ~1100 frames and starve the generation it is
+        // meant to protect. Accept the knob, convert, clamp.
+        const bool long_form   = body.value("long", false);
+        const int  chunk_words = body.value("chunk_words", 120);
+        int long_ref_frames    = body.value("long_ref_frames", 250);
+        if (body.contains("buffer")) {
+            const int buf = body.value("buffer", 2);
+            long_ref_frames = std::min(long_ref_frames > 0 ? long_ref_frames : 250,
+                                       std::max(1, buf) * 250);
+        }
+        if (long_ref_frames > 600) long_ref_frames = 600;
+
         // ---- SSE streaming + optional interleaved forced alignment ----
         // The path kobbler's BookReader takes: stream_format="sse",
         // response_format="pcm", align=true, align_stream="partial".
@@ -498,6 +514,7 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
             res.set_header("X-Accel-Buffering", "no");
             res.set_chunked_content_provider("text/event-stream",
                 [eng, &cx, input, gp, do_align_run, emit_partials, have_voice, chunk_frames,
+                 long_form, chunk_words, long_ref_frames,
                  ref = std::move(ref), words = std::move(words)]
                 (size_t, httplib::DataSink & sink) mutable -> bool {
                     Activity act_stream(cx);
@@ -579,10 +596,14 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                     {
                         std::lock_guard<std::mutex> lk(cx.mtx);
                         eng->clear_cancel();
-                        ok = eng->synthesize_stream(input, gp, have_voice ? &ref : nullptr, chunk_frames,
-                                                    [&](const float * pcm, int n, bool) {
-                                                        if (n > 0) emit_audio(pcm, n);
-                                                    }, r);
+                        auto emit_sse = [&](const float * pcm, int n, bool) {
+                            if (n > 0) emit_audio(pcm, n);
+                        };
+                        ok = long_form
+                           ? eng->synthesize_long(input, gp, chunk_words, long_ref_frames,
+                                                  chunk_frames, emit_sse, r)
+                           : eng->synthesize_stream(input, gp, have_voice ? &ref : nullptr,
+                                                    chunk_frames, emit_sse, r);
                     }
 
                     if (partial_active) {
@@ -628,7 +649,8 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
             res.set_header("Content-Type", "audio/wav");
             const int chunk_frames = body.value("chunk_frames", 6);
             res.set_chunked_content_provider("audio/wav",
-                [eng, &cx, input, gp, have_voice, chunk_frames, ref = std::move(ref)]
+                [eng, &cx, input, gp, have_voice, chunk_frames, long_form, chunk_words,
+                 long_ref_frames, ref = std::move(ref)]
                 (size_t, httplib::DataSink & sink) mutable {
                     // Streaming WAV cannot know its length up front; 0xFFFFFFFF is
                     // the conventional placeholder here (unlike the buffered path,
@@ -653,12 +675,16 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                     {
                         std::lock_guard<std::mutex> lk(cx.mtx);
                         eng->clear_cancel();
-                        ok = eng->synthesize_stream(input, gp, have_voice ? &ref : nullptr, chunk_frames,
-                            [&](const float * pcm, int n, bool) {
-                                if (n <= 0) return;
-                                const std::string b = pcm_f32_to_s16le(pcm, (size_t) n);
-                                sink.write(b.data(), b.size());
-                            }, r);
+                        auto emit_raw = [&](const float * pcm, int n, bool) {
+                            if (n <= 0) return;
+                            const std::string b = pcm_f32_to_s16le(pcm, (size_t) n);
+                            sink.write(b.data(), b.size());
+                        };
+                        ok = long_form
+                           ? eng->synthesize_long(input, gp, chunk_words, long_ref_frames,
+                                                  chunk_frames, emit_raw, r)
+                           : eng->synthesize_stream(input, gp, have_voice ? &ref : nullptr,
+                                                    chunk_frames, emit_raw, r);
                     }
                     wd_stop.store(true);
                     if (wd.joinable()) wd.join();
@@ -674,7 +700,9 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
         {
             std::lock_guard<std::mutex> lk(cx.mtx);
             eng->clear_cancel();
-            ok = eng->synthesize(input, gp, have_voice ? &ref : nullptr, r);
+            ok = long_form
+               ? eng->synthesize_long(input, gp, chunk_words, long_ref_frames, 0, nullptr, r)
+               : eng->synthesize(input, gp, have_voice ? &ref : nullptr, r);
         }
         if (!ok) return err_json(res, 500, eng->get_error());
         // A worker abort surfaces as an empty result, and an HTTP 200 with a
