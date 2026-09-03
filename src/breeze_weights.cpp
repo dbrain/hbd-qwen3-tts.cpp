@@ -17,10 +17,13 @@ using qwen3_tts::release_preferred_backend;
 
 void BreezeWeights::unload() {
     if (buffer_)      { ggml_backend_buffer_free(buffer_); buffer_ = nullptr; }
+    if (buffer_cpu_)  { ggml_backend_buffer_free(buffer_cpu_); buffer_cpu_ = nullptr; }
     if (ctx_)         { ggml_free(ctx_); ctx_ = nullptr; }
+    if (ctx_cpu_)     { ggml_free(ctx_cpu_); ctx_cpu_ = nullptr; }
     if (backend_)     { release_preferred_backend(backend_); backend_ = nullptr; }
     if (backend_cpu_) { ggml_backend_free(backend_cpu_); backend_cpu_ = nullptr; }
-    tensors_.clear();
+    tensors_.clear(); gpu_tensors_.clear(); cpu_tensors_.clear();
+    te_on_cpu_ = false;
 }
 
 struct ggml_tensor * BreezeWeights::getf(const char * fmt, ...) const {
@@ -90,6 +93,8 @@ bool BreezeWeights::load(const std::string & path) {
     struct ggml_init_params p = { ggml_tensor_overhead() * (size_t) (nt + 128), nullptr, true };
     ctx_ = ggml_init(p);
     if (!ctx_) { error_msg_ = "ggml_init failed"; return false; }
+    ctx_cpu_ = ggml_init(p);
+    if (!ctx_cpu_) { error_msg_ = "ggml_init (cpu) failed"; return false; }
     // ggml_backend_alloc_ctx_tensors lays tensors out in ctx-creation order, and
     // load_tensor_data_from_file fills them by name, so the creation order is a
     // free choice of buffer layout. Emit attn_q/attn_k/attn_v back-to-back and
@@ -131,19 +136,40 @@ bool BreezeWeights::load(const std::string & path) {
             }
             if (!grouped) push(name);
         }
+        // BREEZE_TEXT_ENC_CPU=1 keeps the text encoder's weights in host RAM.
+        // It is 40% of the weight bytes for ~1% of the runtime -- it runs once
+        // per request, not once per frame -- so on a shared card that is a very
+        // cheap ~926 MiB. No change is needed in breeze_text_enc.cpp: its
+        // scheduler already lists the CPU backend, and ggml-sched places an op
+        // on the backend its weights live on.
+        const char * te_cpu_env = std::getenv("BREEZE_TEXT_ENC_CPU");
+        te_on_cpu_ = backend_cpu_ && te_cpu_env && *te_cpu_env && *te_cpu_env != '0';
+
         for (const auto & name : order) {
-            struct ggml_tensor * t = ggml_dup_tensor(ctx_, ggml_get_tensor(meta, name.c_str()));
+            const bool to_cpu = te_on_cpu_ && name.rfind("text_enc.", 0) == 0;
+            ggml_context * dst = to_cpu ? ctx_cpu_ : ctx_;
+            struct ggml_tensor * t = ggml_dup_tensor(dst, ggml_get_tensor(meta, name.c_str()));
             ggml_set_name(t, name.c_str());
             tensors_[name] = t;
+            (to_cpu ? cpu_tensors_ : gpu_tensors_)[name] = t;
         }
     }
-    if (!load_tensor_data_from_file(path, gc, ctx_, tensors_, buffer_, error_msg_, dev_type_))
+    if (!load_tensor_data_from_file(path, gc, ctx_, gpu_tensors_, buffer_, error_msg_, dev_type_))
         return false;
+    if (te_on_cpu_ && !cpu_tensors_.empty()) {
+        if (!load_tensor_data_from_file(path, gc, ctx_cpu_, cpu_tensors_, buffer_cpu_, error_msg_,
+                                        GGML_BACKEND_DEVICE_TYPE_CPU))
+            return false;
+    }
 
     fprintf(stderr, "  Breeze weights: %s  %lld tensors, %.1f MiB on %s\n",
             path.c_str(), (long long) nt,
             ggml_backend_buffer_get_size(buffer_) / (1024.0 * 1024.0),
             dev ? ggml_backend_dev_name(dev) : "?");
+    if (te_on_cpu_ && buffer_cpu_) {
+        fprintf(stderr, "  Breeze weights: text encoder on CPU, %.1f MiB moved off the device\n",
+                ggml_backend_buffer_get_size(buffer_cpu_) / (1024.0 * 1024.0));
+    }
     return true;
 }
 

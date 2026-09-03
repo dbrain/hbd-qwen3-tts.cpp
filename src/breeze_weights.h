@@ -58,6 +58,12 @@ private:
     std::map<std::string, struct ggml_tensor *> tensors_;
     struct ggml_context * ctx_ = nullptr;
     ggml_backend_buffer_t buffer_ = nullptr;
+    // Second home for the text encoder under BREEZE_TEXT_ENC_CPU: its own ctx +
+    // host buffer, so the device buffer holds only what runs per frame.
+    ggml_backend_buffer_t buffer_cpu_ = nullptr;
+    struct ggml_context * ctx_cpu_ = nullptr;
+    std::map<std::string, struct ggml_tensor *> gpu_tensors_, cpu_tensors_;
+    bool te_on_cpu_ = false;
     ggml_backend_t backend_ = nullptr;
     ggml_backend_t backend_cpu_ = nullptr;
     enum ggml_backend_dev_type dev_type_ = GGML_BACKEND_DEVICE_TYPE_CPU;
