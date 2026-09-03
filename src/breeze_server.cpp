@@ -485,6 +485,10 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                                        std::max(1, buf) * 250);
         }
         if (long_ref_frames > 600) long_ref_frames = 600;
+        // Silence at each seam. higgs-server calls the same knob gap_ms (its
+        // default is 250 for multispeaker turns); 180 ms reads as a sentence
+        // break here without sounding like a stall.
+        const int gap_ms = body.value("gap_ms", 180);
 
         // ---- SSE streaming + optional interleaved forced alignment ----
         // The path kobbler's BookReader takes: stream_format="sse",
@@ -514,7 +518,7 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
             res.set_header("X-Accel-Buffering", "no");
             res.set_chunked_content_provider("text/event-stream",
                 [eng, &cx, input, gp, do_align_run, emit_partials, have_voice, chunk_frames,
-                 long_form, chunk_words, long_ref_frames,
+                 long_form, chunk_words, long_ref_frames, gap_ms,
                  ref = std::move(ref), words = std::move(words)]
                 (size_t, httplib::DataSink & sink) mutable -> bool {
                     Activity act_stream(cx);
@@ -601,7 +605,7 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                         };
                         ok = long_form
                            ? eng->synthesize_long(input, gp, chunk_words, long_ref_frames,
-                                                  chunk_frames, emit_sse, r)
+                                                  chunk_frames, gap_ms, emit_sse, r)
                            : eng->synthesize_stream(input, gp, have_voice ? &ref : nullptr,
                                                     chunk_frames, emit_sse, r);
                     }
@@ -650,7 +654,7 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
             const int chunk_frames = body.value("chunk_frames", 6);
             res.set_chunked_content_provider("audio/wav",
                 [eng, &cx, input, gp, have_voice, chunk_frames, long_form, chunk_words,
-                 long_ref_frames, ref = std::move(ref)]
+                 long_ref_frames, gap_ms, ref = std::move(ref)]
                 (size_t, httplib::DataSink & sink) mutable {
                     // Streaming WAV cannot know its length up front; 0xFFFFFFFF is
                     // the conventional placeholder here (unlike the buffered path,
@@ -682,7 +686,7 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                         };
                         ok = long_form
                            ? eng->synthesize_long(input, gp, chunk_words, long_ref_frames,
-                                                  chunk_frames, emit_raw, r)
+                                                  chunk_frames, gap_ms, emit_raw, r)
                            : eng->synthesize_stream(input, gp, have_voice ? &ref : nullptr,
                                                     chunk_frames, emit_raw, r);
                     }
@@ -701,7 +705,7 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
             std::lock_guard<std::mutex> lk(cx.mtx);
             eng->clear_cancel();
             ok = long_form
-               ? eng->synthesize_long(input, gp, chunk_words, long_ref_frames, 0, nullptr, r)
+               ? eng->synthesize_long(input, gp, chunk_words, long_ref_frames, 0, gap_ms, nullptr, r)
                : eng->synthesize(input, gp, have_voice ? &ref : nullptr, r);
         }
         if (!ok) return err_json(res, 500, eng->get_error());

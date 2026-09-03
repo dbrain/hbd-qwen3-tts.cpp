@@ -110,9 +110,13 @@ public:
     // stream_chunk_frames > 0 streams each text chunk's codec blocks through
     // on_chunk as they are produced, so TTFA stays at the first block rather
     // than the first whole chunk (~45 s in).
+    // gap_ms inserts silence at each seam. The chunk boundary is a sentence
+    // end, but the model cannot see the next chunk and so gives it no
+    // sentence-final pause -- the last word of one chunk runs straight into the
+    // first of the next, which is audible as a rush even when the voice matches.
     bool synthesize_long(const std::string & text, const gen_params & gp,
                          int chunk_words, int ref_max_frames,
-                         int stream_chunk_frames,
+                         int stream_chunk_frames, int gap_ms,
                          const pcm_cb & on_chunk, gen_result & out);
 
     // Split text into ~chunk_words chunks on sentence boundaries. Exposed so a

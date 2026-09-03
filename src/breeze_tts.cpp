@@ -383,10 +383,12 @@ std::vector<std::string> BreezeTTS::chunk_text(const std::string & text, int chu
 
 bool BreezeTTS::synthesize_long(const std::string & text, const gen_params & gp,
                                 int chunk_words, int ref_max_frames,
-                                int stream_chunk_frames,
+                                int stream_chunk_frames, int gap_ms,
                                 const pcm_cb & on_chunk, gen_result & out) {
     if (!loaded_) { error_msg_ = "not loaded"; return false; }
     if (ref_max_frames <= 0) ref_max_frames = 250;
+    if (gap_ms < 0) gap_ms = 0;
+    const std::vector<float> gap((size_t) (gap_ms * w_.cfg().cc.sample_rate / 1000), 0.0f);
     const int NC = w_.cfg().bb.n_codebooks;
 
     auto chunks = chunk_text(text, chunk_words);
@@ -405,6 +407,10 @@ bool BreezeTTS::synthesize_long(const std::string & text, const gen_params & gp,
         const int used_ref_T = have_hist ? hist.T : 0;
         if (have_hist) { hist.ref_text = hist_text; }
         const bool last = (ci + 1 == chunks.size());
+        if (ci > 0 && !gap.empty()) {
+            if (on_chunk) on_chunk(gap.data(), (int) gap.size(), false);
+            out.pcm.insert(out.pcm.end(), gap.begin(), gap.end());
+        }
         bool ok;
         if (stream_chunk_frames > 0 && on_chunk) {
             // Forward each codec block as it lands, but only report is_final on
