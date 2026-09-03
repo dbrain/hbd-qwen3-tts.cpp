@@ -264,6 +264,21 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
+    breeze::ref_voice ref;
+    const std::string refw = argval(argc, argv, "--ref-wav", "");
+    if (!refw.empty()) {
+        std::vector<float> pcm;
+        if (!read_wav_24k(refw, pcm)) { fprintf(stderr, "cannot read %s\n", refw.c_str()); return 1; }
+        auto te = std::chrono::steady_clock::now();
+        if (!eng.encode_voice(pcm.data(), (int) pcm.size(), ref.codes, ref.T)) {
+            fprintf(stderr, "encode_voice: %s\n", eng.get_error().c_str()); return 1;
+        }
+        ref.ref_text = argval(argc, argv, "--ref-text", "");
+        printf("ref: %zu samples -> %d frames in %.0f ms\n", pcm.size(), ref.T,
+               std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - te).count());
+    }
+
     // --long: rolling-context long-form. Renders the whole text in chunks, each
     // conditioned on the previous chunk's generated audio, so the voice carries
     // without needing a saved reference.
@@ -279,7 +294,7 @@ int main(int argc, char ** argv) {
         int lblocks = 0;
         breeze::BreezeTTS::pcm_cb lcb = [&](const float *, int n, bool) { if (n > 0) ++lblocks; };
         auto tw = std::chrono::steady_clock::now();
-        if (!eng.synthesize_long(text, gp, long_chunk, ref_frames, lstream,
+        if (!eng.synthesize_long(text, gp, ref.T ? &ref : nullptr, long_chunk, ref_frames, lstream,
                                  atoi(argval(argc, argv, "--long-gap-ms", "180")),
                                  lstream > 0 ? lcb : breeze::BreezeTTS::pcm_cb{}, r)) {
             fprintf(stderr, "long: %s\n", eng.get_error().c_str()); return 1;
@@ -294,21 +309,6 @@ int main(int argc, char ** argv) {
         write_wav(outp, r.pcm, eng.sample_rate());
         printf("wrote %s\n", outp.c_str());
         return 0;
-    }
-
-    breeze::ref_voice ref;
-    const std::string refw = argval(argc, argv, "--ref-wav", "");
-    if (!refw.empty()) {
-        std::vector<float> pcm;
-        if (!read_wav_24k(refw, pcm)) { fprintf(stderr, "cannot read %s\n", refw.c_str()); return 1; }
-        auto te = std::chrono::steady_clock::now();
-        if (!eng.encode_voice(pcm.data(), (int) pcm.size(), ref.codes, ref.T)) {
-            fprintf(stderr, "encode_voice: %s\n", eng.get_error().c_str()); return 1;
-        }
-        ref.ref_text = argval(argc, argv, "--ref-text", "");
-        printf("ref: %zu samples -> %d frames in %.0f ms\n", pcm.size(), ref.T,
-               std::chrono::duration<double, std::milli>(
-                   std::chrono::steady_clock::now() - te).count());
     }
 
     std::vector<double> rtfs, ttfas, walls;

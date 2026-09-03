@@ -114,7 +114,12 @@ public:
     // end, but the model cannot see the next chunk and so gives it no
     // sentence-final pause -- the last word of one chunk runs straight into the
     // first of the next, which is audible as a rush even when the voice matches.
+    // `ref` seeds the FIRST chunk (a saved voice). Later chunks roll on their
+    // own generated audio, which already carries that voice — so the narrator is
+    // whoever `ref` is, for the whole document. Pass nullptr to let the model
+    // pick its own voice on chunk 0 and hold it from there.
     bool synthesize_long(const std::string & text, const gen_params & gp,
+                         const ref_voice * ref,
                          int chunk_words, int ref_max_frames,
                          int stream_chunk_frames, int gap_ms,
                          const pcm_cb & on_chunk, gen_result & out);

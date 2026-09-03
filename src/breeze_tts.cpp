@@ -382,6 +382,7 @@ std::vector<std::string> BreezeTTS::chunk_text(const std::string & text, int chu
 }
 
 bool BreezeTTS::synthesize_long(const std::string & text, const gen_params & gp,
+                                const ref_voice * ref,
                                 int chunk_words, int ref_max_frames,
                                 int stream_chunk_frames, int gap_ms,
                                 const pcm_cb & on_chunk, gen_result & out) {
@@ -397,15 +398,18 @@ bool BreezeTTS::synthesize_long(const std::string & text, const gen_params & gp,
     out = gen_result{};
     // Rolling history: the previous chunk's generated codes and its text, which
     // together are exactly the clone template's (ref_text, ref_audio) pair.
+    // Seed from the caller's voice so chunk 0 speaks in it; from chunk 1 the
+    // rolling history takes over and carries that same voice forward.
     ref_voice hist;
     std::string hist_text;
+    if (ref && ref->T > 0) { hist = *ref; hist_text = ref->ref_text; }
 
     for (size_t ci = 0; ci < chunks.size(); ++ci) {
         if (cancelled()) break;
         gen_result r;
         const bool have_hist = hist.T > 0;
         const int used_ref_T = have_hist ? hist.T : 0;
-        if (have_hist) { hist.ref_text = hist_text; }
+        if (have_hist) hist.ref_text = hist_text;
         const bool last = (ci + 1 == chunks.size());
         if (ci > 0 && !gap.empty()) {
             if (on_chunk) on_chunk(gap.data(), (int) gap.size(), false);

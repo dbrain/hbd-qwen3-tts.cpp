@@ -476,7 +476,12 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
         // prompt tokens, reference frames and new frames all share n_ctx, so a
         // 2-chunk history would be ~1100 frames and starve the generation it is
         // meant to protect. Accept the knob, convert, clamp.
-        const bool long_form   = body.value("long", false);
+        // Long-form is the DEFAULT. For a short input chunk_text returns a single
+        // chunk and the path is identical to a plain synth, so defaulting it on
+        // costs nothing and means a caller cannot accidentally hit the silent
+        // truncation at ~164 words. Send "long": false for exact single-shot
+        // control.
+        const bool long_form   = body.value("long", true);
         const int  chunk_words = body.value("chunk_words", 120);
         int long_ref_frames    = body.value("long_ref_frames", 250);
         if (body.contains("buffer")) {
@@ -604,8 +609,8 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                             if (n > 0) emit_audio(pcm, n);
                         };
                         ok = long_form
-                           ? eng->synthesize_long(input, gp, chunk_words, long_ref_frames,
-                                                  chunk_frames, gap_ms, emit_sse, r)
+                           ? eng->synthesize_long(input, gp, have_voice ? &ref : nullptr, chunk_words,
+                                                  long_ref_frames, chunk_frames, gap_ms, emit_sse, r)
                            : eng->synthesize_stream(input, gp, have_voice ? &ref : nullptr,
                                                     chunk_frames, emit_sse, r);
                     }
@@ -685,8 +690,8 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                             sink.write(b.data(), b.size());
                         };
                         ok = long_form
-                           ? eng->synthesize_long(input, gp, chunk_words, long_ref_frames,
-                                                  chunk_frames, gap_ms, emit_raw, r)
+                           ? eng->synthesize_long(input, gp, have_voice ? &ref : nullptr, chunk_words,
+                                                  long_ref_frames, chunk_frames, gap_ms, emit_raw, r)
                            : eng->synthesize_stream(input, gp, have_voice ? &ref : nullptr,
                                                     chunk_frames, emit_raw, r);
                     }
@@ -705,7 +710,8 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
             std::lock_guard<std::mutex> lk(cx.mtx);
             eng->clear_cancel();
             ok = long_form
-               ? eng->synthesize_long(input, gp, chunk_words, long_ref_frames, 0, gap_ms, nullptr, r)
+               ? eng->synthesize_long(input, gp, have_voice ? &ref : nullptr, chunk_words,
+                                     long_ref_frames, 0, gap_ms, nullptr, r)
                : eng->synthesize(input, gp, have_voice ? &ref : nullptr, r);
         }
         if (!ok) return err_json(res, 500, eng->get_error());
