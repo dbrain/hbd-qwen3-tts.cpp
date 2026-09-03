@@ -656,20 +656,25 @@ int run_aligner_loop(int fd) {
         // sees the whole waveform and legitimately times every word.
         size_t n_emit = words.size();
         if (ok && resp_tag == Frame::PARTIAL_RESP && partial_trim_enabled()) {
-            // Two gates, because neither alone is sufficient. A word cannot end
-            // after the audio that exists -- but the ramp is COMPRESSED into the
-            // audio window when the text still far outruns the audio, so early
-            // on it passes the time gate (measured: 90 words "resolved" in 7.2 s
-            // = 12.5 words/s, four times a plausible speaking rate, the tail of
-            // it all at confidence 0.02). Confidence is what tells them apart.
-            // Trimming one real word early is self-correcting -- the next
-            // partial re-sends it -- whereas admitting a ramp word jumps a
-            // read-along highlight far ahead of the voice.
-            const float min_conf = partial_min_conf();
+            // Gate 1: a word cannot end after the audio that exists.
             n_emit = 0;
-            while (n_emit < words.size()
-                   && out_t1[n_emit] <= audio_seen_ms
-                   && out_conf[n_emit] >= min_conf) n_emit++;
+            while (n_emit < words.size() && out_t1[n_emit] <= audio_seen_ms) n_emit++;
+
+            // Gate 2: while the text still far outruns the audio the ramp is
+            // COMPRESSED INTO the audio window, so it survives gate 1 -- 138
+            // words "resolved" in 11.0 s (12.5 words/s, four times a plausible
+            // speaking rate) with everything past index ~50 at confidence 0.03.
+            //
+            // Drop the trailing run the aligner has no confidence in, rather
+            // than stopping at the first word it is unsure about: per-word
+            // confidence is NOT monotonic once the audio has caught up (a
+            // healthy 3.4 words/s partial measured 0.94 at index 126 and 0.07
+            // at index 112), so a first-dip cut permanently stalls the prefix
+            // -- it pinned 104 of 500 words at 146 s of audio. The ramp is
+            // instead a CONTIGUOUS low-confidence suffix, which this removes
+            // while leaving an interior dip alone.
+            const float min_conf = partial_min_conf();
+            while (n_emit > 0 && out_conf[n_emit - 1] < min_conf) n_emit--;
         }
 
         json resp;
