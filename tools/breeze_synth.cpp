@@ -271,11 +271,20 @@ int main(int argc, char ** argv) {
     if (long_chunk > 0) {
         const int ref_frames = atoi(argval(argc, argv, "--long-ref-frames", "250"));
         breeze::gen_result r;
+        // --stream N applies to --long too: each chunk's codec blocks are
+        // forwarded as they land, which is the path the server takes. Without
+        // this the CLI silently ignored --stream and measured the buffered path
+        // twice.
+        const int lstream = atoi(argval(argc, argv, "--stream", "0"));
+        int lblocks = 0;
+        breeze::BreezeTTS::pcm_cb lcb = [&](const float *, int n, bool) { if (n > 0) ++lblocks; };
         auto tw = std::chrono::steady_clock::now();
-        if (!eng.synthesize_long(text, gp, long_chunk, ref_frames, 0,
-                                     atoi(argval(argc, argv, "--long-gap-ms", "180")), nullptr, r)) {
+        if (!eng.synthesize_long(text, gp, long_chunk, ref_frames, lstream,
+                                 atoi(argval(argc, argv, "--long-gap-ms", "180")),
+                                 lstream > 0 ? lcb : breeze::BreezeTTS::pcm_cb{}, r)) {
             fprintf(stderr, "long: %s\n", eng.get_error().c_str()); return 1;
         }
+        if (lstream > 0) printf("stream blocks: %d\n", lblocks);
         const double wall = std::chrono::duration<double, std::milli>(
                                 std::chrono::steady_clock::now() - tw).count();
         const double dur = 1000.0 * r.pcm.size() / eng.sample_rate();
