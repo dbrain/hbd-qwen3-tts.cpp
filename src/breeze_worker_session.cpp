@@ -78,7 +78,8 @@ static json meta_to_json(const gen_result & r, bool cancelled) {
     return json{{"T", r.T}, {"n_prompt_tokens", r.n_prompt_tokens},
                 {"text_enc_ms", r.text_enc_ms}, {"prefill_ms", r.prefill_ms},
                 {"decode_ms", r.decode_ms}, {"codec_ms", r.codec_ms},
-                {"ttfa_ms", r.ttfa_ms}, {"cancelled", cancelled}};
+                {"ttfa_ms", r.ttfa_ms}, {"truncated", r.truncated},
+                {"cancelled", cancelled}};
 }
 static void meta_from_json(const json & j, gen_result & o) {
     o.T               = j.value("T", 0);
@@ -88,6 +89,11 @@ static void meta_from_json(const json & j, gen_result & o) {
     o.decode_ms       = j.value("decode_ms", 0.0);
     o.codec_ms        = j.value("codec_ms", 0.0);
     o.ttfa_ms         = j.value("ttfa_ms", 0.0);
+    // Worker isolation runs the whole synth in the forked child, so anything the
+    // caller needs must cross this boundary explicitly. Omitting `truncated`
+    // meant the parent always reported "not truncated" -- the flag worked in
+    // process and was silently dropped in the only configuration we deploy.
+    o.truncated       = j.value("truncated", false);
 }
 
 // ───────────────────────────── parent side ─────────────────────────────
