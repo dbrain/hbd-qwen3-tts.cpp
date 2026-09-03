@@ -484,7 +484,14 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
             // PARTIAL_RESP left in the socket would desync the FINAL handshake.
             const bool do_align_run  = do_align && cx.aligner && !cx.aligner_model.empty();
             const bool emit_partials = do_align_run && a_mode == "partial";
-            const int chunk_frames   = body.value("chunk_frames", 6);
+            // kobbler sends qwen3-tts's spelling, `stream_first_batch_size: 1`,
+            // to ask for the smallest possible first chunk (i.e. lowest TTFA).
+            // Our knob is `chunk_frames` -- same meaning, since the emit size
+            // doubles from there up to a cap -- so accept both names rather than
+            // silently ignoring the caller's TTFA tuning.
+            const int chunk_frames   = body.value("chunk_frames",
+                                         body.value("stream_first_batch_size",
+                                           body.value("stream_batch_size", 6)));
             std::vector<std::string> words = whitespace_split_for_align(input);
 
             res.set_header("Content-Type", "text/event-stream");
