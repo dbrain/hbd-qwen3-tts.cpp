@@ -426,6 +426,17 @@ static bool partial_trim_enabled() {
     return v;
 }
 
+// Confidence floor separating genuinely-resolved words from the synthetic ramp
+// (see the trim comment in handle_align). Measured: ramp words land at
+// 0.01-0.03, a real declining tail bottoms out around 0.10.
+static float partial_min_conf() {
+    static const float v = []() {
+        const char * e = std::getenv("QWEN3_FA_PARTIAL_MIN_CONF");
+        return (e && *e) ? (float) std::atof(e) : 0.05f;
+    }();
+    return v;
+}
+
 int run_aligner_loop(int fd) {
     setvbuf(stderr, nullptr, _IONBF, 0);
     // No prctl(PR_SET_PDEATHSIG): the eager-spawn-from-a-thread pattern would
@@ -645,8 +656,20 @@ int run_aligner_loop(int fd) {
         // sees the whole waveform and legitimately times every word.
         size_t n_emit = words.size();
         if (ok && resp_tag == Frame::PARTIAL_RESP && partial_trim_enabled()) {
+            // Two gates, because neither alone is sufficient. A word cannot end
+            // after the audio that exists -- but the ramp is COMPRESSED into the
+            // audio window when the text still far outruns the audio, so early
+            // on it passes the time gate (measured: 90 words "resolved" in 7.2 s
+            // = 12.5 words/s, four times a plausible speaking rate, the tail of
+            // it all at confidence 0.02). Confidence is what tells them apart.
+            // Trimming one real word early is self-correcting -- the next
+            // partial re-sends it -- whereas admitting a ramp word jumps a
+            // read-along highlight far ahead of the voice.
+            const float min_conf = partial_min_conf();
             n_emit = 0;
-            while (n_emit < words.size() && out_t1[n_emit] <= audio_seen_ms) n_emit++;
+            while (n_emit < words.size()
+                   && out_t1[n_emit] <= audio_seen_ms
+                   && out_conf[n_emit] >= min_conf) n_emit++;
         }
 
         json resp;
