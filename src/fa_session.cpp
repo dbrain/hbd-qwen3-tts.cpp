@@ -416,6 +416,16 @@ bool AlignerSession::finalize_streaming_align(const float * tail_pcm, size_t n_t
 
 // ─────────────────────────── run_aligner_loop (child) ───────────────────────
 
+// Ship only the resolved prefix of a PARTIAL alignment. QWEN3_FA_PARTIAL_TRIM=0
+// restores the old "always return every word" behaviour for A/B.
+static bool partial_trim_enabled() {
+    static const bool v = []() {
+        const char * e = std::getenv("QWEN3_FA_PARTIAL_TRIM");
+        return !(e && *e && std::atoi(e) == 0);
+    }();
+    return v;
+}
+
 int run_aligner_loop(int fd) {
     setvbuf(stderr, nullptr, _IONBF, 0);
     // No prctl(PR_SET_PDEATHSIG): the eager-spawn-from-a-thread pattern would
@@ -616,22 +626,45 @@ int run_aligner_loop(int fd) {
             cached_t0 = out_t0; cached_t1 = out_t1; cached_conf = out_conf;
         }
 
+        // A PARTIAL is aligned against the audio that EXISTS SO FAR, but the
+        // aligner is handed the WHOLE word list and always returns a timing for
+        // every word -- so the not-yet-spoken tail comes back crammed into a
+        // synthetic ~40 ms/word ramp past the end of the audio, at confidence
+        // ~0.01 (vs ~0.6-0.9 for genuinely resolved words). Measured: at 480 ms
+        // of audio, 493 of 500 words claimed a t0 beyond the audio that
+        // existed. Clients merge partials by word_index, so shipping that tail
+        // paints the whole passage with fabricated timings that then have to be
+        // walked back by every later partial. It is also most of the cost:
+        // re-sending all N words on every partial was 26500 word entries (2.4
+        // MiB, 21% of the SSE stream) for a 500-word passage.
+        //
+        // A word cannot start after the audio that exists, so truncate to the
+        // resolved prefix. Timings are monotonic (the aligner LIS-orders them),
+        // so a prefix scan is exact, and keeping it a PREFIX is what lets
+        // parents keep addressing words by position. FINAL is unaffected -- it
+        // sees the whole waveform and legitimately times every word.
+        size_t n_emit = words.size();
+        if (ok && resp_tag == Frame::PARTIAL_RESP && partial_trim_enabled()) {
+            n_emit = 0;
+            while (n_emit < words.size() && out_t1[n_emit] <= audio_seen_ms) n_emit++;
+        }
+
         json resp;
         resp["ok"] = ok; resp["error"] = err; resp["audio_seen_ms"] = audio_seen_ms;
         if (ok) {
             json wj = json::array();
-            for (size_t i = 0; i < words.size(); i++)
+            for (size_t i = 0; i < n_emit; i++)
                 wj.push_back({{"word_index",(int)i},{"text",words[i]},
                               {"t0_ms",out_t0[i]},{"t1_ms",out_t1[i]},{"confidence",out_conf[i]}});
             resp["words"] = std::move(wj);
         }
         const int64_t t_total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(clk::now() - t_start).count();
         resp["profile"] = {{"t_load_ms",t_load_ms},{"t_resample_ms",t_resample_ms},
-                           {"t_aligner_ms",t_align_ms},{"t_total_ms",t_total_ms},{"n_words",(int)words.size()}};
-        fprintf(stderr, "  [fa-aligner %s] wall=%lldms load=%lld resample=%lld align=%lld acc=%d@%dHz seen=%lldms%s\n",
+                           {"t_aligner_ms",t_align_ms},{"t_total_ms",t_total_ms},{"n_words",(int)words.size()},{"n_words_emitted",(int)n_emit}};
+        fprintf(stderr, "  [fa-aligner %s] wall=%lldms load=%lld resample=%lld align=%lld acc=%d@%dHz seen=%lldms words=%d/%d%s\n",
                 is_final ? "final  " : "partial", (long long) t_total_ms, (long long) t_load_ms,
                 (long long) t_resample_ms, (long long) t_align_ms, (int) acc_pcm.size(), acc_pcm_sr,
-                (long long) audio_seen_ms, reused ? " [cached]" : "");
+                (long long) audio_seen_ms, (int) n_emit, (int) words.size(), reused ? " [cached]" : "");
         if (send_frame(fd, resp_tag, hdr.req_id, resp.dump()) != IpcError::OK) {
             fprintf(stderr, "fa-aligner: %s send failed\n", is_final ? "FINAL_RESP" : "PARTIAL_RESP");
             return 9;
