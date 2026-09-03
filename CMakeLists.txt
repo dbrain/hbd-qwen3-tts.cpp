@@ -473,6 +473,7 @@ if(QWEN3_TTS_SERVER)
         src/worker_ipc.cpp
         src/worker_session.cpp
         src/audio/ffmpeg_encode.cpp
+        src/audio/time_stretch.cpp
     )
     target_link_libraries(qwen3-tts-server PRIVATE
         qwen3_tts
@@ -515,6 +516,7 @@ if(QWEN3_TTS_SERVER)
         src/higgs_worker_ipc.cpp
         src/fa_session.cpp
         src/audio/ffmpeg_encode.cpp
+        src/audio/time_stretch.cpp
     )
     target_include_directories(breeze-server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(breeze-server PRIVATE

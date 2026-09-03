@@ -26,6 +26,7 @@
 //   POST   /v1/admin/load | /v1/admin/unload
 
 #include "audio/ffmpeg_encode.h"
+#include "audio/time_stretch.h"
 #include "breeze_tts.h"
 #include "breeze_voices.h"
 #include "breeze_worker_session.h"
@@ -476,20 +477,23 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                             "interleaved speech.audio.alignment.* events, not in a buffered body");
         }
 
-        // `speed` is not implemented -- neither engine this replaces implemented
-        // it either. Accepting it and returning unchanged-rate audio is the worst
-        // option: the caller believes it worked. 1.0 is the OpenAI default and a
-        // genuine no-op, so let it through; anything else is refused with the
-        // fix, because resampling in the player is instant and also lets the
-        // client divide the alignment timestamps to match.
-        if (body.contains("speed") && body["speed"].is_number()) {
-            const double sp = body["speed"].get<double>();
-            if (std::fabs(sp - 1.0) > 1e-6)
-                return err_json(res, 400,
-                    "speed is not implemented server-side; set playbackRate on the audio "
-                    "element (with preservesPitch) and divide any alignment t0_ms/t1_ms by "
-                    "the same rate. Only speed=1.0 is accepted.");
-        }
+        // `speed` changes duration, not pitch: the audio is time-stretched with
+        // WSOLA on the way out (see audio/time_stretch.h). The forced aligner
+        // still sees the NATURAL-rate waveform -- it is an acoustic model
+        // trained on natural speech, and stretching its input would only cost
+        // accuracy -- so every timestamp we emit is divided by `speed` instead.
+        // Range matches OpenAI's. Quality holds well over roughly 0.5-2.0; past
+        // that WSOLA is audible, which is a property of the method, not a bug.
+        const double speed = body.value("speed", 1.0);
+        if (!(speed >= 0.25 && speed <= 4.0))
+            return err_json(res, 400, "speed must be between 0.25 and 4.0");
+        const bool  stretching = !qwen3_tts_audio::TimeStretch::is_identity(speed);
+        // Client-facing time = natural time / speed. Used for alignment
+        // timestamps and for the audio_*_ms fields, which must describe the
+        // audio the client actually receives.
+        const auto  to_client_ms = [speed](int64_t ms) {
+            return (int64_t) std::llround((double) ms / speed);
+        };
 
         // ---- long-form knobs (higgs-server's spelling, so a client that already
         // drives higgs long-form works unchanged) ----
@@ -544,7 +548,7 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
             res.set_header("X-Accel-Buffering", "no");
             res.set_chunked_content_provider("text/event-stream",
                 [eng, &cx, input, gp, do_align_run, emit_partials, have_voice, chunk_frames,
-                 long_form, chunk_words, long_ref_frames, gap_ms,
+                 long_form, chunk_words, long_ref_frames, gap_ms, speed, stretching, to_client_ms,
                  ref = std::move(ref), words = std::move(words)]
                 (size_t, httplib::DataSink & sink) mutable -> bool {
                     Activity act_stream(cx);
@@ -583,14 +587,20 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                                     cx.aligner->drain_partial_alignments(
                                         [&](int64_t seen, const std::vector<fa::AlignedWord> & ws) {
                                             if (!emit_partials) return;  // final-only: drain, don't publish
+                                            // Aligner time -> client time. The
+                                            // audio the client holds is stretched,
+                                            // so untouched timestamps would drift
+                                            // linearly against it.
                                             json wj = json::array();
                                             for (size_t i = 0; i < ws.size(); i++)
                                                 wj.push_back({{"word_index",(int)i},{"text",ws[i].text},
-                                                              {"t0_ms",ws[i].t0_ms},{"t1_ms",ws[i].t1_ms},
+                                                              {"t0_ms",to_client_ms(ws[i].t0_ms)},
+                                                              {"t1_ms",to_client_ms(ws[i].t1_ms)},
                                                               {"confidence",ws[i].confidence}});
                                             emit_event("speech.audio.alignment.partial",
                                                        {{"type","speech.audio.alignment.partial"},
-                                                        {"audio_seen_ms",seen},{"words",std::move(wj)}});
+                                                        {"audio_seen_ms",to_client_ms(seen)},
+                                                        {"words",std::move(wj)}});
                                         });
                                     std::this_thread::sleep_for(20ms);
                                 }
@@ -607,18 +617,37 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                         }
                     });
 
-                    auto emit_audio = [&](const float * pcm, int n) {
-                        cx.last_activity_ms.store(now_ms());
-                        const std::string s16 = pcm_f32_to_s16le(pcm, (size_t) n);
+                    // One stretcher for the whole request: WSOLA carries overlap
+                    // state across chunks, so a per-chunk instance would splice
+                    // at every boundary. Null when speed == 1 so the default
+                    // path does not even allocate.
+                    std::unique_ptr<qwen3_tts_audio::TimeStretch> ts;
+                    if (stretching) ts.reset(new qwen3_tts_audio::TimeStretch(speed, 24000));
+                    std::vector<float> sbuf;
+
+                    auto emit_pcm = [&](const float * pcm, size_t n) {
+                        if (!n) return;
+                        const std::string s16 = pcm_f32_to_s16le(pcm, n);
                         emit_event("speech.audio.delta",
                                    {{"type","speech.audio.delta"},
                                     {"audio", base64_encode(s16.data(), s16.size())}});
+                    };
+
+                    auto emit_audio = [&](const float * pcm, int n) {
+                        cx.last_activity_ms.store(now_ms());
+                        // The aligner gets the natural-rate audio and a natural
+                        // timeline; conversion to client time happens where the
+                        // events are emitted.
                         if (partial_active) {
                             const int64_t chunk_ms = (int64_t) n * 1000 / 24000;
                             const int64_t total = audio_offset_ms.fetch_add(chunk_ms) + chunk_ms;
                             cx.aligner_last_activity_ms.store(now_ms());
                             cx.aligner->push_partial_pcm(pcm, (size_t) n, total);
                         }
+                        if (!ts) { emit_pcm(pcm, (size_t) n); return; }
+                        sbuf.clear();
+                        ts->push(pcm, (size_t) n, sbuf);
+                        emit_pcm(sbuf.data(), sbuf.size());
                     };
 
                     breeze::gen_result r;
@@ -636,6 +665,12 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                                                     chunk_frames, emit_sse, r);
                     }
 
+                    if (ts) {   // the last window is only completed by flushing
+                        sbuf.clear();
+                        ts->flush(sbuf);
+                        emit_pcm(sbuf.data(), sbuf.size());
+                    }
+
                     if (partial_active) {
                         reader_stop.store(true);
                         if (reader_thread.joinable()) reader_thread.join();
@@ -651,11 +686,13 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                             json wj = json::array();
                             for (size_t i = 0; i < aligned.size(); i++)
                                 wj.push_back({{"word_index",(int)i},{"text",aligned[i].text},
-                                              {"t0_ms",aligned[i].t0_ms},{"t1_ms",aligned[i].t1_ms},
+                                              {"t0_ms",to_client_ms(aligned[i].t0_ms)},
+                                              {"t1_ms",to_client_ms(aligned[i].t1_ms)},
                                               {"confidence",aligned[i].confidence}});
                             emit_event("speech.audio.alignment.final",
                                        {{"type","speech.audio.alignment.final"},
-                                        {"audio_total_ms",total_ms},{"words",std::move(wj)}});
+                                        {"audio_total_ms",to_client_ms(total_ms)},
+                                        {"words",std::move(wj)}});
                         } else {
                             emit_event("speech.audio.alignment.error",
                                        {{"type","speech.audio.alignment.error"},
@@ -686,7 +723,7 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
             const int chunk_frames = body.value("chunk_frames", 6);
             res.set_chunked_content_provider("audio/wav",
                 [eng, &cx, input, gp, have_voice, chunk_frames, long_form, chunk_words,
-                 long_ref_frames, gap_ms, ref = std::move(ref)]
+                 long_ref_frames, gap_ms, speed, stretching, ref = std::move(ref)]
                 (size_t, httplib::DataSink & sink) mutable {
                     // Streaming WAV cannot know its length up front; 0xFFFFFFFF is
                     // the conventional placeholder here (unlike the buffered path,
@@ -708,13 +745,23 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                     });
                     breeze::gen_result r;
                     bool ok;
+                    std::unique_ptr<qwen3_tts_audio::TimeStretch> ts;
+                    if (stretching) ts.reset(new qwen3_tts_audio::TimeStretch(speed, 24000));
+                    std::vector<float> sbuf;
+                    auto write_pcm = [&](const float * pcm, size_t n) {
+                        if (!n) return;
+                        const std::string b = pcm_f32_to_s16le(pcm, n);
+                        sink.write(b.data(), b.size());
+                    };
                     {
                         std::lock_guard<std::mutex> lk(cx.mtx);
                         eng->clear_cancel();
                         auto emit_raw = [&](const float * pcm, int n, bool) {
                             if (n <= 0) return;
-                            const std::string b = pcm_f32_to_s16le(pcm, (size_t) n);
-                            sink.write(b.data(), b.size());
+                            if (!ts) { write_pcm(pcm, (size_t) n); return; }
+                            sbuf.clear();
+                            ts->push(pcm, (size_t) n, sbuf);
+                            write_pcm(sbuf.data(), sbuf.size());
                         };
                         ok = long_form
                            ? eng->synthesize_long(input, gp, have_voice ? &ref : nullptr, chunk_words,
@@ -722,6 +769,7 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                            : eng->synthesize_stream(input, gp, have_voice ? &ref : nullptr,
                                                     chunk_frames, emit_raw, r);
                     }
+                    if (ts) { sbuf.clear(); ts->flush(sbuf); write_pcm(sbuf.data(), sbuf.size()); }
                     wd_stop.store(true);
                     if (wd.joinable()) wd.join();
                     sink.done();
@@ -745,6 +793,17 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
         // A worker abort surfaces as an empty result, and an HTTP 200 with a
         // 44-byte WAV passes a status-code smoke test. Fail loudly instead.
         if (r.pcm.empty()) return err_json(res, 500, "engine produced no audio");
+
+        // Stretch before anything measures or encodes it, so the headers and the
+        // encoded body describe the same audio.
+        if (stretching) {
+            qwen3_tts_audio::TimeStretch st(speed, 24000);
+            std::vector<float> out;
+            out.reserve((size_t) ((double) r.pcm.size() / speed) + 4096);
+            st.push(r.pcm.data(), r.pcm.size(), out);
+            st.flush(out);
+            r.pcm.swap(out);
+        }
 
         const double secs = (double) r.pcm.size() / 24000.0;
         res.set_header("X-Audio-Seconds", std::to_string(secs));
