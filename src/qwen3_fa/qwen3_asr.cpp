@@ -1513,7 +1513,14 @@ extern "C" qwen3_asr_context_params qwen3_asr_context_default_params(void) {
     qwen3_asr_context_params p = {};
     p.n_threads = 4;
     p.verbosity = 1;
+    // QWEN3_FA_CPU=1 puts the aligner entirely on the CPU. The LLM body is
+    // already there (CRISPASR_N_GPU_LAYERS=0 in fa_session), so this only moves
+    // the audio tower and its buffers -- but that is the whole of the aligner's
+    // GPU footprint, and it runs at RTF ~0.014, so there is a lot of headroom to
+    // spend. Worth it whenever the TTS model wants the card to itself.
     p.use_gpu = true;
+    if (const char * e = std::getenv("QWEN3_FA_CPU"))
+        if (*e && *e != '0') p.use_gpu = false;
     return p;
 }
 

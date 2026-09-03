@@ -25,6 +25,7 @@
 //   POST   /v1/audio/speech                 -> wav|pcm|mp3 bytes, or SSE stream
 //   POST   /v1/admin/load | /v1/admin/unload
 
+#include "audio/ffmpeg_encode.h"
 #include "breeze_tts.h"
 #include "breeze_voices.h"
 #include "breeze_worker_session.h"
@@ -679,9 +680,20 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
         const double busy = (r.text_enc_ms + r.prefill_ms + r.decode_ms + r.codec_ms) / 1000.0;
         if (secs > 0) res.set_header("X-RTF", std::to_string(busy / secs));
 
+        // kobbler's preview endpoint defaults to response_format=mp3 and then
+        // labels the body audio/mpeg. Falling through to WAV shipped WAV bytes
+        // under an mp3 content-type -- silent, and browsers mostly cope, which
+        // is what makes it dangerous. Encode for real.
         const std::string fmt = body.value("response_format", std::string("wav"));
         if (fmt == "pcm") {
             res.set_content(pcm_f32_to_s16le(r.pcm.data(), r.pcm.size()), "audio/pcm");
+        } else if (fmt == "mp3") {
+            const int kbps = body.value("bitrate_kbps", 64);
+            auto enc = qwen3_tts_audio::encode_one_shot(
+                qwen3_tts_audio::Codec::Mp3, 24000, kbps, r.pcm.data(), r.pcm.size());
+            if (enc.empty()) return err_json(res, 500, "mp3 encode failed");
+            res.set_content(std::string(enc.begin(), enc.end()),
+                            qwen3_tts_audio::content_type_for(qwen3_tts_audio::Codec::Mp3));
         } else {
             res.set_content(wav_bytes(r.pcm, 24000), "audio/wav");
         }

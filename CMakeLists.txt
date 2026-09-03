@@ -514,12 +514,14 @@ if(QWEN3_TTS_SERVER)
         src/breeze_worker_session.cpp
         src/higgs_worker_ipc.cpp
         src/fa_session.cpp
+        src/audio/ffmpeg_encode.cpp
     )
     target_include_directories(breeze-server PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(breeze-server PRIVATE
         breeze_core
         httplib::httplib
         nlohmann_json::nlohmann_json
+        PkgConfig::LIBAV
     )
     if(QWEN3_TTS_FORCED_ALIGNMENT)
         target_link_libraries(breeze-server PRIVATE qwen3_fa)
