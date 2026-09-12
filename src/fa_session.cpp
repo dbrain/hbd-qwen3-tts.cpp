@@ -29,6 +29,13 @@ using json = nlohmann::json;
 
 namespace fa {
 
+// Monotonic milliseconds. Only ever used for differences.
+static int64_t fa_now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 // ───────────────────────────── transport ────────────────────────────────────
 
 const char * ipc_error_str(IpcError e) {
@@ -253,6 +260,8 @@ bool AlignerSession::begin_streaming_align(const std::vector<std::string> & word
     pending_pcm_.clear();
     pending_seen_ms_           = 0;
     inflight_                  = 0;
+    stream_align_started_ms_   = fa_now_ms();
+    last_sent_seen_ms_         = 0;
     return true;
 }
 
@@ -263,6 +272,25 @@ bool AlignerSession::flush_pending_locked() {
     if (fd_ < 0)                   { last_error_ = "flush_pending: worker not running"; return false; }
     if (pending_pcm_.empty())      return true;
     if (inflight_ >= kMaxInflight) return true;   // slot busy; coalesce further
+
+    // A partial only has to keep the highlight ahead of PLAYBACK, and playback
+    // cannot be further into the audio than the wall clock since the stream
+    // opened — it starts at TTFA and runs at 1x. So once the last pass already
+    // covered that position by kLeadMs, another one buys the client nothing and
+    // costs a full re-align of everything so far (see the note on
+    // last_sent_seen_ms_). Synthesis outruns realtime, so unthrottled this ran
+    // continuously; gated, it settles to roughly the rate the audio is
+    // CONSUMED. The surplus coalesces into pending_pcm_ and goes out as one
+    // larger delta, which is cheaper again.
+    static const int64_t kLeadMs = []() {
+        const char * e = std::getenv("QWEN3_FA_PARTIAL_LEAD_MS");
+        const int64_t v = (e && *e) ? (int64_t) std::atoll(e) : 45000;
+        return v < 0 ? 0 : v;
+    }();
+    if (stream_align_has_sent_any_ && kLeadMs > 0) {
+        const int64_t elapsed = fa_now_ms() - stream_align_started_ms_;
+        if (last_sent_seen_ms_ > elapsed + kLeadMs) return true;   // coalesce further
+    }
 
     json meta = {
         {"words",           stream_align_words_},
@@ -275,6 +303,7 @@ bool AlignerSession::flush_pending_locked() {
     IpcError e = send_frame(fd_, Frame::PARTIAL_REQ, req_id, payload.data(), payload.size());
     if (e != IpcError::OK) { last_error_ = std::string("PARTIAL_REQ send: ") + ipc_error_str(e); return false; }
     stream_align_has_sent_any_ = true;
+    last_sent_seen_ms_ = pending_seen_ms_;
     pending_pcm_.clear();
     inflight_++;
     return true;

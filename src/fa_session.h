@@ -154,6 +154,15 @@ private:
     std::vector<float>       pending_pcm_;
     int64_t                  pending_seen_ms_ = 0;
     int                      inflight_ = 0;
+
+    // Partial-rate throttle. A pass re-aligns EVERYTHING accumulated against the
+    // WHOLE word list, and the word list is the expensive half: measured on 60 s
+    // of fixed audio, 200 words cost 817 ms, 900 cost 971 ms and 2600 cost
+    // 2463 ms. On a 2609-word chapter that is ~5.5 s of GPU and CPU per pass by
+    // the nine-minute mark, run back to back — which is why the voice itself
+    // rendered at ~1.35x realtime instead of ~4x. See flush_pending_locked.
+    int64_t                  stream_align_started_ms_ = 0;
+    int64_t                  last_sent_seen_ms_ = 0;
 };
 
 // Aligner-only child dispatch loop. Called from main() when `--fa-aligner <fd>`

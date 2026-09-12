@@ -463,25 +463,41 @@ bool BreezeTTS::synthesize_long(const std::string & text, const gen_params & gp,
         out.truncated |= r.truncated;   // any short chunk truncates the whole read
         if (ci == 0) out.ttfa_ms = r.ttfa_ms;
 
-        // Carry only the TAIL of this chunk. Prompt tokens + ref frames + new
-        // frames share n_ctx, so an unbounded history starves the generation.
         // Carry only the TAIL of this chunk: prompt tokens, reference frames and
         // new frames all share n_ctx, so an unbounded history starves the
         // generation it is meant to protect.
-        const int keep = std::min(r.T, ref_max_frames);
-        hist.codes.assign(r.codes.end() - (size_t) keep * NC, r.codes.end());
-        hist.T = keep;
+        //
         // The clone template pairs a transcript with THE AUDIO OF THAT
         // TRANSCRIPT. Once the codes are trimmed to a tail, the chunk's full
-        // text no longer describes them, so pairing the two would hand the model
-        // a transcript for audio it cannot hear. Fall back to voice-only
-        // conditioning in that case -- an empty ref_text, which is what higgs
-        // does for its rolling context anyway.
-        hist_text = (keep == r.T) ? chunks[ci] : std::string();
+        // text no longer describes them, and pairing the two would hand the
+        // model a transcript for audio it cannot hear. The budget is set so a
+        // default-sized chunk is carried whole, but a chunk of unusually long
+        // sentences can still overrun it -- and when it does, the rolling
+        // history has to be abandoned rather than sent untranscribed, because
+        // audio with no transcript is what drifts into non-words.
+        //
+        // Abandoning it costs nothing when there is a named voice: the caller's
+        // reference IS a valid template and is what holds the speaker across the
+        // whole read anyway. Only an unnamed voice has nothing to fall back to,
+        // and there the untranscribed tail is still better than starting over
+        // with a freshly sampled speaker.
+        const int keep = std::min(r.T, ref_max_frames);
+        if (keep == r.T) {
+            hist.codes.assign(r.codes.end() - (size_t) keep * NC, r.codes.end());
+            hist.T = keep;
+            hist_text = chunks[ci];
+        } else if (ref && ref->T > 0) {
+            hist = *ref;
+            hist_text = ref->ref_text;
+        } else {
+            hist.codes.assign(r.codes.end() - (size_t) keep * NC, r.codes.end());
+            hist.T = keep;
+            hist_text.clear();
+        }
         fprintf(stderr, "  [breeze long-form] chunk %zu/%zu: prompt=%d tok -> %d frames (%.1fs), "
                 "ref_T used=%d%s, carry=%d\n",
                 ci + 1, chunks.size(), r.n_prompt_tokens, r.T, r.T / 12.5, used_ref_T,
-                used_voice_only ? " (voice-only)" : "", keep);
+                used_voice_only ? " (voice-only)" : "", hist.T);
     }
     return true;
 }
