@@ -527,10 +527,14 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
         // control.
         const bool long_form   = body.value("long", true);
         const int  chunk_words = body.value("chunk_words", 120);
-        int long_ref_frames    = body.value("long_ref_frames", 250);
+        // Default big enough to carry a whole default-sized chunk, transcript
+        // and all. A budget that forces the carry down to a TAIL costs the
+        // transcript with it (see synthesize_long) and the model drifts into
+        // non-words a few chunks in.
+        int long_ref_frames    = body.value("long_ref_frames", 600);
         if (body.contains("buffer")) {
             const int buf = body.value("buffer", 2);
-            long_ref_frames = std::min(long_ref_frames > 0 ? long_ref_frames : 250,
+            long_ref_frames = std::min(long_ref_frames > 0 ? long_ref_frames : 600,
                                        std::max(1, buf) * 250);
         }
         if (long_ref_frames > 600) long_ref_frames = 600;
@@ -697,11 +701,26 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                     wd_stop.store(true);
                     if (wd.joinable()) wd.join();
 
+                    // A cancelled render stopped mid-document: the audio holds
+                    // only part of the text, and finalize_streaming_align fits
+                    // EVERY word into whatever it is given. Publishing that would
+                    // hand the client a word table running at the wrong rate for
+                    // the whole passage -- the highlight races the voice to the
+                    // end. The session is still finalised (the subprocess
+                    // handshake has to complete or the next request desyncs); the
+                    // result is simply not published, leaving the last partial --
+                    // prefix-clamped and honest -- standing.
+                    const bool cancelled = eng->is_cancel_requested();
+
                     if (partial_active) {
                         const int64_t total_ms = audio_offset_ms.load();
                         std::vector<fa::AlignedWord> aligned;
                         fa::AlignProfile prof;
-                        if (cx.aligner->finalize_streaming_align(nullptr, 0, total_ms, aligned, prof)) {
+                        if (!cx.aligner->finalize_streaming_align(nullptr, 0, total_ms, aligned, prof)) {
+                            emit_event("speech.audio.alignment.error",
+                                       {{"type","speech.audio.alignment.error"},
+                                        {"error", cx.aligner->last_error()}});
+                        } else if (!cancelled) {
                             json wj = json::array();
                             for (size_t i = 0; i < aligned.size(); i++)
                                 wj.push_back({{"word_index",(int)i},{"text",aligned[i].text},
@@ -712,10 +731,6 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                                        {{"type","speech.audio.alignment.final"},
                                         {"audio_total_ms",to_client_ms(total_ms)},
                                         {"words",std::move(wj)}});
-                        } else {
-                            emit_event("speech.audio.alignment.error",
-                                       {{"type","speech.audio.alignment.error"},
-                                        {"error", cx.aligner->last_error()}});
                         }
                         cx.aligner_inflight.fetch_sub(1);
                         if (aligner_lock.owns_lock()) aligner_lock.unlock();
@@ -726,9 +741,14 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                     // Without this the client ships a short clip believing it is
                     // complete, which is the failure the migration doc warns
                     // about at `long:false`.
+                    // A cancel breaks the long-form loop and returns success
+                    // with whatever was rendered, so `ok` alone cannot tell a
+                    // finished read from an abandoned one -- and a client that
+                    // cannot tell will treat half a chapter as a whole one.
                     emit_event("speech.audio.done",
                                {{"type","speech.audio.done"},{"frames",r.T},
-                                {"ttfa_ms",r.ttfa_ms},{"ok",ok},
+                                {"ttfa_ms",r.ttfa_ms},{"ok",ok && !cancelled},
+                                {"cancelled",cancelled},
                                 {"truncated",r.truncated}});
                     sink.done();
                     return true;
@@ -1015,6 +1035,15 @@ int main(int argc, char ** argv) {
             }
         }).detach();
     }
+
+    // A read-along client paces itself: it stops draining the body once it
+    // holds enough audio to play, and only resumes minutes later. That stalls
+    // our socket, and httplib's five-second default made the disconnect
+    // watchdog below read the stall as a hangup and cancel the render mid-
+    // document. Generation should block on the slow consumer instead -- a real
+    // hangup is still caught immediately, because a dead socket goes writable
+    // at once and wait_writable() checks is_socket_alive() after select.
+    srv.set_write_timeout(600, 0);
 
     fprintf(stderr, "breeze-server listening on %s:%d\n", host.c_str(), port);
     if (!srv.listen(host.c_str(), port)) { fprintf(stderr, "listen failed\n"); return 1; }

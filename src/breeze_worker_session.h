@@ -66,7 +66,13 @@ public:
                       std::vector<int32_t> & out_codes, int & out_T);
 
     void request_cancel();
-    void clear_cancel() {}   // the child clears its own flag per SPEECH_REQ
+    // The child clears its own flag per SPEECH_REQ; this clears the parent's
+    // record of having asked, which is what the server reports to the client.
+    void clear_cancel() { cancel_sent_.store(false, std::memory_order_relaxed); }
+    // Whether a cancel was actually delivered for the synth now running. A
+    // cancelled long-form render returns SUCCESS with partial audio, so this is
+    // the only way to tell a finished read from an abandoned one.
+    bool is_cancel_requested() const { return cancel_sent_.load(std::memory_order_relaxed); }
 
 private:
     bool send_load_req_locked(const WorkerConfig & cfg);
@@ -81,6 +87,8 @@ private:
     WorkerConfig             loaded_cfg_;
     bool                     loaded_ok_ = false;
     std::string              default_gpu_, next_gpu_, worker_gpu_;
+
+    std::atomic<bool>        cancel_sent_{false};
 
     pid_t                    pid_ = -1;
     int                      fd_  = -1;

@@ -394,7 +394,17 @@ bool BreezeTTS::synthesize_long(const std::string & text, const gen_params & gp,
                                 int stream_chunk_frames, int gap_ms,
                                 const pcm_cb & on_chunk, gen_result & out) {
     if (!loaded_) { error_msg_ = "not loaded"; return false; }
-    if (ref_max_frames <= 0) ref_max_frames = 250;
+    // Big enough that a default-sized chunk (120 words, ~500 frames) is carried
+    // WHOLE. That matters far more than the memory it costs: the rolling history
+    // is a clone template, and a template only works when the transcript
+    // describes the audio. Trim the audio to a tail and the transcript has to be
+    // dropped (below), which leaves every chunk after the first conditioned on
+    // 20 s of the model's own speech with nothing saying what it said. Measured
+    // on 912 words of prose, that produced real non-words by chunk 4 ("but
+    // consider your daughters" -> "Paparier daughters", "impossible for us" ->
+    // "impossible for Nums for Evertex") and drifted worse from there; carrying
+    // the transcript rendered the same passage clean at the same RTF.
+    if (ref_max_frames <= 0) ref_max_frames = 600;
     if (gap_ms < 0) gap_ms = 0;
     const std::vector<float> gap((size_t) (gap_ms * w_.cfg().cc.sample_rate / 1000), 0.0f);
     const int NC = w_.cfg().bb.n_codebooks;
@@ -416,6 +426,10 @@ bool BreezeTTS::synthesize_long(const std::string & text, const gen_params & gp,
         gen_result r;
         const bool have_hist = hist.T > 0;
         const int used_ref_T = have_hist ? hist.T : 0;
+        // Captured BEFORE hist_text is reassigned for the next chunk, which is
+        // what the log used to read -- so the line described the conditioning of
+        // the chunk after the one it named.
+        const bool used_voice_only = have_hist && hist_text.empty();
         if (have_hist) hist.ref_text = hist_text;
         const bool last = (ci + 1 == chunks.size());
         if (ci > 0 && !gap.empty()) {
@@ -467,7 +481,7 @@ bool BreezeTTS::synthesize_long(const std::string & text, const gen_params & gp,
         fprintf(stderr, "  [breeze long-form] chunk %zu/%zu: prompt=%d tok -> %d frames (%.1fs), "
                 "ref_T used=%d%s, carry=%d\n",
                 ci + 1, chunks.size(), r.n_prompt_tokens, r.T, r.T / 12.5, used_ref_T,
-                used_ref_T && hist_text.empty() ? " (voice-only)" : "", keep);
+                used_voice_only ? " (voice-only)" : "", keep);
     }
     return true;
 }

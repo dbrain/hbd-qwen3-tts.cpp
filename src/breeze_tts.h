@@ -151,6 +151,9 @@ public:
     void request_cancel() { cancel_.store(true, std::memory_order_relaxed); }
     void clear_cancel()   { cancel_.store(false, std::memory_order_relaxed); }
     bool cancelled() const { return cancel_.load(std::memory_order_relaxed); }
+    // Same question, spelled the way the server asks it of either engine
+    // (in-process BreezeTTS or the isolated WorkerSession).
+    bool is_cancel_requested() const { return cancelled(); }
 
     // VRAM inventory (weights + KV + scheduler reservations), MiB.
     void log_vram(const char * label) const;

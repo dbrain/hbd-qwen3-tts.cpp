@@ -128,6 +128,7 @@ void WorkerSession::request_cancel() {
     if (fd < 0) return;
     std::lock_guard<std::mutex> slk(send_mutex_);
     send_frame(fd, WFrame::CANCEL_REQ, req_id, nullptr, 0);
+    cancel_sent_.store(true, std::memory_order_relaxed);
 }
 
 bool WorkerSession::send_load_req_locked(const WorkerConfig & cfg) {
