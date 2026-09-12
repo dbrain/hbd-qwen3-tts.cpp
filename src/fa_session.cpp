@@ -203,10 +203,14 @@ void AlignerSession::shutdown() {
     kill_worker_locked();
 }
 
-bool AlignerSession::ensure_loaded(const std::string & aligner_model) {
+bool AlignerSession::ensure_loaded(const std::string & aligner_model, const std::string & device) {
     std::lock_guard<std::mutex> lock(io_mutex_);
-    if (pid_ > 0 && loaded_ok_ && loaded_model_ == aligner_model) return true;
+    if (pid_ > 0 && loaded_ok_ && loaded_model_ == aligner_model && loaded_device_ == device)
+        return true;
     if (aligner_model.empty()) { last_error_ = "aligner_model not configured"; return false; }
+    // A respawn, not a reconfigure: the backend is bound when the context is
+    // created, and the old child's VRAM only goes back to the card when the
+    // process does.
     if (pid_ > 0) kill_worker_locked();
 
     pid_t child = spawn_aligner(argv0_.c_str(), extra_argv_, &fd_);
@@ -222,7 +226,8 @@ bool AlignerSession::ensure_loaded(const std::string & aligner_model) {
     fprintf(stderr, "fa-aligner-session: HELLO (pid=%d): %.*s\n",
             (int) pid_, (int) payload.size(), (const char *) payload.data());
 
-    json req = { {"aligner_model", aligner_model}, {"eager_load_aligner", true} };
+    json req = { {"aligner_model", aligner_model}, {"eager_load_aligner", true},
+                 {"device", device} };
     e = send_frame(fd_, Frame::LOAD_REQ, 0, req.dump());
     if (e != IpcError::OK) {
         last_error_ = std::string("aligner LOAD_REQ send: ") + ipc_error_str(e);
@@ -243,8 +248,9 @@ bool AlignerSession::ensure_loaded(const std::string & aligner_model) {
         last_error_ = std::string("aligner LOAD_RESP parse: ") + ex.what();
         kill_worker_locked(); return false;
     }
-    loaded_model_ = aligner_model;
-    loaded_ok_    = true;
+    loaded_model_  = aligner_model;
+    loaded_device_ = device;
+    loaded_ok_     = true;
     return true;
 }
 
@@ -763,6 +769,21 @@ int run_aligner_loop(int fd) {
                     json req = json::parse(std::string(payload.begin(), payload.end()));
                     fa_model_path = req.value("aligner_model", std::string{});
                     bool eager = req.value("eager_load_aligner", false);
+                    // Device is fixed for the life of the child: the backend is
+                    // chosen when the context is created, so the parent
+                    // respawns rather than switching in place. Setting it here
+                    // is therefore always before the load.
+                    const std::string device = req.value("device", std::string("gpu"));
+                    if (device == "cpu") {
+                        setenv("QWEN3_FA_CPU", "1", 1);
+                        // Four threads is right when the audio tower is on the
+                        // GPU and only the LLM body is not. On the CPU path
+                        // every layer is here and the rest of the box is idle.
+                        setenv("QWEN3_FA_THREADS", "8", 0);
+                    } else {
+                        unsetenv("QWEN3_FA_CPU");
+                    }
+                    fprintf(stderr, "fa-aligner: device=%s\n", device.c_str());
                     if (fa_model_path.empty()) err = "aligner_model empty in LOAD_REQ";
                     else if (eager) { ensure_fa_loaded(err, t_load_ms); ok = err.empty(); }
                     else ok = true;

@@ -535,8 +535,15 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
         // 64 words is ~24 s of narration -- inside the good window -- where the
         // 120 that reads best is not. When nothing is being aligned the larger
         // chunk wins: fewer seams for the rolling reference to carry across.
-        const bool align_wanted = body.value("align", false) && cx.aligner
-                                  && !cx.aligner_model.empty();
+        // Where the aligner runs, chosen per REQUEST so an orchestrator that
+        // can see the card can answer it: "gpu" (default), "cpu" — same result,
+        // ~4x the wall clock, no VRAM at all — or "off". Alignment must never
+        // be the reason TTS does not fit, so the caller can always take it away
+        // without taking the voice away with it.
+        std::string align_device = body.value("align_device", std::string("gpu"));
+        if (align_device != "cpu" && align_device != "off") align_device = "gpu";
+        const bool align_wanted = body.value("align", false) && align_device != "off"
+                                  && cx.aligner && !cx.aligner_model.empty();
         const int  chunk_words = body.value("chunk_words", align_wanted ? 64 : 120);
         // Default big enough to carry a whole default-sized chunk, transcript
         // and all. A budget that forces the carry down to a TAIL costs the
@@ -579,7 +586,7 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
             res.set_header("Content-Type", "text/event-stream");
             res.set_header("X-Accel-Buffering", "no");
             res.set_chunked_content_provider("text/event-stream",
-                [eng, &cx, input, gp, do_align_run, emit_partials, have_voice, chunk_frames,
+                [eng, &cx, input, gp, do_align_run, emit_partials, align_device, have_voice, chunk_frames,
                  long_form, chunk_words, long_ref_frames, gap_ms, speed, stretching, to_client_ms,
                  ref = std::move(ref)]
                 (size_t, httplib::DataSink & sink) mutable -> bool {
@@ -635,7 +642,7 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                         aligner_lock = std::unique_lock<std::mutex>(cx.aligner_mtx);
                         cx.aligner_inflight.fetch_add(1);
                         cx.aligner_last_activity_ms.store(now_ms());
-                        if (!cx.aligner->ensure_loaded(cx.aligner_model)) {
+                        if (!cx.aligner->ensure_loaded(cx.aligner_model, align_device)) {
                             emit_event("speech.audio.alignment.error",
                                        {{"type","speech.audio.alignment.error"},
                                         {"error", std::string("aligner load failed: ") + cx.aligner->last_error()}});

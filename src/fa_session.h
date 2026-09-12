@@ -98,8 +98,13 @@ public:
     explicit AlignerSession(const char * argv0, std::vector<std::string> extra_argv = {});
     ~AlignerSession();
 
-    // Spawn + (lazy or eager) load the FA GGUF; respawn on path change.
-    bool ensure_loaded(const std::string & aligner_model);
+    // Spawn + (lazy or eager) load the FA GGUF; respawn on path OR device
+    // change. `device` is "gpu" (audio tower on the card, LLM body already on
+    // the CPU) or "cpu" (everything on the CPU: ~4x slower per pass, and zero
+    // VRAM, which is the point — alignment must never be what stops TTS from
+    // fitting).
+    bool ensure_loaded(const std::string & aligner_model,
+                       const std::string & device = "gpu");
     void shutdown();  // SIGKILL + waitpid; idempotent
 
     bool is_alive() const { return pid_ > 0; }
@@ -130,6 +135,7 @@ private:
     std::string              argv0_;
     std::vector<std::string> extra_argv_;
     std::string              loaded_model_;
+    std::string              loaded_device_;
     bool                     loaded_ok_ = false;
 
     pid_t                    pid_ = -1;
