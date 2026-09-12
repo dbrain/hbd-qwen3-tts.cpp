@@ -90,6 +90,13 @@ public:
     // (pcm, n_samples, is_final)
     using pcm_cb = std::function<void(const float *, int, bool)>;
 
+    // (chunk_index, chunk_count, chunk_text) — fired as each long-form chunk
+    // BEGINS, after any seam gap, so the caller can stamp the text that is about
+    // to be spoken against the audio position it starts at. That pairing is the
+    // only timing information available when the forced aligner is off, and it
+    // costs nothing to produce: synthesize_long already has both halves in hand.
+    using chunk_cb = std::function<void(size_t, size_t, const std::string &)>;
+
     bool synthesize(const std::string & text, const gen_params & gp,
                     const ref_voice * ref, gen_result & out);
     bool synthesize_stream(const std::string & text, const gen_params & gp,
@@ -128,7 +135,8 @@ public:
                          const ref_voice * ref,
                          int chunk_words, int ref_max_frames,
                          int stream_chunk_frames, int gap_ms,
-                         const pcm_cb & on_chunk, gen_result & out);
+                         const pcm_cb & on_chunk, gen_result & out,
+                         const chunk_cb & on_chunk_start = nullptr);
 
     // Split text into ~chunk_words chunks on sentence boundaries. Exposed so a
     // caller can align its own word offsets with what synthesize_long renders.

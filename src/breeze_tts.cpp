@@ -392,7 +392,8 @@ bool BreezeTTS::synthesize_long(const std::string & text, const gen_params & gp,
                                 const ref_voice * ref,
                                 int chunk_words, int ref_max_frames,
                                 int stream_chunk_frames, int gap_ms,
-                                const pcm_cb & on_chunk, gen_result & out) {
+                                const pcm_cb & on_chunk, gen_result & out,
+                                const chunk_cb & on_chunk_start) {
     if (!loaded_) { error_msg_ = "not loaded"; return false; }
     // Big enough that a default-sized chunk (120 words, ~500 frames) is carried
     // WHOLE. That matters far more than the memory it costs: the rolling history
@@ -436,6 +437,9 @@ bool BreezeTTS::synthesize_long(const std::string & text, const gen_params & gp,
             if (on_chunk) on_chunk(gap.data(), (int) gap.size(), false);
             out.pcm.insert(out.pcm.end(), gap.begin(), gap.end());
         }
+        // After the seam gap, so the position handed out is where this chunk's
+        // own speech starts rather than where the silence before it does.
+        if (on_chunk_start) on_chunk_start(ci, chunks.size(), chunks[ci]);
         bool ok;
         if (stream_chunk_frames > 0 && on_chunk) {
             // Forward each codec block as it lands, but only report is_final on

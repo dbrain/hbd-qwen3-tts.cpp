@@ -661,9 +661,12 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                         // The aligner gets the natural-rate audio and a natural
                         // timeline; conversion to client time happens where the
                         // events are emitted.
+                        // The counter runs whether or not the aligner does:
+                        // the chunk anchors are the client's only position
+                        // signal when alignment is off.
+                        const int64_t chunk_ms = (int64_t) n * 1000 / 24000;
+                        const int64_t total    = audio_offset_ms.fetch_add(chunk_ms) + chunk_ms;
                         if (partial_active) {
-                            const int64_t chunk_ms = (int64_t) n * 1000 / 24000;
-                            const int64_t total = audio_offset_ms.fetch_add(chunk_ms) + chunk_ms;
                             cx.aligner_last_activity_ms.store(now_ms());
                             cx.aligner->push_partial_pcm(pcm, (size_t) n, total);
                         }
@@ -681,9 +684,29 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                         auto emit_sse = [&](const float * pcm, int n, bool) {
                             if (n > 0) emit_audio(pcm, n);
                         };
+                        // Free "where are we in the text" signal: sentence
+                        // boundaries the engine already computed, stamped with
+                        // the audio position they start at. Works with the
+                        // aligner off, and never lands mid-word.
+                        int64_t anchor_words = 0;
+                        auto emit_chunk_start = [&](size_t idx, size_t total_chunks,
+                                                    const std::string & text) {
+                            const int64_t at = audio_offset_ms.load();
+                            const int64_t nw = (int64_t) whitespace_split_for_align(text).size();
+                            emit_event("speech.audio.chunk",
+                                       {{"type","speech.audio.chunk"},
+                                        {"index",(int) idx},
+                                        {"chunks_total",(int) total_chunks},
+                                        {"word_offset",(int) anchor_words},
+                                        {"word_count",(int) nw},
+                                        {"audio_offset_ms",to_client_ms(at)},
+                                        {"text",text}});
+                            anchor_words += nw;
+                        };
                         ok = long_form
                            ? eng->synthesize_long(input, gp, have_voice ? &ref : nullptr, chunk_words,
-                                                  long_ref_frames, chunk_frames, gap_ms, emit_sse, r)
+                                                  long_ref_frames, chunk_frames, gap_ms, emit_sse, r,
+                                                  emit_chunk_start)
                            : eng->synthesize_stream(input, gp, have_voice ? &ref : nullptr,
                                                     chunk_frames, emit_sse, r);
                     }

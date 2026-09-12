@@ -191,7 +191,8 @@ bool WorkerSession::ensure_loaded(const WorkerConfig & cfg) {
 bool WorkerSession::send_speech_locked(const std::string & meta_json,
                                        const std::vector<int32_t> & codes_blob,
                                        bool streaming, const BreezeTTS::pcm_cb & on_chunk,
-                                       gen_result & out) {
+                                       gen_result & out,
+                                       const BreezeTTS::chunk_cb & on_chunk_start) {
     if (pid_ <= 0 || fd_ < 0 || !loaded_ok_) { last_error_ = "worker not ready"; return false; }
     auto payload = pack_codes_payload(meta_json, codes_blob.data(), codes_blob.size());
     const uint32_t req_id = next_req_id_.fetch_add(1);
@@ -219,6 +220,19 @@ bool WorkerSession::send_speech_locked(const std::string & meta_json,
                     last_error_ = "AUDIO_FRAME unpack"; kill_worker_locked(); return false;
                 }
                 const int n = (int) (nb / sizeof(float));
+                // The frame's metadata slot was unused until long-form chunk
+                // boundaries needed a way across; a frame that opens a chunk
+                // carries it, every other frame leaves it empty. Dispatched
+                // BEFORE the audio so the position the caller reads is the one
+                // this chunk starts at.
+                if (!m.empty() && on_chunk_start) {
+                    try {
+                        const json j = json::parse(m);
+                        on_chunk_start((size_t) j.value("chunk", 0),
+                                       (size_t) j.value("chunks_total", 0),
+                                       j.value("chunk_text", std::string{}));
+                    } catch (...) {}
+                }
                 if (on_chunk && n > 0) on_chunk(reinterpret_cast<const float *>(blob), n, false);
                 break;
             }
@@ -251,7 +265,8 @@ bool WorkerSession::send_speech_locked(const std::string & meta_json,
 bool WorkerSession::synthesize_long(const std::string & text, const gen_params & gp,
                                     const ref_voice * ref, int chunk_words, int ref_max_frames,
                                     int stream_chunk_frames, int gap_ms,
-                                    const BreezeTTS::pcm_cb & on_chunk, gen_result & out) {
+                                    const BreezeTTS::pcm_cb & on_chunk, gen_result & out,
+                                    const BreezeTTS::chunk_cb & on_chunk_start) {
     std::lock_guard<std::mutex> lk(io_mutex_);
     const bool streaming = stream_chunk_frames > 0 && on_chunk != nullptr;
     json meta = {{"mode", streaming ? "stream" : "plain"}, {"input", text},
@@ -265,7 +280,7 @@ bool WorkerSession::synthesize_long(const std::string & text, const gen_params &
         meta["ref_T"] = ref->T;
         meta["ref_text"] = ref->ref_text;
     }
-    return send_speech_locked(meta.dump(), blob, streaming, on_chunk, out);
+    return send_speech_locked(meta.dump(), blob, streaming, on_chunk, out, on_chunk_start);
 }
 
 bool WorkerSession::synthesize(const std::string & text, const gen_params & gp,
@@ -456,10 +471,24 @@ int run_breeze_worker_loop(int fd) {
 
                 std::atomic<bool> ipc_ok{true};
                 const uint32_t cb_req = hdr.req_id;
-                BreezeTTS::pcm_cb on_chunk = [fd, cb_req, &ipc_ok](const float * pcm, int n, bool) {
+                // Set by on_chunk_start and consumed by the next audio frame, so
+                // a chunk boundary rides out on the frame that opens the chunk
+                // instead of needing a frame type of its own. Same thread
+                // throughout — synthesize_long calls both in sequence.
+                std::string pending_chunk_meta;
+                BreezeTTS::chunk_cb on_chunk_start =
+                    [&pending_chunk_meta](size_t i, size_t n, const std::string & t) {
+                        pending_chunk_meta = json{{"chunk", (int) i},
+                                                  {"chunks_total", (int) n},
+                                                  {"chunk_text", t}}.dump();
+                    };
+                BreezeTTS::pcm_cb on_chunk = [fd, cb_req, &ipc_ok, &pending_chunk_meta](
+                                                 const float * pcm, int n, bool) {
                     if (!ipc_ok.load() || n <= 0) return;
+                    std::string meta;
+                    meta.swap(pending_chunk_meta);
                     if (send_frame(fd, WFrame::AUDIO_FRAME, cb_req,
-                                   pack_audio_payload(std::string{}, pcm, (size_t) n)) != IpcError::OK)
+                                   pack_audio_payload(meta, pcm, (size_t) n)) != IpcError::OK)
                         ipc_ok.store(false);
                 };
 
@@ -475,7 +504,8 @@ int run_breeze_worker_loop(int fd) {
                                              req.value("long_ref_frames", 250),
                                              streaming ? req.value("chunk_frames", 6) : 0,
                                              req.value("gap_ms", 180),
-                                             streaming ? on_chunk : BreezeTTS::pcm_cb{}, r);
+                                             streaming ? on_chunk : BreezeTTS::pcm_cb{}, r,
+                                             streaming ? on_chunk_start : BreezeTTS::chunk_cb{});
                 } else if (streaming) {
                     ok = tts.synthesize_stream(input, gp, ref.T ? &ref : nullptr,
                                                req.value("chunk_frames", 6), on_chunk, r);

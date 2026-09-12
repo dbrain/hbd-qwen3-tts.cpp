@@ -58,7 +58,8 @@ public:
     bool synthesize_long(const std::string & text, const gen_params & gp,
                          const ref_voice * ref, int chunk_words, int ref_max_frames,
                          int stream_chunk_frames, int gap_ms,
-                         const BreezeTTS::pcm_cb & on_chunk, gen_result & out);
+                         const BreezeTTS::pcm_cb & on_chunk, gen_result & out,
+                         const BreezeTTS::chunk_cb & on_chunk_start = nullptr);
     bool synthesize_stream(const std::string & text, const gen_params & gp,
                            const ref_voice * ref, int chunk_frames,
                            const BreezeTTS::pcm_cb & on_chunk, gen_result & out);
@@ -80,7 +81,8 @@ private:
     bool send_speech_locked(const std::string & meta_json,
                             const std::vector<int32_t> & codes_blob,
                             bool streaming, const BreezeTTS::pcm_cb & on_chunk,
-                            gen_result & out);
+                            gen_result & out,
+                            const BreezeTTS::chunk_cb & on_chunk_start = nullptr);
 
     std::string              argv0_;
     std::vector<std::string> extra_argv_;
