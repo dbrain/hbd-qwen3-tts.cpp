@@ -1511,7 +1511,17 @@ extern "C" int32_t* qwen3_asr_tokenize(qwen3_asr_context* ctx, const char* text,
 
 extern "C" qwen3_asr_context_params qwen3_asr_context_default_params(void) {
     qwen3_asr_context_params p = {};
+    // Four is the right default when only the LLM body is on the CPU and the
+    // audio tower carries the work on the GPU. It is the wrong one under
+    // QWEN3_FA_CPU=1, where every layer is on the CPU and the box's remaining
+    // cores are simply idle -- and that mode is the one chosen precisely when
+    // the card has no room, i.e. when latency is already the thing being
+    // traded. QWEN3_FA_THREADS lets the caller spend the cores it has.
     p.n_threads = 4;
+    if (const char * e = std::getenv("QWEN3_FA_THREADS")) {
+        const int v = std::atoi(e);
+        if (v > 0) p.n_threads = v;
+    }
     p.verbosity = 1;
     // QWEN3_FA_CPU=1 puts the aligner entirely on the CPU. The LLM body is
     // already there (CRISPASR_N_GPU_LAYERS=0 in fa_session), so this only moves
