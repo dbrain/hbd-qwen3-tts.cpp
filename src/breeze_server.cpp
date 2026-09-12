@@ -47,6 +47,8 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <condition_variable>
+#include <deque>
 #include <thread>
 #include <vector>
 
@@ -526,7 +528,16 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
         // truncation at ~164 words. Send "long": false for exact single-shot
         // control.
         const bool long_form   = body.value("long", true);
-        const int  chunk_words = body.value("chunk_words", 120);
+        // Chunk size is also the ALIGNER's window (see the SSE path): each
+        // chunk is aligned on its own, and the aligner is only accurate on
+        // short audio. Measured against the rendered waveform, its last word
+        // lands 0.2% early at 22 s, 5.8% early at 45 s and 12% early at 67 s.
+        // 64 words is ~24 s of narration -- inside the good window -- where the
+        // 120 that reads best is not. When nothing is being aligned the larger
+        // chunk wins: fewer seams for the rolling reference to carry across.
+        const bool align_wanted = body.value("align", false) && cx.aligner
+                                  && !cx.aligner_model.empty();
+        const int  chunk_words = body.value("chunk_words", align_wanted ? 64 : 120);
         // Default big enough to carry a whole default-sized chunk, transcript
         // and all. A budget that forces the carry down to a TAIL costs the
         // transcript with it (see synthesize_long) and the model drifts into
@@ -547,7 +558,6 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
         // The path kobbler's BookReader takes: stream_format="sse",
         // response_format="pcm", align=true, align_stream="partial".
         if (stream_format == "sse") {
-            const bool do_align      = body.value("align", false);
             const std::string a_mode = body.value("align_stream", std::string("final-only"));
             // align_stream only chooses whether the INCREMENTAL events reach the
             // client; it used to gate the aligner itself, so the documented
@@ -555,7 +565,7 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
             // The internal partial pass still runs in final-only mode — it is
             // how PCM reaches the aligner subprocess, and an undrained
             // PARTIAL_RESP left in the socket would desync the FINAL handshake.
-            const bool do_align_run  = do_align && cx.aligner && !cx.aligner_model.empty();
+            const bool do_align_run  = align_wanted;
             const bool emit_partials = do_align_run && a_mode == "partial";
             // kobbler sends qwen3-tts's spelling, `stream_first_batch_size: 1`,
             // to ask for the smallest possible first chunk (i.e. lowest TTFA).
@@ -565,14 +575,13 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
             const int chunk_frames   = body.value("chunk_frames",
                                          body.value("stream_first_batch_size",
                                            body.value("stream_batch_size", 6)));
-            std::vector<std::string> words = whitespace_split_for_align(input);
 
             res.set_header("Content-Type", "text/event-stream");
             res.set_header("X-Accel-Buffering", "no");
             res.set_chunked_content_provider("text/event-stream",
                 [eng, &cx, input, gp, do_align_run, emit_partials, have_voice, chunk_frames,
                  long_form, chunk_words, long_ref_frames, gap_ms, speed, stretching, to_client_ms,
-                 ref = std::move(ref), words = std::move(words)]
+                 ref = std::move(ref)]
                 (size_t, httplib::DataSink & sink) mutable -> bool {
                     Activity act_stream(cx);
                     std::mutex sink_mtx;
@@ -582,11 +591,46 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                         sink.write(s.data(), s.size());
                     };
 
-                    bool partial_active = false;
+                    // ── Forced alignment, one chunk at a time ───────────
+                    //
+                    // The aligner is accurate on short audio and drifts badly
+                    // on long. Measured against the rendered waveform, the last
+                    // word it times lands 0.2% early over 22 s, 5.8% early over
+                    // 45 s and 12% early over 67 s. Aligning a whole passage in
+                    // one pass therefore runs the highlight ahead of the voice
+                    // and walks the reader off the page before it has been
+                    // read — the "it speeds through the words after a page
+                    // turn" this read-along had.
+                    //
+                    // The chunk anchors make the fix nearly free: a chunk is a
+                    // known word range over a known audio range, so each one is
+                    // aligned alone, inside the window the aligner is good in,
+                    // and the results are concatenated. It costs less as well —
+                    // a pass is O(words²) plus ~5 ms per second of audio, so N
+                    // passes over 1/N of the text beat one pass over all of it,
+                    // and the aligner's VRAM (linear in the audio it holds) is
+                    // bounded by one chunk instead of the whole chapter.
+                    struct PendingChunk {
+                        std::vector<std::string> words;
+                        std::vector<float>       pcm;        // natural rate
+                        int64_t                  base_ms   = 0;
+                        size_t                   word_base = 0;
+                    };
+
+                    bool partial_active = false;   // aligner loaded, lock held
                     std::unique_lock<std::mutex> aligner_lock;
-                    std::thread reader_thread;
-                    std::atomic<bool> reader_stop{false};
                     std::atomic<int64_t> audio_offset_ms{0};
+
+                    std::mutex                align_mtx;
+                    std::condition_variable   align_cv;
+                    std::deque<PendingChunk>  align_q;
+                    bool                      align_feeding = true;
+                    bool                      align_failed  = false;
+                    std::thread               align_thread;
+                    // Written only by the align thread, read only after it is
+                    // joined.
+                    std::vector<fa::AlignedWord> aligned_all;
+
                     if (do_align_run) {
                         aligner_lock = std::unique_lock<std::mutex>(cx.aligner_mtx);
                         cx.aligner_inflight.fetch_add(1);
@@ -597,39 +641,96 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                                         {"error", std::string("aligner load failed: ") + cx.aligner->last_error()}});
                             cx.aligner_inflight.fetch_sub(1);
                             aligner_lock.unlock();
-                        } else if (!cx.aligner->begin_streaming_align(words, 24000)) {
-                            emit_event("speech.audio.alignment.error",
-                                       {{"type","speech.audio.alignment.error"},
-                                        {"error", std::string("begin_streaming_align failed: ") + cx.aligner->last_error()}});
-                            cx.aligner_inflight.fetch_sub(1);
-                            aligner_lock.unlock();
                         } else {
                             partial_active = true;
-                            reader_thread = std::thread([&]() {
-                                while (!reader_stop.load(std::memory_order_relaxed)) {
-                                    cx.aligner->drain_partial_alignments(
-                                        [&](int64_t seen, const std::vector<fa::AlignedWord> & ws) {
-                                            if (!emit_partials) return;  // final-only: drain, don't publish
-                                            // Aligner time -> client time. The
-                                            // audio the client holds is stretched,
-                                            // so untouched timestamps would drift
-                                            // linearly against it.
-                                            json wj = json::array();
-                                            for (size_t i = 0; i < ws.size(); i++)
-                                                wj.push_back({{"word_index",(int)i},{"text",ws[i].text},
-                                                              {"t0_ms",to_client_ms(ws[i].t0_ms)},
-                                                              {"t1_ms",to_client_ms(ws[i].t1_ms)},
-                                                              {"confidence",ws[i].confidence}});
-                                            emit_event("speech.audio.alignment.partial",
-                                                       {{"type","speech.audio.alignment.partial"},
-                                                        {"audio_seen_ms",to_client_ms(seen)},
-                                                        {"words",std::move(wj)}});
-                                        });
-                                    std::this_thread::sleep_for(20ms);
+                            // Off the synth thread: a pass is hundreds of ms of
+                            // GPU and the generation must not wait on it.
+                            align_thread = std::thread([&]() {
+                                for (;;) {
+                                    PendingChunk pc;
+                                    {
+                                        std::unique_lock<std::mutex> lk(align_mtx);
+                                        align_cv.wait(lk, [&] { return !align_q.empty() || !align_feeding; });
+                                        if (align_q.empty()) return;
+                                        pc = std::move(align_q.front());
+                                        align_q.pop_front();
+                                    }
+                                    if (align_failed || pc.words.empty() || pc.pcm.empty()) continue;
+
+                                    const int64_t chunk_ms = (int64_t) pc.pcm.size() * 1000 / 24000;
+                                    std::vector<fa::AlignedWord> got;
+                                    fa::AlignProfile prof;
+                                    cx.aligner_last_activity_ms.store(now_ms());
+                                    const bool ok_align =
+                                        cx.aligner->begin_streaming_align(pc.words, 24000) &&
+                                        cx.aligner->finalize_streaming_align(pc.pcm.data(), pc.pcm.size(),
+                                                                            chunk_ms, got, prof);
+                                    cx.aligner_last_activity_ms.store(now_ms());
+                                    if (!ok_align) {
+                                        // One bad chunk ends alignment for the
+                                        // request; the audio keeps streaming.
+                                        align_failed = true;
+                                        emit_event("speech.audio.alignment.error",
+                                                   {{"type","speech.audio.alignment.error"},
+                                                    {"error", cx.aligner->last_error()}});
+                                        continue;
+                                    }
+
+                                    // Chunk-local timings and indices into the
+                                    // passage's own.
+                                    if (aligned_all.size() < pc.word_base) aligned_all.resize(pc.word_base);
+                                    aligned_all.resize(pc.word_base + got.size());
+                                    for (size_t i = 0; i < got.size(); i++) {
+                                        fa::AlignedWord w = got[i];
+                                        w.t0_ms += pc.base_ms;
+                                        w.t1_ms += pc.base_ms;
+                                        aligned_all[pc.word_base + i] = std::move(w);
+                                    }
+
+                                    if (!emit_partials) continue;   // final-only
+                                    // Aligner time -> client time. The audio the
+                                    // client holds is stretched, so untouched
+                                    // timestamps would drift linearly against it.
+                                    json wj = json::array();
+                                    for (size_t i = 0; i < aligned_all.size(); i++)
+                                        wj.push_back({{"word_index",(int)i},{"text",aligned_all[i].text},
+                                                      {"t0_ms",to_client_ms(aligned_all[i].t0_ms)},
+                                                      {"t1_ms",to_client_ms(aligned_all[i].t1_ms)},
+                                                      {"confidence",aligned_all[i].confidence}});
+                                    emit_event("speech.audio.alignment.partial",
+                                               {{"type","speech.audio.alignment.partial"},
+                                                {"audio_seen_ms",to_client_ms(pc.base_ms + chunk_ms)},
+                                                {"words",std::move(wj)}});
                                 }
                             });
                         }
                     }
+
+                    // The chunk being generated, filled on the synth thread and
+                    // handed over whole when the next one starts.
+                    std::vector<std::string> cur_words;
+                    std::vector<float>       cur_pcm;
+                    int64_t                  cur_base_ms   = 0;
+                    size_t                   cur_word_base = 0;
+                    bool                     cur_open      = false;
+
+                    auto close_chunk = [&]() {
+                        if (!cur_open || cur_pcm.empty() || cur_words.empty()) {
+                            cur_pcm.clear();
+                            cur_words.clear();
+                            cur_open = false;
+                            return;
+                        }
+                        {
+                            std::lock_guard<std::mutex> lk(align_mtx);
+                            align_q.push_back(PendingChunk{std::move(cur_words), std::move(cur_pcm),
+                                                           cur_base_ms, cur_word_base});
+                        }
+                        align_cv.notify_one();
+                        cur_pcm.clear();
+                        cur_words.clear();
+                        cur_open = false;
+                    };
 
                     // Disconnect watchdog: the worker stays warm (499-style).
                     std::atomic<bool> wd_stop{false};
@@ -658,18 +759,14 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
 
                     auto emit_audio = [&](const float * pcm, int n) {
                         cx.last_activity_ms.store(now_ms());
-                        // The aligner gets the natural-rate audio and a natural
-                        // timeline; conversion to client time happens where the
-                        // events are emitted.
                         // The counter runs whether or not the aligner does:
                         // the chunk anchors are the client's only position
                         // signal when alignment is off.
-                        const int64_t chunk_ms = (int64_t) n * 1000 / 24000;
-                        const int64_t total    = audio_offset_ms.fetch_add(chunk_ms) + chunk_ms;
-                        if (partial_active) {
-                            cx.aligner_last_activity_ms.store(now_ms());
-                            cx.aligner->push_partial_pcm(pcm, (size_t) n, total);
-                        }
+                        audio_offset_ms.fetch_add((int64_t) n * 1000 / 24000);
+                        // The aligner gets the natural-rate audio and a natural
+                        // timeline; conversion to client time happens where the
+                        // events are emitted.
+                        if (cur_open) cur_pcm.insert(cur_pcm.end(), pcm, pcm + n);
                         if (!ts) { emit_pcm(pcm, (size_t) n); return; }
                         sbuf.clear();
                         ts->push(pcm, (size_t) n, sbuf);
@@ -692,16 +789,28 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                         auto emit_chunk_start = [&](size_t idx, size_t total_chunks,
                                                     const std::string & text) {
                             const int64_t at = audio_offset_ms.load();
-                            const int64_t nw = (int64_t) whitespace_split_for_align(text).size();
+                            std::vector<std::string> cw = whitespace_split_for_align(text);
                             emit_event("speech.audio.chunk",
                                        {{"type","speech.audio.chunk"},
                                         {"index",(int) idx},
                                         {"chunks_total",(int) total_chunks},
                                         {"word_offset",(int) anchor_words},
-                                        {"word_count",(int) nw},
+                                        {"word_count",(int) cw.size()},
                                         {"audio_offset_ms",to_client_ms(at)},
                                         {"text",text}});
-                            anchor_words += nw;
+                            // The chunk before this one is now complete — all
+                            // of its audio has been emitted — so it can be
+                            // aligned while this one generates.
+                            if (partial_active) {
+                                close_chunk();
+                                cur_words     = std::move(cw);
+                                cur_base_ms   = at;
+                                cur_word_base = (size_t) anchor_words;
+                                cur_open      = true;
+                                anchor_words += (int64_t) cur_words.size();
+                                return;
+                            }
+                            anchor_words += (int64_t) cw.size();
                         };
                         ok = long_form
                            ? eng->synthesize_long(input, gp, have_voice ? &ref : nullptr, chunk_words,
@@ -718,38 +827,34 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                     }
 
                     if (partial_active) {
-                        reader_stop.store(true);
-                        if (reader_thread.joinable()) reader_thread.join();
+                        close_chunk();   // the last chunk has no successor to close it
+                        {
+                            std::lock_guard<std::mutex> lk(align_mtx);
+                            align_feeding = false;
+                        }
+                        align_cv.notify_one();
+                        if (align_thread.joinable()) align_thread.join();
                     }
                     wd_stop.store(true);
                     if (wd.joinable()) wd.join();
 
-                    // A cancelled render stopped mid-document: the audio holds
-                    // only part of the text, and finalize_streaming_align fits
-                    // EVERY word into whatever it is given. Publishing that would
-                    // hand the client a word table running at the wrong rate for
-                    // the whole passage -- the highlight races the voice to the
-                    // end. The session is still finalised (the subprocess
-                    // handshake has to complete or the next request desyncs); the
-                    // result is simply not published, leaving the last partial --
-                    // prefix-clamped and honest -- standing.
+                    // A cancelled render stopped mid-document. Every chunk
+                    // that WAS aligned is still honest -- each was aligned
+                    // against its own audio -- but the passage is not finished,
+                    // and a `final` event says it is. The partials already sent
+                    // stand instead: prefix-clamped, and as far as the voice
+                    // actually got.
                     const bool cancelled = eng->is_cancel_requested();
 
                     if (partial_active) {
                         const int64_t total_ms = audio_offset_ms.load();
-                        std::vector<fa::AlignedWord> aligned;
-                        fa::AlignProfile prof;
-                        if (!cx.aligner->finalize_streaming_align(nullptr, 0, total_ms, aligned, prof)) {
-                            emit_event("speech.audio.alignment.error",
-                                       {{"type","speech.audio.alignment.error"},
-                                        {"error", cx.aligner->last_error()}});
-                        } else if (!cancelled) {
+                        if (!cancelled && !align_failed && !aligned_all.empty()) {
                             json wj = json::array();
-                            for (size_t i = 0; i < aligned.size(); i++)
-                                wj.push_back({{"word_index",(int)i},{"text",aligned[i].text},
-                                              {"t0_ms",to_client_ms(aligned[i].t0_ms)},
-                                              {"t1_ms",to_client_ms(aligned[i].t1_ms)},
-                                              {"confidence",aligned[i].confidence}});
+                            for (size_t i = 0; i < aligned_all.size(); i++)
+                                wj.push_back({{"word_index",(int)i},{"text",aligned_all[i].text},
+                                              {"t0_ms",to_client_ms(aligned_all[i].t0_ms)},
+                                              {"t1_ms",to_client_ms(aligned_all[i].t1_ms)},
+                                              {"confidence",aligned_all[i].confidence}});
                             emit_event("speech.audio.alignment.final",
                                        {{"type","speech.audio.alignment.final"},
                                         {"audio_total_ms",to_client_ms(total_ms)},
