@@ -833,8 +833,21 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                         emit_pcm(sbuf.data(), sbuf.size());
                     }
 
+                    // A cancelled render stopped mid-document. Every chunk
+                    // that WAS aligned is still honest -- each was aligned
+                    // against its own audio -- but the passage is not finished,
+                    // and a `final` event says it is. The partials already sent
+                    // stand instead: prefix-clamped, and as far as the voice
+                    // actually got.
+                    const bool cancelled = eng->is_cancel_requested();
+
                     if (partial_active) {
-                        close_chunk();   // the last chunk has no successor to close it
+                        // The last chunk has no successor to close it -- unless
+                        // the render was abandoned inside it, in which case its
+                        // audio is a fragment of the words it claims and
+                        // aligning them against it would cram the whole chunk
+                        // into whatever seconds got made.
+                        if (!cancelled) close_chunk();
                         {
                             std::lock_guard<std::mutex> lk(align_mtx);
                             align_feeding = false;
@@ -844,14 +857,6 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                     }
                     wd_stop.store(true);
                     if (wd.joinable()) wd.join();
-
-                    // A cancelled render stopped mid-document. Every chunk
-                    // that WAS aligned is still honest -- each was aligned
-                    // against its own audio -- but the passage is not finished,
-                    // and a `final` event says it is. The partials already sent
-                    // stand instead: prefix-clamped, and as far as the voice
-                    // actually got.
-                    const bool cancelled = eng->is_cancel_requested();
 
                     if (partial_active) {
                         const int64_t total_ms = audio_offset_ms.load();
