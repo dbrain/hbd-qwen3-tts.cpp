@@ -379,42 +379,6 @@ std::vector<std::string> BreezeTTS::chunk_text(const std::string & text, int chu
                            if (!sp && !in) { ++n; in = true; } else if (sp) in = false; }
         return n;
     };
-
-    // With a ramp, an opening sentence longer than the first budget would still
-    // ship whole and hold the first highlight back for all of it. Cut it once,
-    // at the last clause mark (, ; : or a dash) that fits the budget, keeping at
-    // least kMinClause words on each side -- or, with no clause mark, at the
-    // budget itself. Only the first sentence: everywhere
-    // else a seam at a sentence end is worth more than a sooner alignment.
-    constexpr int kMinClause = 4;
-    if (first_chunk_words > 0 && first_chunk_words < chunk_words && !sents.empty()
-        && words_in(sents[0]) > first_chunk_words) {
-        const std::string & s0 = sents[0];
-        const int total = words_in(s0);
-        size_t cut = std::string::npos, at_budget = std::string::npos;
-        int n = 0;
-        for (size_t i = 0; i < s0.size(); ++i) {
-            const bool sp = (s0[i] == ' ');
-            if (sp && i > 0 && s0[i - 1] != ' ') {
-                ++n;
-                const char c = s0[i - 1];
-                const bool clause = c == ',' || c == ';' || c == ':' ||
-                                    (i >= 3 && (unsigned char) s0[i - 1] == 0x94 &&
-                                     (unsigned char) s0[i - 2] == 0x80 && (unsigned char) s0[i - 3] == 0xE2) ||
-                                    (i >= 2 && s0[i - 1] == '-' && s0[i - 2] == '-');
-                const bool room = n >= kMinClause && total - n >= kMinClause && n <= first_chunk_words;
-                if (room && clause) cut = i;
-                if (room && n == first_chunk_words) at_budget = i;
-            }
-        }
-        if (cut == std::string::npos) cut = at_budget;
-        if (cut != std::string::npos) {
-            std::string head = s0.substr(0, cut);
-            std::string tail = s0.substr(s0.find_first_not_of(' ', cut));
-            sents[0] = head;
-            sents.insert(sents.begin() + 1, tail);
-        }
-    }
     std::vector<std::string> out;
     std::string cur; int cur_w = 0;
     for (const auto & sn : sents) {
