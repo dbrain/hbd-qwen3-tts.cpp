@@ -568,7 +568,11 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
         const bool align_wanted = body.value("align", false) && align_device != "off"
                                   && cx.aligner && !cx.aligner_model.empty();
         const int  chunk_words = body.value("chunk_words", align_wanted ? 64 : 120);
-        const int  first_chunk_words = body.value("first_chunk_words", 0);
+        // A chunk is only aligned once all of its audio exists, so at 64 words a
+        // read-along waited ~9 s for its first highlight. 16 packs whole
+        // sentences (never cut mid-sentence -- that cost pacing and stutters)
+        // and doubles from there: ~3.5 s, with no measurable change in pace.
+        const int  first_chunk_words = body.value("first_chunk_words", align_wanted ? 16 : 0);
         // Default big enough to carry a whole default-sized chunk, transcript
         // and all. A budget that forces the carry down to a TAIL costs the
         // transcript with it (see synthesize_long) and the model drifts into
