@@ -19,8 +19,9 @@ static inline int round_up_stride(int n) {
 
 size_t Backbone::sched_bytes() const {
     if (!w_) return 0;
-    size_t n = sched_ ? ggml_backend_sched_get_buffer_size(sched_, w_->backend()) : 0;
-    if (dec_.sched) n += ggml_backend_sched_get_buffer_size(dec_.sched, w_->backend());
+    size_t n = (sched_ && sched_owned_) ? ggml_backend_sched_get_buffer_size(sched_, w_->backend()) : 0;
+    if (dec_.sched)  n += ggml_backend_sched_get_buffer_size(dec_.sched, w_->backend());
+    if (pair_.sched) n += ggml_backend_sched_get_buffer_size(pair_.sched, w_->backend());
     return n;
 }
 
@@ -30,16 +31,25 @@ void Backbone::drop_decode_slot() {
     dec_.gf = nullptr; dec_.n_kv_eff = -1; dec_.kv_alloc = -1; dec_.meta.clear();
 }
 
+void Backbone::drop_pair_slot() {
+    if (pair_.sched) { ggml_backend_sched_free(pair_.sched); pair_.sched = nullptr; }
+    if (pair_.ctx)   { ggml_free(pair_.ctx); pair_.ctx = nullptr; }
+    pair_.gf = nullptr; pair_.other = nullptr; pair_.meta.clear();
+    pair_.n_kv_a = pair_.n_kv_b = -1;
+}
+
 void Backbone::free_state() {
     drop_decode_slot();
-    if (sched_)     { ggml_backend_sched_free(sched_); sched_ = nullptr; }
+    drop_pair_slot();
+    if (sched_ && sched_owned_) ggml_backend_sched_free(sched_);
+    sched_ = nullptr; sched_owned_ = true;
     if (kv_buffer_) { ggml_backend_buffer_free(kv_buffer_); kv_buffer_ = nullptr; }
     if (kv_ctx_)    { ggml_free(kv_ctx_); kv_ctx_ = nullptr; }
     k_cache_.clear(); v_cache_.clear(); layers_.clear(); compute_meta_.clear();
     n_ctx_ = kv_alloc_ = n_past_ = 0;
 }
 
-bool Backbone::init(BreezeWeights * w, int n_ctx) {
+bool Backbone::init(BreezeWeights * w, int n_ctx, Backbone * share_sched) {
     free_state();
     w_ = w;
     cfg_ = w->cfg().bb;
@@ -90,11 +100,16 @@ bool Backbone::init(BreezeWeights * w, int n_ctx) {
       if (e && !std::strcmp(e, "f32")) kv_type_ = GGML_TYPE_F32; }
     if (!alloc_kv(kv_initial_, false)) return false;
 
-    std::vector<ggml_backend_t> backends = { w->backend() };
-    if (w->backend_cpu()) backends.push_back(w->backend_cpu());
-    sched_ = ggml_backend_sched_new(backends.data(), nullptr, (int) backends.size(),
-                                    BZ_LM_MAX_NODES, false, true);
-    if (!sched_) { error_msg_ = "backbone: sched_new failed"; return false; }
+    if (share_sched && share_sched->sched_) {
+        sched_ = share_sched->sched_;
+        sched_owned_ = false;
+    } else {
+        std::vector<ggml_backend_t> backends = { w->backend() };
+        if (w->backend_cpu()) backends.push_back(w->backend_cpu());
+        sched_ = ggml_backend_sched_new(backends.data(), nullptr, (int) backends.size(),
+                                        BZ_LM_MAX_NODES, false, true);
+        if (!sched_) { error_msg_ = "backbone: sched_new failed"; return false; }
+    }
     compute_meta_.resize(ggml_tensor_overhead() * BZ_LM_MAX_NODES +
                          ggml_graph_overhead_custom(BZ_LM_MAX_NODES, false));
     return true;
@@ -147,7 +162,9 @@ bool Backbone::alloc_kv(int n_alloc, bool copy) {
         }
     }
     kv_alloc_ = n_alloc;
+    ++kv_gen_;
     drop_decode_slot();   // the cached decode graph views the old slab
+    drop_pair_slot();
     return true;
 }
 
@@ -380,6 +397,160 @@ bool Backbone::run(int n, const float * embeds, const int32_t * codes,
     if (!cached) { ggml_backend_sched_reset(sched_); ggml_free(c); }
     n_past_ += n;
     if (P) { g_bb.get += lap(); g_bb.calls++; }
+    return true;
+}
+
+struct ggml_cgraph * Backbone::build_pair_graph(struct ggml_context * c, Backbone & other) {
+    struct ggml_cgraph * gf = ggml_new_graph_custom(c, BZ_LM_MAX_NODES, false);
+    const int hd = cfg_.head_dim, nh = cfg_.n_head, nkv = cfg_.n_kv_head;
+    const float scale = 1.0f / std::sqrt((float) hd);
+    const int n = 2;   // column 0 = this sequence, column 1 = `other`
+    Backbone * seq[2] = { this, &other };
+
+    // Both columns embed the same frame; the indices are uploaded twice.
+    struct ggml_tensor * x = nullptr;
+    for (int cb = 0; cb < cfg_.n_codebooks; ++cb) {
+        char nm[32]; snprintf(nm, sizeof(nm), "codes_%d", cb);
+        struct ggml_tensor * idx = ggml_new_tensor_1d(c, GGML_TYPE_I32, n);
+        ggml_set_name(idx, nm); ggml_set_input(idx);
+        struct ggml_tensor * r = ggml_get_rows(c, audio_embd_, idx);
+        x = x ? ggml_add(c, x, r) : r;
+    }
+    struct ggml_tensor * pos = ggml_new_tensor_1d(c, GGML_TYPE_I32, n);
+    ggml_set_name(pos, "pos"); ggml_set_input(pos);
+    struct ggml_tensor * kvi[2], * mask[2];
+    int n_kv_eff[2];
+    for (int s = 0; s < 2; ++s) {
+        char nm[16];
+        snprintf(nm, sizeof(nm), "kvi_%d", s);
+        kvi[s] = ggml_new_tensor_1d(c, GGML_TYPE_I32, 1);
+        ggml_set_name(kvi[s], nm); ggml_set_input(kvi[s]);
+        n_kv_eff[s] = round_up_stride(seq[s]->n_past_ + 1);
+        snprintf(nm, sizeof(nm), "mask_%d", s);
+        mask[s] = ggml_new_tensor_2d(c, GGML_TYPE_F16, n_kv_eff[s], 1);
+        ggml_set_name(mask[s], nm); ggml_set_input(mask[s]);
+    }
+
+    for (int il = 0; il < cfg_.n_layers; ++il) {
+        const layer & L = layers_[il];
+        struct ggml_tensor * res = x;
+        struct ggml_tensor * h = ggml_mul(c, ggml_rms_norm(c, x, cfg_.rms_eps), L.attn_norm);
+        struct ggml_tensor * q = ggml_reshape_3d(c, ggml_mul_mat(c, L.wq, h), hd, nh,  n);
+        struct ggml_tensor * k = ggml_reshape_3d(c, ggml_mul_mat(c, L.wk, h), hd, nkv, n);
+        struct ggml_tensor * v = ggml_reshape_3d(c, ggml_mul_mat(c, L.wv, h), hd, nkv, n);
+        q = ggml_mul(c, ggml_rms_norm(c, q, cfg_.rms_eps), L.q_norm);
+        k = ggml_mul(c, ggml_rms_norm(c, k, cfg_.rms_eps), L.k_norm);
+        q = ggml_rope_ext(c, q, pos, nullptr, hd, GGML_ROPE_TYPE_NEOX, 0,
+                          cfg_.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        k = ggml_rope_ext(c, k, pos, nullptr, hd, GGML_ROPE_TYPE_NEOX, 0,
+                          cfg_.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+        struct ggml_tensor * attn = nullptr;
+        for (int s = 0; s < 2; ++s) {
+            struct ggml_tensor * ks = seq[s]->k_cache_[il], * vs = seq[s]->v_cache_[il];
+            const int alloc = seq[s]->kv_alloc_;
+            ggml_build_forward_expand(gf, ggml_set_rows(c,
+                ggml_view_2d(c, ks, hd * nkv, alloc, ks->nb[2], 0),
+                ggml_view_2d(c, k,  hd * nkv, 1, k->nb[2], (size_t) s * k->nb[2]), kvi[s]));
+            ggml_build_forward_expand(gf, ggml_set_rows(c,
+                ggml_view_2d(c, vs, hd * nkv, alloc, vs->nb[2], 0),
+                ggml_view_2d(c, v,  hd * nkv, 1, v->nb[2], (size_t) s * v->nb[2]), kvi[s]));
+            struct ggml_tensor * kview = ggml_view_3d(c, ks, hd, nkv, n_kv_eff[s], ks->nb[1], ks->nb[2], 0);
+            struct ggml_tensor * vview = ggml_view_3d(c, vs, hd, nkv, n_kv_eff[s], vs->nb[1], vs->nb[2], 0);
+            struct ggml_tensor * qs = ggml_view_3d(c, q, hd, nh, 1, q->nb[1], q->nb[2], (size_t) s * q->nb[2]);
+            struct ggml_tensor * Q = ggml_permute(c, qs, 0, 2, 1, 3);
+            struct ggml_tensor * K = ggml_permute(c, kview, 0, 2, 1, 3);
+            struct ggml_tensor * V = ggml_permute(c, vview, 0, 2, 1, 3);
+            struct ggml_tensor * a = ggml_flash_attn_ext(c, Q, K, V, mask[s], scale, 0.0f, 0.0f);
+            a = ggml_cont_2d(c, a, nh * hd, 1);
+            attn = attn ? ggml_concat(c, attn, a, 1) : a;
+        }
+        attn = ggml_mul_mat(c, L.wo, attn);
+
+        x = ggml_add(c, res, attn);
+        res = x;
+        h = ggml_mul(c, ggml_rms_norm(c, x, cfg_.rms_eps), L.ffn_norm);
+        struct ggml_tensor * g = ggml_silu(c, ggml_mul_mat(c, L.ffn_gate, h));
+        struct ggml_tensor * u = ggml_mul_mat(c, L.ffn_up, h);
+        h = ggml_mul_mat(c, L.ffn_down, ggml_mul(c, g, u));
+        x = ggml_add(c, res, h);
+    }
+
+    x = ggml_mul(c, ggml_rms_norm(c, x, cfg_.rms_eps), out_norm_);
+    ggml_set_name(x, "hidden_pair");
+    ggml_set_output(x);
+    ggml_build_forward_expand(gf, x);
+    struct ggml_tensor * logits = ggml_mul_mat(c, lm_head_, x);   // [lm_head_size, 2]
+    ggml_set_name(logits, "logits_pair");
+    ggml_set_output(logits);
+    ggml_build_forward_expand(gf, logits);
+    return gf;
+}
+
+bool Backbone::decode_frame_pair(Backbone & other, const int32_t * codes,
+                                 std::vector<float> & h_self, std::vector<float> & l_self,
+                                 std::vector<float> & h_other, std::vector<float> & l_other) {
+    if (!ensure_kv(n_past_ + 1)) return false;
+    if (!other.ensure_kv(other.n_past_ + 1)) { error_msg_ = other.error_msg_; return false; }
+    const int want_a = round_up_stride(n_past_ + 1);
+    const int want_b = round_up_stride(other.n_past_ + 1);
+    if (pair_.gf && (pair_.other != &other || pair_.n_kv_a != want_a || pair_.n_kv_b != want_b ||
+                     pair_.gen_a != kv_gen_ || pair_.gen_b != other.kv_gen_))
+        drop_pair_slot();
+    if (!pair_.gf) {
+        std::vector<ggml_backend_t> backends = { w_->backend() };
+        if (w_->backend_cpu()) backends.push_back(w_->backend_cpu());
+        pair_.sched = ggml_backend_sched_new(backends.data(), nullptr, (int) backends.size(),
+                                             BZ_LM_MAX_NODES, false, true);
+        if (!pair_.sched) { error_msg_ = "backbone: sched_new failed"; return false; }
+        pair_.meta.resize(compute_meta_.size());
+        struct ggml_init_params dp = { pair_.meta.size(), pair_.meta.data(), true };
+        pair_.ctx = ggml_init(dp);
+        pair_.gf = build_pair_graph(pair_.ctx, other);
+        if (!ggml_backend_sched_alloc_graph(pair_.sched, pair_.gf)) {
+            error_msg_ = "backbone: alloc pair graph"; drop_pair_slot(); return false;
+        }
+        pair_.other = &other;
+        pair_.n_kv_a = want_a; pair_.n_kv_b = want_b;
+        pair_.gen_a = kv_gen_; pair_.gen_b = other.kv_gen_;
+    }
+    struct ggml_cgraph * gf = pair_.gf;
+
+    const int32_t posv[2] = { n_past_, other.n_past_ };
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "pos"), posv, 0, sizeof(posv));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "kvi_0"), &posv[0], 0, sizeof(int32_t));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "kvi_1"), &posv[1], 0, sizeof(int32_t));
+    for (int cb = 0; cb < cfg_.n_codebooks; ++cb) {
+        char nm[32]; snprintf(nm, sizeof(nm), "codes_%d", cb);
+        const int32_t id = codes[cb] + cb * cfg_.audio_vocab;
+        const int32_t col[2] = { id, id };
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, nm), col, 0, sizeof(col));
+    }
+    const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+    const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
+    const int want[2] = { want_a, want_b };
+    for (int s = 0; s < 2; ++s) {
+        std::vector<ggml_fp16_t> m((size_t) want[s]);
+        for (int j = 0; j < want[s]; ++j) m[j] = (j <= posv[s]) ? zero : ninf;
+        char nm[16]; snprintf(nm, sizeof(nm), "mask_%d", s);
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, nm), m.data(), 0,
+                                m.size() * sizeof(ggml_fp16_t));
+    }
+    if (ggml_backend_sched_graph_compute(pair_.sched, gf) != GGML_STATUS_SUCCESS) {
+        error_msg_ = "backbone: pair compute"; return false;
+    }
+    const int E = cfg_.n_embd;
+    struct ggml_tensor * hl = ggml_graph_get_tensor(gf, "hidden_pair");
+    struct ggml_tensor * lg = ggml_graph_get_tensor(gf, "logits_pair");
+    const int LM = (int) lg->ne[0];
+    h_self.resize(E); h_other.resize(E);
+    l_self.resize(LM); l_other.resize(LM);
+    ggml_backend_tensor_get(hl, h_self.data(),  0, (size_t) E * sizeof(float));
+    ggml_backend_tensor_get(hl, h_other.data(), (size_t) E * sizeof(float), (size_t) E * sizeof(float));
+    ggml_backend_tensor_get(lg, l_self.data(),  0, (size_t) LM * sizeof(float));
+    ggml_backend_tensor_get(lg, l_other.data(), (size_t) LM * sizeof(float), (size_t) LM * sizeof(float));
+    n_past_++;
+    other.n_past_++;
     return true;
 }
 

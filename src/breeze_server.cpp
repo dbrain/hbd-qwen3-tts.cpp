@@ -209,6 +209,9 @@ static void fill_params(const json & body, breeze::gen_params & gp) {
     gp.instruction        = body.value("instruction",
                               body.value("instructions",
                                 body.value("voice_description", std::string{})));
+    // Guidance strength for the instruction (breeze_infer's --cfg-scale; the
+    // reference recommends 4 for voice design / direction). 1 = single pass.
+    gp.cfg_scale          = body.value("cfg_scale", body.value("guidance_scale", 1.0f));
 }
 
 struct ServerCtx {
@@ -472,7 +475,10 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
         if (input.empty()) return err_json(res, 400, "empty input");
 
         breeze::gen_params gp;
-        fill_params(body, gp);
+        try { fill_params(body, gp); }
+        catch (const std::exception & e) { return err_json(res, 400, std::string("bad parameter: ") + e.what()); }
+        if (!std::isfinite(gp.cfg_scale) || gp.cfg_scale <= 0.0f)
+            return err_json(res, 400, "cfg_scale must be greater than 0");
         if (cx.set_gpu) cx.set_gpu(body.value("gpu", std::string()));
         // Shared into the streaming providers below: httplib runs them after this
         // handler returns, and a scoped Activity left inflight at 0 in between --

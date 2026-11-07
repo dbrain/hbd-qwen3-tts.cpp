@@ -23,7 +23,11 @@ class Backbone {
 public:
     ~Backbone() { free_state(); }
 
-    bool init(BreezeWeights * w, int n_ctx = 2048);
+    // share_sched: run prefills on that backbone's scheduler instead of a new
+    // one. The CFG negative branch prefills strictly after the positive one, so
+    // a second prefill compute buffer (the biggest one, ~prompt length) would
+    // only ever sit idle.
+    bool init(BreezeWeights * w, int n_ctx = 2048, Backbone * share_sched = nullptr);
     void reset();
 
     bool prefill_embeds(const float * embeds, int n,
@@ -32,6 +36,12 @@ public:
     bool decode_frame(const int32_t * codes,
                       std::vector<float> & hidden_last,
                       std::vector<float> & logits);
+    // CFG: append the SAME frame to this sequence and to `other` (separate KV,
+    // separate positions) in one batch-2 graph, so the weights are read once
+    // for both. Equivalent to decode_frame() on each.
+    bool decode_frame_pair(Backbone & other, const int32_t * codes,
+                           std::vector<float> & hidden_self, std::vector<float> & logits_self,
+                           std::vector<float> & hidden_other, std::vector<float> & logits_other);
     // Prefill a run of frames (used to seed generated context; not on the hot path).
     bool prefill_frames(const int32_t * codes, int n_frames,
                         std::vector<float> & hidden_last,
@@ -45,7 +55,7 @@ public:
     int  n_past() const { return n_past_; }
     int  n_ctx()  const { return n_ctx_; }
     size_t kv_bytes() const { return kv_buffer_ ? ggml_backend_buffer_get_size(kv_buffer_) : 0; }
-    size_t sched_bytes() const;
+    size_t sched_bytes() const;   // excludes a shared scheduler
     const std::string & get_error() const { return error_msg_; }
 
 private:
@@ -66,6 +76,7 @@ private:
     bool alloc_kv(int n_alloc, bool copy);
     bool ensure_kv(int need);
     struct ggml_cgraph * build_graph(struct ggml_context * c, int n, bool from_codes);
+    struct ggml_cgraph * build_pair_graph(struct ggml_context * c, Backbone & other);
     bool run(int n, const float * embeds, const int32_t * codes,
              std::vector<float> & hidden_last, std::vector<float> & logits);
 
@@ -81,6 +92,10 @@ private:
     std::vector<struct ggml_tensor *> k_cache_, v_cache_;
     ggml_type kv_type_ = GGML_TYPE_F16;
     int n_ctx_ = 0, kv_alloc_ = 0, kv_initial_ = 0, n_past_ = 0;
+    // Bumped on every KV (re)allocation: a cached pair graph holds the OTHER
+    // backbone's cache tensors, and a size match alone cannot prove they are
+    // the same tensors (reset() can shrink and a later grow land on the same size).
+    unsigned kv_gen_ = 0;
 
     // The prompt prefill is one-shot (rebuild each time), but the per-frame
     // decode graph is identical for a whole 256-frame KV block, so it is built
@@ -96,7 +111,20 @@ private:
     } dec_;
     void drop_decode_slot();
 
+    // Batch-2 CFG decode graph, keyed on both sequences' KV shape + generation.
+    struct pair_slot {
+        ggml_backend_sched_t sched = nullptr;
+        struct ggml_context * ctx = nullptr;
+        struct ggml_cgraph *  gf = nullptr;
+        std::vector<uint8_t>  meta;
+        const Backbone * other = nullptr;
+        int n_kv_a = -1, n_kv_b = -1;
+        unsigned gen_a = 0, gen_b = 0;
+    } pair_;
+    void drop_pair_slot();
+
     ggml_backend_sched_t sched_ = nullptr;
+    bool sched_owned_ = true;
     std::vector<uint8_t> compute_meta_;
     std::string error_msg_;
 };

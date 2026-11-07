@@ -13,10 +13,17 @@
 //   clone            [S0]{ref_text} | <audio> | [S0]{text}
 //   clone+instruction[S0]{ref_text} | <audio> | [S0]<ins_bos>{ins}<ins_eos>{text}
 //
-// CFG is deliberately NOT implemented: the reference gates it on
-// `cfg_scale != 1.0 and negative_prompt_ids is not None` and calls the
-// alternative "a wasteful dual pass". Single pass is the default and the
-// entire reason this port is fast.
+// Classifier-free guidance (single CFG, as BreezeGenerationMixin._sample):
+// with cfg_scale != 1 and an instruction, a NEGATIVE prompt -- the same request
+// with the instruction removed (instruction -> plain, clone+instruction ->
+// clone) -- runs alongside the positive one on its own KV. Each step the
+// backbone's codebook-0/EOS logits AND every depth-decoder codebook's logits
+// are mixed as uncond + cfg_scale * (cond - uncond) before the usual
+// penalty/mask/sampling, and the one sampled frame is appended to BOTH
+// sequences. Templates without an instruction have no negative prompt, so
+// cfg_scale is ignored there (the reference raises). cfg_scale == 1 is the
+// untouched single-pass path. BREEZE_CFG_BATCH=0 runs the two branches one
+// after the other instead of as one batch-2 graph (for A/B only).
 
 #include "breeze_weights.h"
 #include "breeze_text_enc.h"
@@ -55,6 +62,7 @@ struct gen_params {
     uint32_t seed = 0;
     std::string speaker = "S0";
     std::string instruction;      // empty => plain template
+    float cfg_scale = 1.0f;       // != 1 needs an instruction; see header comment
 };
 
 struct ref_voice {
@@ -181,16 +189,25 @@ private:
                       double & text_enc_ms);
     bool run_ar(const gen_params & gp, int chunk_frames, const pcm_cb * on_chunk,
                 gen_result & out);
+    // Lazily builds the negative branch (second backbone KV + depth KV); the
+    // single-pass path never pays for it.
+    bool ensure_cfg();
     std::string speaker_tag(const std::string & spk) const;
 
     // Carried between prefill and the AR loop so run_ar() has one entry shape.
     std::vector<float> prefill_hidden_, prefill_logits_;
+    std::vector<float> neg_hidden_, neg_logits_;
+    bool use_cfg_ = false;
     std::chrono::steady_clock::time_point t_ar_start_;
 
     BreezeWeights w_;
     TextEncoder   te_;
     Backbone      bb_;
     DepthDecoder  dd_;
+    Backbone      bb_neg_;
+    DepthDecoder  dd_neg_;
+    bool          cfg_ready_ = false;
+    int           n_ctx_ = 2048;
     qwen3_tts::AudioTokenizerDecoder cc_;
     qwen3_tts::AudioCodecEncoder      ce_;
     bool loaded_ = false;

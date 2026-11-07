@@ -32,6 +32,16 @@ public:
                    float temperature, int top_k, float top_p, uint32_t & rng_state,
                    std::vector<float> * logits_out = nullptr);
 
+    // CFG: the same frame through this decoder (conditional, h_cond) and `neg`
+    // (unconditional, h_uncond), each with its own KV. Every codebook samples
+    // from uncond + cfg_scale * (cond - uncond), and the sampled code is fed to
+    // BOTH -- exactly BreezeGenerationMixin._depth_decoder_generate_with_cfg.
+    // batched runs the pair as one batch-2 graph per step; otherwise each
+    // decoder steps on its own graphs, one after the other.
+    bool run_frame_cfg(DepthDecoder & neg, const float * h_cond, const float * h_uncond,
+                       int32_t * codes, float cfg_scale, bool batched,
+                       float temperature, int top_k, float top_p, uint32_t & rng_state);
+
     size_t kv_bytes() const { return kv_buf_ ? ggml_backend_buffer_get_size(kv_buf_) : 0; }
     size_t sched_bytes() const;
     void   log_sched_detail() const;
@@ -97,6 +107,17 @@ private:
     graph_slot pre_;
     std::vector<graph_slot> step_;
     bool init_slot(graph_slot & g, int n, int n_past, int head_idx);
+
+    // Batch-2 CFG graphs (prefill + one per head), bound to one `neg` decoder's KV.
+    graph_slot pair_pre_;
+    std::vector<graph_slot> pair_step_;
+    const DepthDecoder * pair_other_ = nullptr;
+    void drop_pair_slots();
+    struct ggml_cgraph * build_pair_graph(struct ggml_context * c, int n_per, int n_past,
+                                          int head_idx, const DepthDecoder & other);
+    bool step_pair(DepthDecoder & other, int n_per, int n_past, int head_idx,
+                   const float * hidden2_or_null, const int32_t * codes_in,
+                   std::vector<float> & logits2);
     std::string error_msg_;
 };
 

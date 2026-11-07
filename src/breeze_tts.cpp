@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 
 namespace breeze {
 
@@ -65,6 +66,8 @@ bool BreezeTTS::load(const std::string & path, int n_ctx) {
     if (!w_.load(path))        { error_msg_ = w_.get_error();  return false; }
     if (!te_.init(&w_))        { error_msg_ = te_.get_error(); return false; }
     if (!bb_.init(&w_, n_ctx)) { error_msg_ = bb_.get_error(); return false; }
+    n_ctx_ = n_ctx;
+    cfg_ready_ = false;
     if (!dd_.init(&w_))        { error_msg_ = dd_.get_error(); return false; }
     // Same GGUF, opened again by the vocoder/encoder: they own their own ggml
     // context and backend (the decoder runs on a dedicated low-priority stream),
@@ -75,8 +78,17 @@ bool BreezeTTS::load(const std::string & path, int n_ctx) {
     return true;
 }
 
+bool BreezeTTS::ensure_cfg() {
+    if (cfg_ready_) return true;
+    if (!bb_neg_.init(&w_, n_ctx_, &bb_)) { error_msg_ = "cfg: " + bb_neg_.get_error(); return false; }
+    if (!dd_neg_.init(&w_))               { error_msg_ = "cfg: " + dd_neg_.get_error(); return false; }
+    cfg_ready_ = true;
+    return true;
+}
+
 void BreezeTTS::unload() {
     loaded_ = false;
+    cfg_ready_ = false;
     cc_.unload_model();
     ce_.unload_model();
     w_.unload();
@@ -161,6 +173,12 @@ bool BreezeTTS::run_ar(const gen_params & gp, int chunk_frames, const pcm_cb * o
     // arrive through out.codes being empty and the members below.
     hidden = std::move(prefill_hidden_);
     logits = std::move(prefill_logits_);
+    std::vector<float> neg_hidden = std::move(neg_hidden_);
+    std::vector<float> neg_logits = std::move(neg_logits_);
+    static const bool cfg_batch = [] {
+        const char * e = std::getenv("BREEZE_CFG_BATCH");
+        return !(e && !std::strcmp(e, "0"));
+    }();
 
     // Frames are [T, NC] row-major; the vocoder takes the same layout.
     const int n_cb = NC;
@@ -178,6 +196,11 @@ bool BreezeTTS::run_ar(const gen_params & gp, int chunk_frames, const pcm_cb * o
         if (cancelled()) { hit_eos = true; break; }   // a cancel is not a truncation
 
         if ((int) logits.size() < LM) { error_msg_ = "ar: short logits"; return false; }
+        if (use_cfg_) {
+            if ((int) neg_logits.size() < LM) { error_msg_ = "ar: short cfg logits"; return false; }
+            for (int i = 0; i < LM; ++i)
+                logits[i] = neg_logits[i] + gp.cfg_scale * (logits[i] - neg_logits[i]);
+        }
 
         // GeneratedTokenRepetitionPenaltyLogitsProcessor: only over generated,
         // in-vocab codebook-0 ids, and only from the second step on.
@@ -196,8 +219,14 @@ bool BreezeTTS::run_ar(const gen_params & gp, int chunk_frames, const pcm_cb * o
 
         std::vector<int32_t> frame(NC, 0);
         frame[0] = c0;
-        if (!dd_.run_frame(hidden.data(), frame.data(), gp.depth_temperature,
-                           gp.depth_top_k, gp.depth_top_p, rng)) {
+        if (use_cfg_) {
+            if (!dd_.run_frame_cfg(dd_neg_, hidden.data(), neg_hidden.data(), frame.data(),
+                                   gp.cfg_scale, cfg_batch, gp.depth_temperature,
+                                   gp.depth_top_k, gp.depth_top_p, rng)) {
+                error_msg_ = dd_.get_error(); return false;
+            }
+        } else if (!dd_.run_frame(hidden.data(), frame.data(), gp.depth_temperature,
+                                  gp.depth_top_k, gp.depth_top_p, rng)) {
             error_msg_ = dd_.get_error(); return false;
         }
         out.codes.insert(out.codes.end(), frame.begin(), frame.end());
@@ -227,8 +256,18 @@ bool BreezeTTS::run_ar(const gen_params & gp, int chunk_frames, const pcm_cb * o
         }
 
         if (step + 1 < gp.max_new_frames) {
-            if (!bb_.decode_frame(frame.data(), hidden, logits)) {
-                error_msg_ = bb_.get_error(); return false;
+            if (use_cfg_ && cfg_batch) {
+                if (!bb_.decode_frame_pair(bb_neg_, frame.data(), hidden, logits,
+                                           neg_hidden, neg_logits)) {
+                    error_msg_ = bb_.get_error(); return false;
+                }
+            } else {
+                if (!bb_.decode_frame(frame.data(), hidden, logits)) {
+                    error_msg_ = bb_.get_error(); return false;
+                }
+                if (use_cfg_ && !bb_neg_.decode_frame(frame.data(), neg_hidden, neg_logits)) {
+                    error_msg_ = bb_neg_.get_error(); return false;
+                }
             }
         }
     }
@@ -284,6 +323,14 @@ bool BreezeTTS::synthesize_stream(const std::string & text, const gen_params & g
 
     t_ar_start_ = std::chrono::steady_clock::now();
     bb_.reset();
+    use_cfg_ = gp.cfg_scale != 1.0f && !gp.instruction.empty();
+    if (gp.cfg_scale != 1.0f && gp.instruction.empty()) {
+        static int warned = 0;
+        if (warned++ < 4)
+            fprintf(stderr, "breeze: cfg_scale=%.2f ignored -- CFG needs an instruction "
+                            "(the negative prompt is the request without it)\n", gp.cfg_scale);
+    }
+    if (use_cfg_ && !ensure_cfg()) return false;
 
     std::vector<int32_t> ids;
     std::vector<float> embeds;
@@ -293,6 +340,19 @@ bool BreezeTTS::synthesize_stream(const std::string & text, const gen_params & g
     auto t0 = std::chrono::steady_clock::now();
     if (!bb_.prefill_embeds(embeds.data(), (int) ids.size(), prefill_hidden_, prefill_logits_)) {
         error_msg_ = bb_.get_error(); return false;
+    }
+    if (use_cfg_) {
+        gen_params neg = gp;
+        neg.instruction.clear();
+        std::vector<int32_t> nids;
+        std::vector<float> nembeds;
+        double nte_ms = 0;
+        if (!build_prompt(text, neg, ref, nids, nembeds, nte_ms)) return false;
+        out.text_enc_ms += nte_ms;
+        bb_neg_.reset();
+        if (!bb_neg_.prefill_embeds(nembeds.data(), (int) nids.size(), neg_hidden_, neg_logits_)) {
+            error_msg_ = bb_neg_.get_error(); return false;
+        }
     }
     out.prefill_ms = std::chrono::duration<double, std::milli>(
                          std::chrono::steady_clock::now() - t0).count();
@@ -522,8 +582,10 @@ bool BreezeTTS::encode_voice(const float * pcm, int n, std::vector<int32_t> & co
 
 void BreezeTTS::log_vram(const char * label) const {
     const double w = w_.weights_bytes() / (1024.0 * 1024.0);
-    const double kv = (bb_.kv_bytes() + dd_.kv_bytes()) / (1024.0 * 1024.0);
-    const double sc = (bb_.sched_bytes() + dd_.sched_bytes() + cc_.sched_bytes()
+    const double kv = (bb_.kv_bytes() + dd_.kv_bytes() + bb_neg_.kv_bytes() + dd_neg_.kv_bytes())
+                      / (1024.0 * 1024.0);
+    const double sc = (bb_.sched_bytes() + dd_.sched_bytes() + bb_neg_.sched_bytes()
+                       + dd_neg_.sched_bytes() + cc_.sched_bytes()
                        + ce_.sched_bytes() + cc_.stream_kv_bytes()) / (1024.0 * 1024.0);
     fprintf(stderr, "  [vram-breeze %-10s] weights=%.1f kv=%.1f sched=%.1f total=%.1f MiB\n",
             label, w, kv, sc, w + kv + sc);
