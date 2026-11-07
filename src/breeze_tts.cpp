@@ -343,8 +343,11 @@ bool BreezeTTS::decode_codes(const int32_t * codes, int T, std::vector<float> & 
     return true;
 }
 
-std::vector<std::string> BreezeTTS::chunk_text(const std::string & text, int chunk_words) {
+std::vector<std::string> BreezeTTS::chunk_text(const std::string & text, int chunk_words,
+                                               int first_chunk_words) {
     if (chunk_words <= 0) chunk_words = 120;
+    int budget = (first_chunk_words > 0 && first_chunk_words < chunk_words) ? first_chunk_words
+                                                                            : chunk_words;
     // Split on sentence enders first so a seam never lands mid-clause; pack
     // sentences up to the word budget. An over-long single sentence ships whole
     // rather than being cut at an arbitrary word.
@@ -380,7 +383,10 @@ std::vector<std::string> BreezeTTS::chunk_text(const std::string & text, int chu
     std::string cur; int cur_w = 0;
     for (const auto & sn : sents) {
         const int w = words_in(sn);
-        if (cur_w > 0 && cur_w + w > chunk_words) { out.push_back(cur); cur.clear(); cur_w = 0; }
+        if (cur_w > 0 && cur_w + w > budget) {
+            out.push_back(cur); cur.clear(); cur_w = 0;
+            budget = std::min(budget * 2, chunk_words);
+        }
         if (!cur.empty()) cur += " ";
         cur += sn; cur_w += w;
     }
@@ -393,7 +399,8 @@ bool BreezeTTS::synthesize_long(const std::string & text, const gen_params & gp,
                                 int chunk_words, int ref_max_frames,
                                 int stream_chunk_frames, int gap_ms,
                                 const pcm_cb & on_chunk, gen_result & out,
-                                const chunk_cb & on_chunk_start) {
+                                const chunk_cb & on_chunk_start,
+                                int first_chunk_words) {
     if (!loaded_) { error_msg_ = "not loaded"; return false; }
     // Big enough that a default-sized chunk (120 words, ~500 frames) is carried
     // WHOLE. That matters far more than the memory it costs: the rolling history
@@ -410,7 +417,7 @@ bool BreezeTTS::synthesize_long(const std::string & text, const gen_params & gp,
     const std::vector<float> gap((size_t) (gap_ms * w_.cfg().cc.sample_rate / 1000), 0.0f);
     const int NC = w_.cfg().bb.n_codebooks;
 
-    auto chunks = chunk_text(text, chunk_words);
+    auto chunks = chunk_text(text, chunk_words, first_chunk_words);
     if (chunks.empty()) { error_msg_ = "no chunks"; return false; }
 
     out = gen_result{};

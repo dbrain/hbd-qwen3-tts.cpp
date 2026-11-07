@@ -136,11 +136,18 @@ public:
                          int chunk_words, int ref_max_frames,
                          int stream_chunk_frames, int gap_ms,
                          const pcm_cb & on_chunk, gen_result & out,
-                         const chunk_cb & on_chunk_start = nullptr);
+                         const chunk_cb & on_chunk_start = nullptr,
+                         int first_chunk_words = 0);
 
     // Split text into ~chunk_words chunks on sentence boundaries. Exposed so a
     // caller can align its own word offsets with what synthesize_long renders.
-    static std::vector<std::string> chunk_text(const std::string & text, int chunk_words);
+    //
+    // first_chunk_words > 0 ramps the budget: the first chunk packs to that,
+    // and each later one doubles it up to chunk_words. A chunk can only be
+    // force-aligned once all of its audio exists, so the first chunk's length
+    // is how long a read-along shows no highlight -- ~6 s at 64 words.
+    static std::vector<std::string> chunk_text(const std::string & text, int chunk_words,
+                                               int first_chunk_words = 0);
 
     // 24 kHz mono in -> Mimi codes, for voice cloning.
     bool encode_voice(const float * pcm, int n_samples, std::vector<int32_t> & codes, int & T);
