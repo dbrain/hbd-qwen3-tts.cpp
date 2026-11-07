@@ -35,6 +35,22 @@ GGUFLoader::~GGUFLoader() {
     close();
 }
 
+// A worker pinned to a card by UUID that the container did not expose sees zero
+// devices. Falling back to CPU then "works" -- at ~0.07x realtime for Breeze,
+// with nothing in the response to say so. Pinning a GPU means wanting one.
+// Empty or "-1" is the conventional way to ask for no GPU, so that still runs.
+static bool cpu_fallback_refused(std::string * error_msg, const char * what) {
+    const char * cvd = std::getenv("CUDA_VISIBLE_DEVICES");
+    if (!cvd || cvd[0] == '\0' || std::strcmp(cvd, "-1") == 0) return false;
+    fprintf(stderr, "%s: CUDA_VISIBLE_DEVICES=%s matches no visible GPU; refusing CPU fallback\n",
+            what, cvd);
+    if (error_msg) {
+        *error_msg = std::string(what) + ": CUDA_VISIBLE_DEVICES=" + cvd +
+                     " matches no visible GPU (is the container given that card?)";
+    }
+    return true;
+}
+
 static ggml_backend_t init_preferred_backend_uncached(const char * component_name,
                                                        std::string * error_msg,
                                                        const char * backend_priority = nullptr) {
@@ -57,6 +73,9 @@ static ggml_backend_t init_preferred_backend_uncached(const char * component_nam
         }
         if (!backend) {
             backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_ACCEL, params);
+        }
+        if (!backend && cpu_fallback_refused(error_msg, component_name ? component_name : "component")) {
+            return nullptr;
         }
     }
     if (!backend) {
@@ -220,6 +239,11 @@ bool load_tensor_data_from_file(
         backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
     }
     if (!backend && preferred_backend_type != GGML_BACKEND_DEVICE_TYPE_CPU) {
+        const char * force_cpu = std::getenv("QWEN3_TTS_FORCE_CPU");
+        if (!(force_cpu && force_cpu[0] == '1') &&
+            cpu_fallback_refused(&error_msg, "GGUF tensor loader")) {
+            return false;
+        }
         backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     }
     if (!backend) {
