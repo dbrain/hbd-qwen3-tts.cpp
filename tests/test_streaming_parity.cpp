@@ -10,7 +10,7 @@
 namespace {
 
 void print_usage(const char * argv0) {
-    fprintf(stderr, "usage: %s --tokenizer <path.gguf> [--frames N] [--chunk K] [--seed S] [--tol F]\n", argv0);
+    fprintf(stderr, "usage: %s --tokenizer <path.gguf> [--frames N] [--chunk K] [--first K0] [--sched a,b,c] [--repeat R] [--dump out.f32] [--seed S] [--tol F]\n", argv0);
 }
 
 }
@@ -19,6 +19,10 @@ int main(int argc, char ** argv) {
     const char * tokenizer_path = nullptr;
     int n_frames = 64;
     int chunk = 16;
+    int first = 0;
+    int repeat = 1;
+    std::vector<int> sched;
+    const char * dump = nullptr;
     int seed = 1;
     float tol = 1e-4f;
 
@@ -26,6 +30,12 @@ int main(int argc, char ** argv) {
         if (strcmp(argv[i], "--tokenizer") == 0 && i + 1 < argc) tokenizer_path = argv[++i];
         else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) n_frames = atoi(argv[++i]);
         else if (strcmp(argv[i], "--chunk") == 0 && i + 1 < argc) chunk = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--first") == 0 && i + 1 < argc) first = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--sched") == 0 && i + 1 < argc) {
+            for (char * t = strtok(argv[++i], ","); t; t = strtok(nullptr, ",")) sched.push_back(atoi(t));
+        }
+        else if (strcmp(argv[i], "--dump") == 0 && i + 1 < argc) dump = argv[++i];
+        else if (strcmp(argv[i], "--repeat") == 0 && i + 1 < argc) repeat = atoi(argv[++i]);
         else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) seed = atoi(argv[++i]);
         else if (strcmp(argv[i], "--tol") == 0 && i + 1 < argc) tol = (float) atof(argv[++i]);
         else { print_usage(argv[0]); return 1; }
@@ -78,15 +88,32 @@ int main(int argc, char ** argv) {
         }
     }
 
-    std::vector<float> pcm_stream;
+    std::vector<float> pcm_stream, pcm_prev;
+    for (int r = 0; r < repeat; ++r) {
+    pcm_prev.swap(pcm_stream);
+    pcm_stream.clear();
     decoder.stream_reset();
-    for (int off = 0; off < n_frames; off += chunk) {
-        int k = std::min(chunk, n_frames - off);
+    for (int off = 0, ci = 0; off < n_frames; ++ci) {
+        int k = !sched.empty() ? (ci < (int) sched.size() ? sched[ci] : sched.back())
+                               : ((off == 0 && first > 0) ? first : chunk);
+        k = std::min(k, n_frames - off);
         const int32_t * ptr = codes.data() + (size_t) off * cfg.n_codebooks;
         if (!decoder.stream_decode(ptr, k, pcm_stream)) {
             fprintf(stderr, "stream_decode failed at off=%d: %s\n", off, decoder.get_error().c_str());
             return 4;
         }
+        off += k;
+    }
+    if (r > 0) {
+        size_t nd = 0, fd = SIZE_MAX;
+        for (size_t i = 0; i < pcm_stream.size() && i < pcm_prev.size(); ++i)
+            if (pcm_stream[i] != pcm_prev[i]) { ++nd; if (fd == SIZE_MAX) fd = i; }
+        printf("repeat %d vs %d: %zu samples differ (first at %lld)\n", r, r - 1, nd, fd == SIZE_MAX ? -1LL : (long long) fd);
+    }
+    }
+    if (dump) {
+        FILE * f = fopen(dump, "wb");
+        if (f) { fwrite(pcm_stream.data(), sizeof(float), pcm_stream.size(), f); fclose(f); }
     }
     printf("streaming: %zu samples (%d chunks of %d frames)\n", pcm_stream.size(),
            (n_frames + chunk - 1) / chunk, chunk);
@@ -106,6 +133,19 @@ int main(int argc, char ** argv) {
         if (d > tol && first_bad == SIZE_MAX) first_bad = i;
     }
     double rms = std::sqrt(sum_sq / pcm_oneshot.size());
+    {
+        const size_t W = 1920 * 4;
+        printf("per-4-frame SNR(dB):");
+        for (size_t b = 0; b < pcm_oneshot.size(); b += W) {
+            double se = 0, sn = 0;
+            for (size_t i = b; i < std::min(b + W, pcm_oneshot.size()); ++i) {
+                double d = (double) pcm_stream[i] - pcm_oneshot[i];
+                se += (double) pcm_oneshot[i] * pcm_oneshot[i]; sn += d * d;
+            }
+            printf(" %.1f", 10.0 * std::log10((se + 1e-30) / (sn + 1e-30)));
+        }
+        printf("\n");
+    }
     printf("max_abs=%.3e rms=%.3e tol=%.3e\n", max_abs, rms, (double) tol);
     if (first_bad != SIZE_MAX) {
         printf("first deviation at sample %zu: stream=%.6f oneshot=%.6f\n",
