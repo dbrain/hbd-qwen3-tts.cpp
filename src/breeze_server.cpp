@@ -432,8 +432,28 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                                            {"n_words",prof.n_words}}}}).dump(), "application/json");
     });
 
+    // Refuses (409) rather than queueing behind a render. A blocking unload
+    // outlived the gate's 10 s client: the gate gave up, but the handler kept
+    // waiting on cx.mtx and later SIGKILLed whichever worker existed then --
+    // usually the NEXT request's, freshly loaded, which then ended ok:false.
+    // The wait stays under the gate's timeout so a render about to finish
+    // still unloads in one call.
     srv.Post("/v1/admin/unload", [&cx](const httplib::Request &, httplib::Response & res) {
-        std::lock_guard<std::mutex> lk(cx.mtx);
+        const int64_t deadline = now_ms() + 8000;
+        std::unique_lock<std::mutex> lk(cx.mtx, std::defer_lock);
+        for (;;) {
+            if (cx.inflight.load() == 0 && lk.try_lock()) {
+                if (cx.inflight.load() == 0) break;
+                lk.unlock();
+            }
+            if (now_ms() >= deadline) {
+                res.status = 409;
+                res.set_content(json({{"unloaded", false},{"busy", true},
+                                      {"model_loaded", cx.is_loaded()}}).dump(), "application/json");
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
         const bool was = cx.is_loaded();
         cx.unload();
         res.set_content(json({{"unloaded", was},{"model_loaded", cx.is_loaded()}}).dump(), "application/json");
@@ -454,7 +474,10 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
         breeze::gen_params gp;
         fill_params(body, gp);
         if (cx.set_gpu) cx.set_gpu(body.value("gpu", std::string()));
-        Activity act(cx);
+        // Shared into the streaming providers below: httplib runs them after this
+        // handler returns, and a scoped Activity left inflight at 0 in between --
+        // a loaded worker that unload could kill before the render began.
+        auto act = std::make_shared<Activity>(cx);
         if (!cx.ensure()) return err_json(res, 503, "engine load failed");
 
         // Resolve an optional clone voice from the filesystem store (GPU-free).
@@ -586,7 +609,7 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
             res.set_header("Content-Type", "text/event-stream");
             res.set_header("X-Accel-Buffering", "no");
             res.set_chunked_content_provider("text/event-stream",
-                [eng, &cx, input, gp, do_align_run, emit_partials, align_device, have_voice, chunk_frames,
+                [act, eng, &cx, input, gp, do_align_run, emit_partials, align_device, have_voice, chunk_frames,
                  long_form, chunk_words, long_ref_frames, gap_ms, speed, stretching, to_client_ms,
                  ref = std::move(ref)]
                 (size_t, httplib::DataSink & sink) mutable -> bool {
@@ -921,7 +944,7 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                                        body.value("stream_first_batch_size",
                                          body.value("stream_batch_size", 6)));
             res.set_chunked_content_provider(ctype,
-                [eng, &cx, input, gp, have_voice, chunk_frames, long_form, chunk_words,
+                [act, eng, &cx, input, gp, have_voice, chunk_frames, long_form, chunk_words,
                  long_ref_frames, gap_ms, speed, stretching, raw_pcm, ref = std::move(ref)]
                 (size_t, httplib::DataSink & sink) mutable {
                     // Streaming WAV cannot know its length up front; 0xFFFFFFFF is
