@@ -266,12 +266,14 @@ bool WorkerSession::synthesize_long(const std::string & text, const gen_params &
                                     const ref_voice * ref, int chunk_words, int ref_max_frames,
                                     int stream_chunk_frames, int gap_ms,
                                     const BreezeTTS::pcm_cb & on_chunk, gen_result & out,
-                                    const BreezeTTS::chunk_cb & on_chunk_start) {
+                                    const BreezeTTS::chunk_cb & on_chunk_start,
+                                    int first_chunk_words) {
     std::lock_guard<std::mutex> lk(io_mutex_);
     const bool streaming = stream_chunk_frames > 0 && on_chunk != nullptr;
     json meta = {{"mode", streaming ? "stream" : "plain"}, {"input", text},
                  {"gp", gp_to_json(gp)}, {"long", true},
-                 {"chunk_words", chunk_words}, {"long_ref_frames", ref_max_frames},
+                 {"chunk_words", chunk_words}, {"first_chunk_words", first_chunk_words},
+                 {"long_ref_frames", ref_max_frames},
                  {"gap_ms", gap_ms},
                  {"chunk_frames", stream_chunk_frames > 0 ? stream_chunk_frames : 6}};
     std::vector<int32_t> blob;
@@ -505,7 +507,8 @@ int run_breeze_worker_loop(int fd) {
                                              streaming ? req.value("chunk_frames", 6) : 0,
                                              req.value("gap_ms", 180),
                                              streaming ? on_chunk : BreezeTTS::pcm_cb{}, r,
-                                             streaming ? on_chunk_start : BreezeTTS::chunk_cb{});
+                                             streaming ? on_chunk_start : BreezeTTS::chunk_cb{},
+                                             req.value("first_chunk_words", 0));
                 } else if (streaming) {
                     ok = tts.synthesize_stream(input, gp, ref.T ? &ref : nullptr,
                                                req.value("chunk_frames", 6), on_chunk, r);

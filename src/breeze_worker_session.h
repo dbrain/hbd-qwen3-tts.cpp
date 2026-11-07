@@ -59,7 +59,8 @@ public:
                          const ref_voice * ref, int chunk_words, int ref_max_frames,
                          int stream_chunk_frames, int gap_ms,
                          const BreezeTTS::pcm_cb & on_chunk, gen_result & out,
-                         const BreezeTTS::chunk_cb & on_chunk_start = nullptr);
+                         const BreezeTTS::chunk_cb & on_chunk_start = nullptr,
+                         int first_chunk_words = 0);
     bool synthesize_stream(const std::string & text, const gen_params & gp,
                            const ref_voice * ref, int chunk_frames,
                            const BreezeTTS::pcm_cb & on_chunk, gen_result & out);

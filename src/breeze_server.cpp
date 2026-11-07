@@ -568,6 +568,11 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
         const bool align_wanted = body.value("align", false) && align_device != "off"
                                   && cx.aligner && !cx.aligner_model.empty();
         const int  chunk_words = body.value("chunk_words", align_wanted ? 64 : 120);
+        // A chunk is only aligned once all of its audio exists, so at 64 words a
+        // read-along waited ~9 s for its first highlight. 16 packs whole
+        // sentences (never cut mid-sentence -- that cost pacing and stutters)
+        // and doubles from there: ~3.5 s, with no measurable change in pace.
+        const int  first_chunk_words = body.value("first_chunk_words", align_wanted ? 16 : 0);
         // Default big enough to carry a whole default-sized chunk, transcript
         // and all. A budget that forces the carry down to a TAIL costs the
         // transcript with it (see synthesize_long) and the model drifts into
@@ -610,7 +615,7 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
             res.set_header("X-Accel-Buffering", "no");
             res.set_chunked_content_provider("text/event-stream",
                 [act, eng, &cx, input, gp, do_align_run, emit_partials, align_device, have_voice, chunk_frames,
-                 long_form, chunk_words, long_ref_frames, gap_ms, speed, stretching, to_client_ms,
+                 long_form, chunk_words, first_chunk_words, long_ref_frames, gap_ms, speed, stretching, to_client_ms,
                  ref = std::move(ref)]
                 (size_t, httplib::DataSink & sink) mutable -> bool {
                     Activity act_stream(cx);
@@ -845,7 +850,7 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                         ok = long_form
                            ? eng->synthesize_long(input, gp, have_voice ? &ref : nullptr, chunk_words,
                                                   long_ref_frames, chunk_frames, gap_ms, emit_sse, r,
-                                                  emit_chunk_start)
+                                                  emit_chunk_start, first_chunk_words)
                            : eng->synthesize_stream(input, gp, have_voice ? &ref : nullptr,
                                                     chunk_frames, emit_sse, r);
                     }
