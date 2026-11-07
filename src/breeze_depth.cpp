@@ -33,12 +33,24 @@ struct acc { double build=0, alloc=0, upload=0, compute=0, get=0; long calls=0;
 };
 } // namespace prof
 
+namespace {
+template <class G> void drop_graph_slot(G & g) {
+    if (g.sched) { ggml_backend_sched_free(g.sched); g.sched = nullptr; }
+    if (g.ctx)   { ggml_free(g.ctx); g.ctx = nullptr; }
+    g.gf = nullptr; g.allocated = false; g.meta.clear();
+}
+} // namespace
+
+void DepthDecoder::drop_pair_slots() {
+    drop_graph_slot(pair_pre_);
+    for (auto & g : pair_step_) drop_graph_slot(g);
+    pair_step_.clear();
+    pair_other_ = nullptr;
+}
+
 void DepthDecoder::free_state() {
-    auto drop = [](graph_slot & g) {
-        if (g.sched) { ggml_backend_sched_free(g.sched); g.sched = nullptr; }
-        if (g.ctx)   { ggml_free(g.ctx); g.ctx = nullptr; }
-        g.gf = nullptr; g.allocated = false; g.meta.clear();
-    };
+    auto drop = [](graph_slot & g) { drop_graph_slot(g); };
+    drop_pair_slots();
     drop(pre_);
     for (auto & g : step_) drop(g);
     step_.clear();
@@ -141,6 +153,9 @@ size_t DepthDecoder::sched_bytes() const {
     if (!w_) return 0;
     size_t n = pre_.sched ? ggml_backend_sched_get_buffer_size(pre_.sched, w_->backend()) : 0;
     for (const auto & g : step_)
+        if (g.sched) n += ggml_backend_sched_get_buffer_size(g.sched, w_->backend());
+    if (pair_pre_.sched) n += ggml_backend_sched_get_buffer_size(pair_pre_.sched, w_->backend());
+    for (const auto & g : pair_step_)
         if (g.sched) n += ggml_backend_sched_get_buffer_size(g.sched, w_->backend());
     return n;
 }
@@ -389,6 +404,199 @@ bool DepthDecoder::run_frame(const float * backbone_hidden, int32_t * codes,
         // and whose head index is cb.
         int32_t tok = codes[cb] + cb * V;
         if (!step(1, cb + 1, cb, nullptr, &tok, logits)) return false;
+    }
+    return true;
+}
+
+// Columns [0, n_per) are this decoder's sequence, [n_per, 2*n_per) are
+// `other`'s. Both sequences sit at the same codebook positions and take the
+// same input codes; only position 0 of the prefill (the backbone hidden state)
+// differs. Each attends over its own KV slab.
+struct ggml_cgraph * DepthDecoder::build_pair_graph(struct ggml_context * c, int n_per,
+                                                    int n_past, int head_idx,
+                                                    const DepthDecoder & other) {
+    struct ggml_cgraph * gf = ggml_new_graph_custom(c, BZ_DD_MAX_NODES, false);
+    const int hd = cfg_.head_dim, nh = cfg_.n_head, nkv = cfg_.n_kv_head;
+    const int n_kv = kv_slots_;
+    const int n = 2 * n_per;
+    const float scale = 1.0f / std::sqrt((float) hd);
+    const DepthDecoder * seq[2] = { this, &other };
+
+    struct ggml_tensor * e;
+    {
+        struct ggml_tensor * idx = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_per);
+        ggml_set_name(idx, "codes"); ggml_set_input(idx);
+        struct ggml_tensor * e1 = ggml_get_rows(c, tok_embd_, idx);   // [audio_embd, n_per]
+        if (n_past == 0) {
+            struct ggml_tensor * bh = ggml_new_tensor_2d(c, GGML_TYPE_F32, cfg_.audio_embd_size, 2);
+            ggml_set_name(bh, "backbone_hidden"); ggml_set_input(bh);
+            struct ggml_tensor * rest = ggml_cont(c, ggml_view_2d(c, e1, cfg_.audio_embd_size,
+                                                                  n_per - 1, e1->nb[1], e1->nb[1]));
+            struct ggml_tensor * b0 = ggml_view_2d(c, bh, cfg_.audio_embd_size, 1, bh->nb[1], 0);
+            struct ggml_tensor * b1 = ggml_view_2d(c, bh, cfg_.audio_embd_size, 1, bh->nb[1], bh->nb[1]);
+            e = ggml_concat(c, ggml_concat(c, b0, rest, 1),
+                               ggml_concat(c, b1, rest, 1), 1);
+        } else {
+            e = ggml_concat(c, e1, e1, 1);
+        }
+    }
+    struct ggml_tensor * x = ggml_mul_mat(c, in_proj_, e);   // [n_embd, n]
+
+    struct ggml_tensor * pos = ggml_new_tensor_1d(c, GGML_TYPE_I32, n);
+    ggml_set_name(pos, "pos"); ggml_set_input(pos);
+    struct ggml_tensor * kvi = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_per);
+    ggml_set_name(kvi, "kvi"); ggml_set_input(kvi);
+    struct ggml_tensor * mask = ggml_new_tensor_2d(c, GGML_TYPE_F32, n_kv, n_per);
+    ggml_set_name(mask, "mask"); ggml_set_input(mask);
+
+    for (int il = 0; il < cfg_.n_layers; ++il) {
+        const layer & L = layers_[il];
+        struct ggml_tensor * res = x;
+        struct ggml_tensor * h = ggml_mul(c, ggml_rms_norm(c, x, cfg_.rms_eps), L.attn_norm);
+        struct ggml_tensor * q = ggml_reshape_3d(c, ggml_mul_mat(c, L.wq, h), hd, nh,  n);
+        struct ggml_tensor * k = ggml_reshape_3d(c, ggml_mul_mat(c, L.wk, h), hd, nkv, n);
+        struct ggml_tensor * v = ggml_reshape_3d(c, ggml_mul_mat(c, L.wv, h), hd, nkv, n);
+        q = ggml_rope_ext(c, q, pos, rope_ff_, hd, GGML_ROPE_TYPE_NEOX, 0,
+                          cfg_.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        k = ggml_rope_ext(c, k, pos, rope_ff_, hd, GGML_ROPE_TYPE_NEOX, 0,
+                          cfg_.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+        struct ggml_tensor * attn = nullptr;
+        for (int sq = 0; sq < 2; ++sq) {
+            struct ggml_tensor * ks = seq[sq]->k_cache_[il], * vs = seq[sq]->v_cache_[il];
+            const size_t off = (size_t) sq * n_per;
+            ggml_build_forward_expand(gf, ggml_set_rows(c,
+                ggml_view_2d(c, ks, hd * nkv, kv_slots_, ks->nb[2], 0),
+                ggml_view_2d(c, k,  hd * nkv, n_per, k->nb[2], off * k->nb[2]), kvi));
+            ggml_build_forward_expand(gf, ggml_set_rows(c,
+                ggml_view_2d(c, vs, hd * nkv, kv_slots_, vs->nb[2], 0),
+                ggml_view_2d(c, v,  hd * nkv, n_per, v->nb[2], off * v->nb[2]), kvi));
+            struct ggml_tensor * kview = ggml_view_3d(c, ks, hd, nkv, n_kv, ks->nb[1], ks->nb[2], 0);
+            struct ggml_tensor * vview = ggml_view_3d(c, vs, hd, nkv, n_kv, vs->nb[1], vs->nb[2], 0);
+            struct ggml_tensor * qs = ggml_view_3d(c, q, hd, nh, n_per, q->nb[1], q->nb[2], off * q->nb[2]);
+            struct ggml_tensor * Q = ggml_permute(c, qs, 0, 2, 1, 3);
+            struct ggml_tensor * K = ggml_permute(c, kview, 0, 2, 1, 3);
+            struct ggml_tensor * kq = ggml_mul_mat(c, K, Q);
+            kq = ggml_soft_max_ext(c, kq, mask, scale, 0.0f);
+            struct ggml_tensor * V = ggml_cont(c, ggml_permute(c, vview, 1, 2, 0, 3));
+            struct ggml_tensor * kqv = ggml_mul_mat(c, V, kq);
+            kqv = ggml_cont_2d(c, ggml_permute(c, kqv, 0, 2, 1, 3), nh * hd, n_per);
+            attn = attn ? ggml_concat(c, attn, kqv, 1) : kqv;
+        }
+        attn = ggml_mul_mat(c, L.wo, attn);
+
+        x = ggml_add(c, res, attn);
+        res = x;
+        h = ggml_mul(c, ggml_rms_norm(c, x, cfg_.rms_eps), L.ffn_norm);
+        struct ggml_tensor * g = ggml_silu(c, ggml_mul_mat(c, L.ffn_gate, h));
+        struct ggml_tensor * u = ggml_mul_mat(c, L.ffn_up, h);
+        h = ggml_mul_mat(c, L.ffn_down, ggml_mul(c, g, u));
+        x = ggml_add(c, res, h);
+    }
+
+    x = ggml_mul(c, ggml_rms_norm(c, x, cfg_.rms_eps), out_norm_);
+    struct ggml_tensor * l0 = ggml_view_2d(c, x, cfg_.n_embd, 1, x->nb[1], (size_t) (n_per - 1) * x->nb[1]);
+    struct ggml_tensor * l1 = ggml_view_2d(c, x, cfg_.n_embd, 1, x->nb[1], (size_t) (n - 1) * x->nb[1]);
+    struct ggml_tensor * last = ggml_concat(c, ggml_cont(c, l0), ggml_cont(c, l1), 1);
+    struct ggml_tensor * head = ggml_view_2d(c, heads_, heads_->ne[0], heads_->ne[1],
+                                             heads_->nb[1], (size_t) head_idx * heads_->nb[2]);
+    struct ggml_tensor * logits = ggml_mul_mat(c, head, last);   // [vocab, 2]
+    ggml_set_name(logits, "logits");
+    ggml_set_output(logits);
+    ggml_build_forward_expand(gf, logits);
+    return gf;
+}
+
+bool DepthDecoder::step_pair(DepthDecoder & other, int n_per, int n_past, int head_idx,
+                             const float * hidden2, const int32_t * codes_in,
+                             std::vector<float> & logits2) {
+    if (pair_other_ != &other) {
+        drop_pair_slots();
+        pair_other_ = &other;
+    }
+    if (pair_step_.empty()) pair_step_.resize(cfg_.n_codebooks - 1);
+    graph_slot & g = (n_past == 0) ? pair_pre_ : pair_step_[head_idx];
+    if (!g.allocated) {
+        std::vector<ggml_backend_t> backends = { w_->backend() };
+        if (w_->backend_cpu()) backends.push_back(w_->backend_cpu());
+        g.sched = ggml_backend_sched_new(backends.data(), nullptr, (int) backends.size(),
+                                         BZ_DD_MAX_NODES, false, true);
+        if (!g.sched) { error_msg_ = "depth: sched_new failed"; return false; }
+        g.meta.resize(ggml_tensor_overhead() * BZ_DD_MAX_NODES +
+                      ggml_graph_overhead_custom(BZ_DD_MAX_NODES, false));
+        struct ggml_init_params p = { g.meta.size(), g.meta.data(), true };
+        g.ctx = ggml_init(p);
+        g.gf = build_pair_graph(g.ctx, n_per, n_past, head_idx, other);
+        if (!ggml_backend_sched_alloc_graph(g.sched, g.gf)) {
+            error_msg_ = "depth: alloc pair graph"; return false;
+        }
+        g.allocated = true;
+    }
+    struct ggml_cgraph * gf = g.gf;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "codes"), codes_in, 0, n_per * sizeof(int32_t));
+    if (n_past == 0) {
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "backbone_hidden"), hidden2, 0,
+                                (size_t) 2 * cfg_.audio_embd_size * sizeof(float));
+    }
+    std::vector<int32_t> posv(2 * n_per), kvi(n_per);
+    for (int i = 0; i < n_per; ++i) posv[i] = posv[n_per + i] = kvi[i] = n_past + i;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "pos"), posv.data(), 0, posv.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "kvi"), kvi.data(), 0, kvi.size() * sizeof(int32_t));
+    const int n_kv = kv_slots_;
+    std::vector<float> m((size_t) n_kv * n_per);
+    for (int i = 0; i < n_per; ++i)
+        for (int j = 0; j < n_kv; ++j)
+            m[(size_t) i * n_kv + j] = (j <= n_past + i) ? 0.0f : -INFINITY;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "mask"), m.data(), 0, m.size() * sizeof(float));
+    if (ggml_backend_sched_graph_compute(g.sched, gf) != GGML_STATUS_SUCCESS) {
+        error_msg_ = "depth: pair compute"; return false;
+    }
+    struct ggml_tensor * lt = ggml_graph_get_tensor(gf, "logits");
+    logits2.resize(ggml_nelements(lt));
+    ggml_backend_tensor_get(lt, logits2.data(), 0, ggml_nbytes(lt));
+    return true;
+}
+
+bool DepthDecoder::run_frame_cfg(DepthDecoder & neg, const float * h_cond, const float * h_uncond,
+                                 int32_t * codes, float cfg_scale, bool batched,
+                                 float temperature, int top_k, float top_p, uint32_t & rng) {
+    const int NC = cfg_.n_codebooks;
+    const int V  = cfg_.vocab;
+    const int CB = w_->cfg().cc.codebook_size;
+
+    std::vector<float> lc, lu, l2, mixed(V);
+    auto run = [&](int n, int n_past, int head_idx, const int32_t * in) -> bool {
+        if (batched) {
+            std::vector<float> h2;
+            if (n_past == 0) {
+                const int E = cfg_.audio_embd_size;
+                h2.resize((size_t) 2 * E);
+                std::memcpy(h2.data(),     h_cond,   (size_t) E * sizeof(float));
+                std::memcpy(h2.data() + E, h_uncond, (size_t) E * sizeof(float));
+            }
+            if (!step_pair(neg, n, n_past, head_idx, n_past == 0 ? h2.data() : nullptr, in, l2))
+                return false;
+            lc.assign(l2.begin(), l2.begin() + V);
+            lu.assign(l2.begin() + V, l2.begin() + 2 * V);
+            return true;
+        }
+        if (!step(n, n_past, head_idx, n_past == 0 ? h_cond : nullptr, in, lc)) return false;
+        if (!neg.step(n, n_past, head_idx, n_past == 0 ? h_uncond : nullptr, in, lu)) {
+            error_msg_ = neg.error_msg_; return false;
+        }
+        return true;
+    };
+
+    int32_t prefill[2] = { 0, codes[0] };
+    if (!run(2, 0, 0, prefill)) return false;
+    for (int cb = 1; cb < NC; ++cb) {
+        if ((int) lc.size() < V || (int) lu.size() < V) { error_msg_ = "depth: short logits"; return false; }
+        for (int i = 0; i < V; ++i) mixed[i] = lu[i] + cfg_scale * (lc[i] - lu[i]);
+        for (int i = CB; i < V; ++i) mixed[i] = -INFINITY;
+        codes[cb] = sample_from(mixed, V, temperature, top_k, top_p, rng);
+        if (cb == NC - 1) break;
+        int32_t tok = codes[cb] + cb * V;
+        if (!run(1, cb + 1, cb, &tok)) return false;
     }
     return true;
 }

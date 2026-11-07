@@ -38,6 +38,9 @@ struct ggml_tensor * BreezeWeights::getf(const char * fmt, ...) const {
 struct ggml_tensor * BreezeWeights::fuse_rows(struct ggml_tensor * a, struct ggml_tensor * b,
                                               const char * name) {
     if (!ctx_ || !a || !b) return nullptr;
+    // A second Backbone/DepthDecoder over the same weights (the CFG negative
+    // branch) asks for the same fused views; ctx_ only has headroom for one set.
+    if (auto it = tensors_.find(name); it != tensors_.end()) return it->second;
     const bool ok = a->type == b->type &&
                     a->ne[0] == b->ne[0] &&
                     a->ne[2] == 1 && a->ne[3] == 1 && b->ne[2] == 1 && b->ne[3] == 1 &&

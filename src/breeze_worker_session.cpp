@@ -57,6 +57,7 @@ static json gp_to_json(const gen_params & gp) {
         {"depth_top_p", gp.depth_top_p},
         {"max_new_frames", gp.max_new_frames}, {"seed", gp.seed},
         {"speaker", gp.speaker}, {"instruction", gp.instruction},
+        {"cfg_scale", gp.cfg_scale},
     };
 }
 static gen_params gp_from_json(const json & j) {
@@ -72,6 +73,7 @@ static gen_params gp_from_json(const json & j) {
     gp.seed               = j.value("seed", 0u);
     gp.speaker            = j.value("speaker", std::string{"S0"});
     gp.instruction        = j.value("instruction", std::string{});
+    gp.cfg_scale          = j.value("cfg_scale", 1.0f);
     return gp;
 }
 static json meta_to_json(const gen_result & r, bool cancelled) {

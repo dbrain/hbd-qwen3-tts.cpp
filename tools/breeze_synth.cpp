@@ -108,6 +108,7 @@ int main(int argc, char ** argv) {
     gp.depth_top_k = gp.top_k;
     gp.depth_top_p = gp.top_p;
     gp.repetition_penalty = (float) atof(argval(argc, argv, "--rep-penalty", "1.1"));
+    gp.cfg_scale   = (float) atof(argval(argc, argv, "--cfg-scale", "1.0"));
     gp.seed        = (uint32_t) atoi(argval(argc, argv, "--seed", "42"));
     gp.max_new_frames = atoi(argval(argc, argv, "--max-frames", "750"));
     if (hasarg(argc, argv, "--no-instruction")) gp.instruction.clear();
