@@ -16,6 +16,24 @@
 
 namespace breeze {
 
+// Long-form reference. Anchored (default): every chunk is cloned from the
+// caller's saved voice, as the reference implementation's batch API does for
+// a list of texts. Rolling (BREEZE_LONG_REF=roll): each chunk is cloned from
+// the previous chunk's own output. Measured over 36 seeds of a 316-word
+// passage: rolling copies whatever level the model landed on forward, so takes
+// spread 2.4x wider (sd 0.95 vs 0.42 dB), fade 1.3 dB by the end (anchored
+// 0.1), and the first chunk after the short opening chunk -- cloned from that
+// one short take -- dipped up to 8.4 dB (anchored 5.2). Without a saved voice
+// there is nothing to anchor to, and rolling is used either way.
+bool anchor_long_ref() {
+    static const bool v = [] {
+        const char * e = getenv("BREEZE_LONG_REF");
+        return !(e && std::string(e) == "roll");
+    }();
+    return v;
+}
+
+
 namespace {
 using clk = std::chrono::steady_clock;
 inline double ms_since(clk::time_point t) {
@@ -88,6 +106,7 @@ struct BreezeScheduler::Lane {
     std::vector<int32_t> frame;
     uint32_t rng = 0;
     int step = 0, emitted = 0, next_block = 0, max_block = 0;
+    int min_frames = 0;   // EOS floor for this chunk (see start_chunk)
     bool first_block = true;
     clk::time_point t_start, t_dec;
     // Text prefetch; null when the encoder runs on the device (no prefetch).
@@ -364,6 +383,32 @@ bool BreezeScheduler::start_chunk(Lane & L, bool sync_text) {
     L.rng = gp.seed ? gp.seed : 0x9E3779B9u;
     L.c0_hist.clear();
     L.step = 0;
+    // EOS floor. Breeze occasionally ends a chunk early -- the last two
+    // sentences of a 64-word chunk never spoken, the request still ok, and the
+    // aligner squeezing the missing words into the last 40 ms so the
+    // read-along highlight races to the end (1 in 72 long-form takes; with the
+    // floor, 1 in 24 tried to end at 13 s of ~21 s and was held, transcript
+    // complete). It is the model's: single generations do it too. The voice's
+    // own reference gives its pace (frames per word); a chunk of 12+ words may
+    // not end before 70% of that pace's length. Takes of the same text vary
+    // about +/-7% in length, so a genuine ending never comes near the floor.
+    {
+        auto words_in = [](const std::string & t) {
+            int n = 0; bool in = false;
+            for (char ch : t) { const bool sp = ch == ' ' || ch == '\n' || ch == '\t' || ch == '\r';
+                                if (!sp && !in) { ++n; in = true; } else if (sp) in = false; }
+            return n;
+        };
+        const int nw = words_in(L.chunks[L.ci]);
+        const auto & rv = L.req.ref;
+        const int rw = rv.T > 0 ? words_in(rv.ref_text) : 0;
+        const double fpw = (rv.T > 0 && rw >= 10) ? (double) rv.T / rw : 4.0;
+        static const double frac = [] {
+            const char * e = getenv("BREEZE_EOS_FLOOR");
+            return e ? atof(e) : 0.7;
+        }();
+        L.min_frames = (nw >= 12 && frac > 0) ? (int) (frac * nw * fpw) : 0;
+    }
     L.emitted = 0;
     L.next_block = L.streaming ? L.req.stream_chunk_frames : 0;
     L.max_block  = L.streaming ? std::max(L.req.stream_chunk_frames, 48) : 0;
@@ -383,7 +428,10 @@ bool BreezeScheduler::start_chunk(Lane & L, bool sync_text) {
     if (L.pf) {
         std::set<std::string> keep;
         if (L.ci + 1 < L.chunks.size()) {
-            const auto nx = segs_for(L, L.ci + 1, L.chunks[L.ci], true);
+            // Anchored, the next chunk's reference is the voice again.
+            const bool anchored = anchor_long_ref() && L.req.ref.T > 0;
+            const auto nx = segs_for(L, L.ci + 1,
+                                     anchored ? L.req.ref.ref_text : L.chunks[L.ci], true);
             keep.insert(nx.begin(), nx.end());
             want_text(L, nx);
         }
@@ -417,7 +465,13 @@ bool BreezeScheduler::pre_step(Lane & L) {
         }
     }
     for (int i = CB; i < V; ++i) logits[i] = -INFINITY;
-    const int c0 = sample_logits(logits, LM, gp.temperature, gp.top_k, gp.top_p, L.rng);
+    int c0 = sample_logits(logits, LM, gp.temperature, gp.top_k, gp.top_p, L.rng);
+    if (c0 == EOS && L.step < L.min_frames) {
+        fprintf(stderr, "breeze-sched: lane %d chunk %zu: EOS at frame %d held (floor %d)\n",
+                L.slot, L.ci, L.step, L.min_frames);
+        logits[EOS] = -INFINITY;
+        c0 = sample_logits(logits, LM, gp.temperature, gp.top_k, gp.top_p, L.rng);
+    }
     if (c0 == EOS) { finish_chunk(L, true); return false; }
     L.c0_hist.push_back(c0);
     L.frame.assign(NC, 0);
@@ -506,7 +560,7 @@ void BreezeScheduler::finish_chunk(Lane & L, bool hit_eos) {
         const bool used_voice_only = L.hist.T > 0 && L.hist_text.empty();
         const ref_voice * ref = L.req.ref.T > 0 ? &L.req.ref : nullptr;
         const int keep = std::min(r.T, L.req.ref_max_frames);
-        if (keep == r.T) {
+        if (keep == r.T && !(anchor_long_ref() && ref)) {
             L.hist.codes.assign(r.codes.end() - (size_t) keep * NC, r.codes.end());
             L.hist.T = keep;
             L.hist_text = L.chunks[L.ci];

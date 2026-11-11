@@ -47,6 +47,11 @@
 
 namespace breeze {
 
+// Long-form chunks clone from the saved voice (default) or roll on the
+// previous chunk's output (BREEZE_LONG_REF=roll). See breeze_sched.cpp.
+bool anchor_long_ref();
+
+
 // Dumps and resets the per-stage BREEZE_PROF accumulators (no-op when unset).
 void prof_dump_all();
 
