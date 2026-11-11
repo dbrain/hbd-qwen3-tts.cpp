@@ -407,7 +407,7 @@ struct ggml_cgraph * Backbone::build_pair_graph(struct ggml_context * c, Backbon
     const int n = 2;   // column 0 = this sequence, column 1 = `other`
     Backbone * seq[2] = { this, &other };
 
-    // Both columns embed the same frame; the indices are uploaded twice.
+    // Column s embeds sequence s's frame (CFG uploads the same one twice).
     struct ggml_tensor * x = nullptr;
     for (int cb = 0; cb < cfg_.n_codebooks; ++cb) {
         char nm[32]; snprintf(nm, sizeof(nm), "codes_%d", cb);
@@ -435,9 +435,28 @@ struct ggml_cgraph * Backbone::build_pair_graph(struct ggml_context * c, Backbon
         const layer & L = layers_[il];
         struct ggml_tensor * res = x;
         struct ggml_tensor * h = ggml_mul(c, ggml_rms_norm(c, x, cfg_.rms_eps), L.attn_norm);
-        struct ggml_tensor * q = ggml_reshape_3d(c, ggml_mul_mat(c, L.wq, h), hd, nh,  n);
-        struct ggml_tensor * k = ggml_reshape_3d(c, ggml_mul_mat(c, L.wk, h), hd, nkv, n);
-        struct ggml_tensor * v = ggml_reshape_3d(c, ggml_mul_mat(c, L.wv, h), hd, nkv, n);
+        // Fused QKV / gate-up as in the single-sequence graph: one matmul (and
+        // one activation quantisation) instead of three / two. With two
+        // columns the slices are strided views; rms_norm, rope and the GLU all
+        // take row-contiguous views, so nothing needs a copy.
+        struct ggml_tensor * q, * k;
+        struct ggml_tensor * v_rows[2];   // per sequence: [hd*nkv, 1], contiguous
+        if (L.wqkv) {
+            struct ggml_tensor * qkv = ggml_mul_mat(c, L.wqkv, h);
+            const size_t es = ggml_type_size(qkv->type);
+            const int64_t nq = hd * nh, nk = hd * nkv;
+            q = ggml_view_3d(c, qkv, hd, nh,  n, hd * es, qkv->nb[1], 0);
+            k = ggml_view_3d(c, qkv, hd, nkv, n, hd * es, qkv->nb[1], (size_t) nq * es);
+            for (int s = 0; s < 2; ++s)
+                v_rows[s] = ggml_view_2d(c, qkv, nk, 1, qkv->nb[1],
+                                         (size_t) (nq + nk) * es + (size_t) s * qkv->nb[1]);
+        } else {
+            q = ggml_reshape_3d(c, ggml_mul_mat(c, L.wq, h), hd, nh,  n);
+            k = ggml_reshape_3d(c, ggml_mul_mat(c, L.wk, h), hd, nkv, n);
+            struct ggml_tensor * v = ggml_reshape_3d(c, ggml_mul_mat(c, L.wv, h), hd, nkv, n);
+            for (int s = 0; s < 2; ++s)
+                v_rows[s] = ggml_view_2d(c, v, hd * nkv, 1, v->nb[2], (size_t) s * v->nb[2]);
+        }
         q = ggml_mul(c, ggml_rms_norm(c, q, cfg_.rms_eps), L.q_norm);
         k = ggml_mul(c, ggml_rms_norm(c, k, cfg_.rms_eps), L.k_norm);
         q = ggml_rope_ext(c, q, pos, nullptr, hd, GGML_ROPE_TYPE_NEOX, 0,
@@ -453,8 +472,7 @@ struct ggml_cgraph * Backbone::build_pair_graph(struct ggml_context * c, Backbon
                 ggml_view_2d(c, ks, hd * nkv, alloc, ks->nb[2], 0),
                 ggml_view_2d(c, k,  hd * nkv, 1, k->nb[2], (size_t) s * k->nb[2]), kvi[s]));
             ggml_build_forward_expand(gf, ggml_set_rows(c,
-                ggml_view_2d(c, vs, hd * nkv, alloc, vs->nb[2], 0),
-                ggml_view_2d(c, v,  hd * nkv, 1, v->nb[2], (size_t) s * v->nb[2]), kvi[s]));
+                ggml_view_2d(c, vs, hd * nkv, alloc, vs->nb[2], 0), v_rows[s], kvi[s]));
             struct ggml_tensor * kview = ggml_view_3d(c, ks, hd, nkv, n_kv_eff[s], ks->nb[1], ks->nb[2], 0);
             struct ggml_tensor * vview = ggml_view_3d(c, vs, hd, nkv, n_kv_eff[s], vs->nb[1], vs->nb[2], 0);
             struct ggml_tensor * qs = ggml_view_3d(c, q, hd, nh, 1, q->nb[1], q->nb[2], (size_t) s * q->nb[2]);
@@ -470,9 +488,15 @@ struct ggml_cgraph * Backbone::build_pair_graph(struct ggml_context * c, Backbon
         x = ggml_add(c, res, attn);
         res = x;
         h = ggml_mul(c, ggml_rms_norm(c, x, cfg_.rms_eps), L.ffn_norm);
-        struct ggml_tensor * g = ggml_silu(c, ggml_mul_mat(c, L.ffn_gate, h));
-        struct ggml_tensor * u = ggml_mul_mat(c, L.ffn_up, h);
-        h = ggml_mul_mat(c, L.ffn_down, ggml_mul(c, g, u));
+        if (L.ffn_gate_up) {
+            struct ggml_tensor * gu = ggml_mul_mat(c, L.ffn_gate_up, h);
+            const int64_t F = L.ffn_gate->ne[1];
+            h = ggml_swiglu_split(c, ggml_view_2d(c, gu, F, n, gu->nb[1], 0),
+                                     ggml_view_2d(c, gu, F, n, gu->nb[1], (size_t) F * gu->nb[0]));
+        } else {
+            h = ggml_swiglu_split(c, ggml_mul_mat(c, L.ffn_gate, h), ggml_mul_mat(c, L.ffn_up, h));
+        }
+        h = ggml_mul_mat(c, L.ffn_down, h);
         x = ggml_add(c, res, h);
     }
 
@@ -488,6 +512,7 @@ struct ggml_cgraph * Backbone::build_pair_graph(struct ggml_context * c, Backbon
 }
 
 bool Backbone::decode_frame_pair(Backbone & other, const int32_t * codes,
+                                 const int32_t * codes_other,
                                  std::vector<float> & h_self, std::vector<float> & l_self,
                                  std::vector<float> & h_other, std::vector<float> & l_other) {
     if (!ensure_kv(n_past_ + 1)) return false;
@@ -522,8 +547,8 @@ bool Backbone::decode_frame_pair(Backbone & other, const int32_t * codes,
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "kvi_1"), &posv[1], 0, sizeof(int32_t));
     for (int cb = 0; cb < cfg_.n_codebooks; ++cb) {
         char nm[32]; snprintf(nm, sizeof(nm), "codes_%d", cb);
-        const int32_t id = codes[cb] + cb * cfg_.audio_vocab;
-        const int32_t col[2] = { id, id };
+        const int32_t col[2] = { codes[cb] + cb * cfg_.audio_vocab,
+                                 codes_other[cb] + cb * cfg_.audio_vocab };
         ggml_backend_tensor_set(ggml_graph_get_tensor(gf, nm), col, 0, sizeof(col));
     }
     const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);

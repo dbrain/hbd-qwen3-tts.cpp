@@ -311,6 +311,7 @@ target_link_libraries(higgs_synth PRIVATE
 add_library(breeze_core STATIC
     src/breeze_model.cpp
     src/breeze_tts.cpp
+    src/breeze_sched.cpp
     src/breeze_tokenizer.cpp
     src/breeze_weights.cpp
     src/breeze_text_enc.cpp

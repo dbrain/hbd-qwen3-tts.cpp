@@ -85,6 +85,14 @@ struct gen_result {
     bool truncated = false;
 };
 
+// Per-call cancel handle. The isolated worker runs several requests at once,
+// so "cancel the synth now running" has to name which one; the in-process
+// engine runs one at a time and ignores the handle.
+struct CallHandle {
+    std::atomic<uint32_t> req_id{0};
+    std::atomic<bool>     cancel{false};
+};
+
 class BreezeTTS {
 public:
     bool load(const std::string & gguf_path, int n_ctx = 2048);
@@ -182,16 +190,25 @@ public:
     void log_vram(const char * label) const;
 
 private:
+    friend class BreezeScheduler;
     // Builds the token ids and the matching prompt embedding block.
+    // text_seg: if set, supplies each text segment's (ids, projected embeds)
+    // instead of tokenising + encoding here -- the scheduler encodes them ahead
+    // of time on another thread.
+    using text_seg_fn = std::function<bool(const std::string & seg, std::vector<int32_t> & ids,
+                                           std::vector<float> & emb, double & ms)>;
     bool build_prompt(const std::string & text, const gen_params & gp,
                       const ref_voice * ref,
                       std::vector<int32_t> & ids, std::vector<float> & embeds,
-                      double & text_enc_ms);
+                      double & text_enc_ms, const text_seg_fn * text_seg = nullptr);
     bool run_ar(const gen_params & gp, int chunk_frames, const pcm_cb * on_chunk,
                 gen_result & out);
     // Lazily builds the negative branch (second backbone KV + depth KV); the
     // single-pass path never pays for it.
     bool ensure_cfg();
+    // The second depth decoder only (its KV is the pair partner both for CFG's
+    // negative branch and for a second concurrent request).
+    bool ensure_dd_pair();
     std::string speaker_tag(const std::string & spk) const;
 
     // Carried between prefill and the AR loop so run_ar() has one entry shape.
@@ -207,6 +224,7 @@ private:
     Backbone      bb_neg_;
     DepthDecoder  dd_neg_;
     bool          cfg_ready_ = false;
+    bool          dd_pair_ready_ = false;
     int           n_ctx_ = 2048;
     qwen3_tts::AudioTokenizerDecoder cc_;
     qwen3_tts::AudioCodecEncoder      ce_;

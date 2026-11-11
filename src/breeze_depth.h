@@ -42,6 +42,18 @@ public:
                        int32_t * codes, float cfg_scale, bool batched,
                        float temperature, int top_k, float top_p, uint32_t & rng_state);
 
+    // Two independent requests through one batch-2 graph per step: this
+    // decoder's KV holds request A, `other`'s holds B. Each samples its own
+    // codes with its own parameters and RNG, in the same order run_frame
+    // would, so A's RNG stream is unchanged by B's presence. The KV holds no
+    // state between frames (every frame starts with a 2-token prefill), so
+    // `other` can be any spare decoder -- the CFG negative branch is reused.
+    struct sample_params { float temperature; int top_k; float top_p; };
+    bool run_frame_pair(DepthDecoder & other, const float * h_a, const float * h_b,
+                        int32_t * codes_a, int32_t * codes_b,
+                        const sample_params & sp_a, const sample_params & sp_b,
+                        uint32_t & rng_a, uint32_t & rng_b);
+
     size_t kv_bytes() const { return kv_buf_ ? ggml_backend_buffer_get_size(kv_buf_) : 0; }
     size_t sched_bytes() const;
     void   log_sched_detail() const;
@@ -108,10 +120,14 @@ private:
     std::vector<graph_slot> step_;
     bool init_slot(graph_slot & g, int n, int n_past, int head_idx);
 
-    // Batch-2 CFG graphs (prefill + one per head), bound to one `neg` decoder's KV.
+    // Batch-2 graphs (prefill + one per head) and their own [.., slots, 2] KV
+    // slab; used for CFG and for two concurrent requests alike.
     graph_slot pair_pre_;
     std::vector<graph_slot> pair_step_;
-    const DepthDecoder * pair_other_ = nullptr;
+    struct ggml_context * pair_kv_ctx_ = nullptr;
+    ggml_backend_buffer_t pair_kv_buf_ = nullptr;
+    std::vector<struct ggml_tensor *> pk_, pv_;
+    bool ensure_pair_kv();
     void drop_pair_slots();
     struct ggml_cgraph * build_pair_graph(struct ggml_context * c, int n_per, int n_past,
                                           int head_idx, const DepthDecoder & other);

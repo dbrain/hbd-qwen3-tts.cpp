@@ -1716,6 +1716,24 @@ void AudioTokenizerDecoder::stream_reset(int32_t max_n_past_hint) {
     }
 }
 
+void AudioTokenizerDecoder::swap_stream(stream_slot & s) {
+    std::swap(streaming_mode_, s.streaming_mode);
+    std::swap(n_past_, s.n_past);
+    std::swap(stream_max_n_past_hint_, s.max_n_past_hint);
+    tail_rings_.swap(s.tail_rings);
+    conv_t_overlap_hosts_.swap(s.conv_t_overlap_hosts);
+    stream_tails_.swap(s.tails);
+    stream_conv_ts_.swap(s.conv_ts);
+    tail_names_.swap(s.tail_names);
+    std::swap(state_.stream_kv, s.kv);
+}
+
+void AudioTokenizerDecoder::free_stream_slot(stream_slot & s) {
+    swap_stream(s);
+    free_stream_kv_cache();
+    swap_stream(s);
+}
+
 void AudioTokenizerDecoder::capture_stream_state(stream_state_snapshot & out) const {
     out.n_past = n_past_;
     out.tail_rings = tail_rings_;

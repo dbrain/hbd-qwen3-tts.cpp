@@ -45,8 +45,16 @@ int sample_logits(std::vector<float> & lg, int V, float temp, int top_k, float t
     double sum = 0;
     for (auto & e : p) { e.first = std::exp(e.first - mx); sum += e.first; }
     for (auto & e : p) e.first = (float) (e.first / sum);
-    std::sort(p.begin(), p.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
     int keep = (top_k > 0 && top_k < V) ? top_k : V;
+    // Only the top `keep` are ever read: partition them out (O(V)) and sort
+    // just those, instead of sorting all ~2051 per codebook (16x a frame).
+    auto desc = [](const auto & a, const auto & b) { return a.first > b.first; };
+    if (keep < V) {
+        std::nth_element(p.begin(), p.begin() + keep - 1, p.end(), desc);
+        std::sort(p.begin(), p.begin() + keep, desc);
+    } else {
+        std::sort(p.begin(), p.end(), desc);
+    }
     if (top_p > 0.0f && top_p < 1.0f) {
         double c = 0; int i = 0;
         for (; i < keep; ++i) { c += p[i].first; if (c > top_p) { ++i; break; } }
@@ -68,6 +76,7 @@ bool BreezeTTS::load(const std::string & path, int n_ctx) {
     if (!bb_.init(&w_, n_ctx)) { error_msg_ = bb_.get_error(); return false; }
     n_ctx_ = n_ctx;
     cfg_ready_ = false;
+    dd_pair_ready_ = false;
     if (!dd_.init(&w_))        { error_msg_ = dd_.get_error(); return false; }
     // Same GGUF, opened again by the vocoder/encoder: they own their own ggml
     // context and backend (the decoder runs on a dedicated low-priority stream),
@@ -78,10 +87,17 @@ bool BreezeTTS::load(const std::string & path, int n_ctx) {
     return true;
 }
 
+bool BreezeTTS::ensure_dd_pair() {
+    if (dd_pair_ready_) return true;
+    if (!dd_neg_.init(&w_)) { error_msg_ = "depth pair: " + dd_neg_.get_error(); return false; }
+    dd_pair_ready_ = true;
+    return true;
+}
+
 bool BreezeTTS::ensure_cfg() {
     if (cfg_ready_) return true;
     if (!bb_neg_.init(&w_, n_ctx_, &bb_)) { error_msg_ = "cfg: " + bb_neg_.get_error(); return false; }
-    if (!dd_neg_.init(&w_))               { error_msg_ = "cfg: " + dd_neg_.get_error(); return false; }
+    if (!ensure_dd_pair()) return false;
     cfg_ready_ = true;
     return true;
 }
@@ -89,6 +105,7 @@ bool BreezeTTS::ensure_cfg() {
 void BreezeTTS::unload() {
     loaded_ = false;
     cfg_ready_ = false;
+    dd_pair_ready_ = false;
     cc_.unload_model();
     ce_.unload_model();
     w_.unload();
@@ -103,7 +120,7 @@ std::string BreezeTTS::speaker_tag(const std::string & spk) const {
 bool BreezeTTS::build_prompt(const std::string & text, const gen_params & gp,
                              const ref_voice * ref,
                              std::vector<int32_t> & ids, std::vector<float> & embeds,
-                             double & text_enc_ms) {
+                             double & text_enc_ms, const text_seg_fn * text_seg) {
     const auto & sp = w_.cfg().sp;
     const int n_embd = w_.cfg().bb.n_embd;
     const int NC = w_.cfg().bb.n_codebooks;
@@ -126,11 +143,18 @@ bool BreezeTTS::build_prompt(const std::string & text, const gen_params & gp,
 
     for (const auto & s : segs) {
         if (s.is_text) {
-            const std::vector<int32_t> tids = w_.tok().encode(s.text, /*add_special=*/true);
+            std::vector<int32_t> tids;
             std::vector<float> e;
-            auto t0 = clk::now();
-            if (!te_.encode(tids, e)) { error_msg_ = te_.get_error(); return false; }
-            text_enc_ms += ms_since(t0);
+            if (text_seg) {
+                double ms = 0;
+                if (!(*text_seg)(s.text, tids, e, ms)) { error_msg_ = "text segment not encoded"; return false; }
+                text_enc_ms += ms;
+            } else {
+                tids = w_.tok().encode(s.text, /*add_special=*/true);
+                auto t0 = clk::now();
+                if (!te_.encode(tids, e)) { error_msg_ = te_.get_error(); return false; }
+                text_enc_ms += ms_since(t0);
+            }
             if ((int) e.size() != (int) tids.size() * n_embd) {
                 error_msg_ = "prompt: text-encoder output size mismatch";
                 return false;

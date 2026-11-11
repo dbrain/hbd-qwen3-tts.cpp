@@ -46,6 +46,7 @@ public:
     const Tokenizer & tok() const { return tok_; }
     ggml_backend_t backend() const { return backend_; }
     ggml_backend_t backend_cpu() const { return backend_cpu_; }
+    bool te_on_cpu() const { return te_on_cpu_; }
     enum ggml_backend_dev_type dev_type() const { return dev_type_; }
     size_t weights_bytes() const {
         return buffer_ ? ggml_backend_buffer_get_size(buffer_) : 0;

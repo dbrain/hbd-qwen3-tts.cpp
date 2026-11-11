@@ -28,6 +28,7 @@
 //   POST   /v1/admin/load | /v1/admin/unload
 
 #include "audio/ffmpeg_encode.h"
+#include "audio/leveler.h"
 #include "audio/time_stretch.h"
 #include "breeze_tts.h"
 #include "breeze_voices.h"
@@ -50,6 +51,7 @@
 #include <condition_variable>
 #include <deque>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 using json = nlohmann::json;
@@ -241,6 +243,93 @@ struct Activity {
     explicit Activity(ServerCtx & c) : cx(c) { cx.inflight.fetch_add(1); cx.last_activity_ms.store(now_ms()); }
     ~Activity() { cx.last_activity_ms.store(now_ms()); cx.inflight.fetch_sub(1); }
 };
+
+// What the client hears: engine PCM -> optional leveller -> optional time
+// stretch -> sink. Both stages carry state across chunks, so there is one chain
+// per request; each is null when off so the default path pays nothing extra.
+struct OutChain {
+    std::unique_ptr<qwen3_tts_audio::Leveler>     lev;
+    std::unique_ptr<qwen3_tts_audio::TimeStretch> ts;
+    std::function<void(const float *, size_t)>    sink;
+    std::vector<float> lbuf, sbuf;
+    OutChain(bool level, double target_db, bool stretching, double speed,
+             std::function<void(const float *, size_t)> out) : sink(std::move(out)) {
+        if (level) lev.reset(new qwen3_tts_audio::Leveler(24000, target_db));
+        if (stretching) ts.reset(new qwen3_tts_audio::TimeStretch(speed, 24000));
+    }
+    void stage2(const float * p, size_t n) {
+        if (!n) return;
+        if (!ts) { sink(p, n); return; }
+        sbuf.clear(); ts->push(p, n, sbuf); if (!sbuf.empty()) sink(sbuf.data(), sbuf.size());
+    }
+    void push(const float * p, size_t n) {
+        if (!lev) { stage2(p, n); return; }
+        lbuf.clear(); lev->push(p, n, lbuf); stage2(lbuf.data(), lbuf.size());
+    }
+    // The leveller holds back up to 0.6 s of lookahead and WSOLA its last
+    // window; both are only completed by flushing, in this order.
+    void finish() {
+        if (lev) { lbuf.clear(); lev->flush(lbuf); stage2(lbuf.data(), lbuf.size()); }
+        if (ts)  { sbuf.clear(); ts->flush(sbuf); if (!sbuf.empty()) sink(sbuf.data(), sbuf.size()); }
+    }
+};
+
+// Default for `level` when a request does not say: BREEZE_LEVEL=off disables.
+static bool level_default() {
+    static const bool v = [] {
+        const char * e = std::getenv("BREEZE_LEVEL");
+        return !(e && (!std::strcmp(e, "off") || !std::strcmp(e, "0")));
+    }();
+    return v;
+}
+
+// The isolated worker renders several requests at once (BreezeScheduler) and
+// cancels per call; the in-process engine renders one at a time under cx.mtx.
+template <class ENG> constexpr bool kConcurrent = std::is_same_v<ENG, breeze::WorkerSession>;
+
+template <class ENG>
+struct RenderLock {
+    std::unique_lock<std::mutex> lk;
+    RenderLock(ENG * eng, ServerCtx & cx) : lk(cx.mtx, std::defer_lock) {
+        if constexpr (!kConcurrent<ENG>) { lk.lock(); eng->clear_cancel(); }
+    }
+};
+template <class ENG>
+static bool render_long(ENG * eng, breeze::CallHandle & h, const std::string & input,
+                        const breeze::gen_params & gp, const breeze::ref_voice * ref,
+                        int chunk_words, int ref_frames, int chunk_frames, int gap_ms,
+                        const breeze::BreezeTTS::pcm_cb & cb, breeze::gen_result & r,
+                        const breeze::BreezeTTS::chunk_cb & ccb = nullptr, int first_chunk_words = 0) {
+    if constexpr (kConcurrent<ENG>)
+        return eng->synthesize_long(input, gp, ref, chunk_words, ref_frames, chunk_frames, gap_ms,
+                                    cb, r, ccb, first_chunk_words, &h);
+    else
+        return eng->synthesize_long(input, gp, ref, chunk_words, ref_frames, chunk_frames, gap_ms,
+                                    cb, r, ccb, first_chunk_words);
+}
+template <class ENG>
+static bool render_stream(ENG * eng, breeze::CallHandle & h, const std::string & input,
+                          const breeze::gen_params & gp, const breeze::ref_voice * ref,
+                          int chunk_frames, const breeze::BreezeTTS::pcm_cb & cb,
+                          breeze::gen_result & r) {
+    if constexpr (kConcurrent<ENG>) return eng->synthesize_stream(input, gp, ref, chunk_frames, cb, r, &h);
+    else                            return eng->synthesize_stream(input, gp, ref, chunk_frames, cb, r);
+}
+template <class ENG>
+static bool render_plain(ENG * eng, breeze::CallHandle & h, const std::string & input,
+                         const breeze::gen_params & gp, const breeze::ref_voice * ref,
+                         breeze::gen_result & r) {
+    if constexpr (kConcurrent<ENG>) return eng->synthesize(input, gp, ref, r, &h);
+    else                            return eng->synthesize(input, gp, ref, r);
+}
+template <class ENG> static void cancel_call(ENG * eng, breeze::CallHandle & h) {
+    if constexpr (kConcurrent<ENG>) eng->request_cancel(h);
+    else                            eng->request_cancel();
+}
+template <class ENG> static bool call_cancelled(ENG * eng, const breeze::CallHandle & h) {
+    if constexpr (kConcurrent<ENG>) return breeze::WorkerSession::is_cancel_requested(h);
+    else                            return eng->is_cancel_requested();
+}
 
 template <class ENG>
 static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
@@ -544,6 +633,20 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
         const auto  to_client_ms = [speed](int64_t ms) {
             return (int64_t) std::llround((double) ms / speed);
         };
+        // Level the voice (see audio/leveler.h): "auto" (default) or "off".
+        // Applied only to what the client hears; the aligner and every
+        // timestamp work on the raw timeline, which the leveller preserves.
+        bool level_on = level_default();
+        if (body.contains("level")) {
+            const std::string lv = body["level"].is_string() ? body["level"].get<std::string>()
+                                 : (body["level"].is_boolean() && body["level"].get<bool>() ? "auto" : "off");
+            if (lv != "auto" && lv != "off")
+                return err_json(res, 400, "level must be \"auto\" or \"off\"");
+            level_on = lv == "auto";
+        }
+        const double level_target_db = body.value("level_target_db", -20.0);
+        if (!(level_target_db >= -40.0 && level_target_db <= -6.0))
+            return err_json(res, 400, "level_target_db must be between -40 and -6");
 
         // ---- long-form knobs (higgs-server's spelling, so a client that already
         // drives higgs long-form works unchanged) ----
@@ -620,8 +723,10 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
             res.set_header("Content-Type", "text/event-stream");
             res.set_header("X-Accel-Buffering", "no");
             res.set_chunked_content_provider("text/event-stream",
-                [act, eng, &cx, input, gp, do_align_run, emit_partials, align_device, have_voice, chunk_frames,
+                [act, call = std::make_shared<breeze::CallHandle>(), eng, &cx, input, gp, do_align_run,
+                 emit_partials, align_device, have_voice, chunk_frames,
                  long_form, chunk_words, first_chunk_words, long_ref_frames, gap_ms, speed, stretching, to_client_ms,
+                 level_on, level_target_db,
                  ref = std::move(ref)]
                 (size_t, httplib::DataSink & sink) mutable -> bool {
                     Activity act_stream(cx);
@@ -658,8 +763,7 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                         size_t                   word_base = 0;
                     };
 
-                    bool partial_active = false;   // aligner loaded, lock held
-                    std::unique_lock<std::mutex> aligner_lock;
+                    bool partial_active = false;   // aligner wanted and loaded once
                     std::atomic<int64_t> audio_offset_ms{0};
 
                     std::mutex                align_mtx;
@@ -672,17 +776,19 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                     // joined.
                     std::vector<fa::AlignedWord> aligned_all;
 
+                    // The aligner is one process doing one pass at a time, and
+                    // concurrent requests share it: the lock is taken per PASS
+                    // (a chunk), not per request, so a second request's chunks
+                    // interleave with the first's instead of waiting for its
+                    // whole passage. aligner_inflight spans the request so the
+                    // idle-unload never kills it between passes.
+                    // Loading (or re-checking) the aligner happens on the
+                    // align thread, before each pass: doing it here would hold
+                    // this request's first audio behind another request's pass.
                     if (do_align_run) {
-                        aligner_lock = std::unique_lock<std::mutex>(cx.aligner_mtx);
                         cx.aligner_inflight.fetch_add(1);
                         cx.aligner_last_activity_ms.store(now_ms());
-                        if (!cx.aligner->ensure_loaded(cx.aligner_model, align_device)) {
-                            emit_event("speech.audio.alignment.error",
-                                       {{"type","speech.audio.alignment.error"},
-                                        {"error", std::string("aligner load failed: ") + cx.aligner->last_error()}});
-                            cx.aligner_inflight.fetch_sub(1);
-                            aligner_lock.unlock();
-                        } else {
+                        {
                             partial_active = true;
                             // Off the synth thread: a pass is hundreds of ms of
                             // GPU and the generation must not wait on it.
@@ -701,12 +807,19 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                                     const int64_t chunk_ms = (int64_t) pc.pcm.size() * 1000 / 24000;
                                     std::vector<fa::AlignedWord> got;
                                     fa::AlignProfile prof;
-                                    cx.aligner_last_activity_ms.store(now_ms());
-                                    const bool ok_align =
-                                        cx.aligner->begin_streaming_align(pc.words, 24000) &&
-                                        cx.aligner->finalize_streaming_align(pc.pcm.data(), pc.pcm.size(),
-                                                                            chunk_ms, got, prof);
-                                    cx.aligner_last_activity_ms.store(now_ms());
+                                    bool ok_align;
+                                    {
+                                        std::lock_guard<std::mutex> alk(cx.aligner_mtx);
+                                        cx.aligner_last_activity_ms.store(now_ms());
+                                        // Another request may have changed the
+                                        // aligner's device, or it may have died.
+                                        ok_align =
+                                            cx.aligner->ensure_loaded(cx.aligner_model, align_device) &&
+                                            cx.aligner->begin_streaming_align(pc.words, 24000) &&
+                                            cx.aligner->finalize_streaming_align(pc.pcm.data(), pc.pcm.size(),
+                                                                                chunk_ms, got, prof);
+                                        cx.aligner_last_activity_ms.store(now_ms());
+                                    }
                                     if (!ok_align) {
                                         // One bad chunk ends alignment for the
                                         // request; the audio keeps streaming.
@@ -777,18 +890,10 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                     std::atomic<bool> wd_stop{false};
                     std::thread wd([&]() {
                         while (!wd_stop.load()) {
-                            if (sink.is_writable && !sink.is_writable()) { eng->request_cancel(); break; }
+                            if (sink.is_writable && !sink.is_writable()) { cancel_call(eng, *call); break; }
                             std::this_thread::sleep_for(50ms);
                         }
                     });
-
-                    // One stretcher for the whole request: WSOLA carries overlap
-                    // state across chunks, so a per-chunk instance would splice
-                    // at every boundary. Null when speed == 1 so the default
-                    // path does not even allocate.
-                    std::unique_ptr<qwen3_tts_audio::TimeStretch> ts;
-                    if (stretching) ts.reset(new qwen3_tts_audio::TimeStretch(speed, 24000));
-                    std::vector<float> sbuf;
 
                     auto emit_pcm = [&](const float * pcm, size_t n) {
                         if (!n) return;
@@ -797,6 +902,12 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                                    {{"type","speech.audio.delta"},
                                     {"audio", base64_encode(s16.data(), s16.size())}});
                     };
+
+                    // One chain for the whole request: WSOLA and the leveller
+                    // carry state across chunks, so a per-chunk instance would
+                    // splice at every boundary.
+                    OutChain chain(level_on, level_target_db, stretching, speed,
+                                   [&](const float * p, size_t n) { emit_pcm(p, n); });
 
                     auto emit_audio = [&](const float * pcm, int n) {
                         cx.last_activity_ms.store(now_ms());
@@ -808,17 +919,13 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                         // timeline; conversion to client time happens where the
                         // events are emitted.
                         if (cur_open) cur_pcm.insert(cur_pcm.end(), pcm, pcm + n);
-                        if (!ts) { emit_pcm(pcm, (size_t) n); return; }
-                        sbuf.clear();
-                        ts->push(pcm, (size_t) n, sbuf);
-                        emit_pcm(sbuf.data(), sbuf.size());
+                        chain.push(pcm, (size_t) n);
                     };
 
                     breeze::gen_result r;
                     bool ok;
                     {
-                        std::lock_guard<std::mutex> lk(cx.mtx);
-                        eng->clear_cancel();
+                        RenderLock<ENG> rl(eng, cx);
                         auto emit_sse = [&](const float * pcm, int n, bool) {
                             if (n > 0) emit_audio(pcm, n);
                         };
@@ -854,18 +961,14 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                             anchor_words += (int64_t) cw.size();
                         };
                         ok = long_form
-                           ? eng->synthesize_long(input, gp, have_voice ? &ref : nullptr, chunk_words,
-                                                  long_ref_frames, chunk_frames, gap_ms, emit_sse, r,
-                                                  emit_chunk_start, first_chunk_words)
-                           : eng->synthesize_stream(input, gp, have_voice ? &ref : nullptr,
-                                                    chunk_frames, emit_sse, r);
+                           ? render_long(eng, *call, input, gp, have_voice ? &ref : nullptr, chunk_words,
+                                         long_ref_frames, chunk_frames, gap_ms, emit_sse, r,
+                                         emit_chunk_start, first_chunk_words)
+                           : render_stream(eng, *call, input, gp, have_voice ? &ref : nullptr,
+                                           chunk_frames, emit_sse, r);
                     }
 
-                    if (ts) {   // the last window is only completed by flushing
-                        sbuf.clear();
-                        ts->flush(sbuf);
-                        emit_pcm(sbuf.data(), sbuf.size());
-                    }
+                    chain.finish();
 
                     // A cancelled render stopped mid-document. Every chunk
                     // that WAS aligned is still honest -- each was aligned
@@ -873,7 +976,7 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                     // and a `final` event says it is. The partials already sent
                     // stand instead: prefix-clamped, and as far as the voice
                     // actually got.
-                    const bool cancelled = eng->is_cancel_requested();
+                    const bool cancelled = call_cancelled(eng, *call);
 
                     if (partial_active) {
                         // The last chunk has no successor to close it -- unless
@@ -907,7 +1010,6 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                                         {"words",std::move(wj)}});
                         }
                         cx.aligner_inflight.fetch_sub(1);
-                        if (aligner_lock.owns_lock()) aligner_lock.unlock();
                     }
 
                     // `truncated` means the model never emitted EOS -- the text
@@ -955,8 +1057,10 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                                        body.value("stream_first_batch_size",
                                          body.value("stream_batch_size", 6)));
             res.set_chunked_content_provider(ctype,
-                [act, eng, &cx, input, gp, have_voice, chunk_frames, long_form, chunk_words,
-                 long_ref_frames, gap_ms, speed, stretching, raw_pcm, ref = std::move(ref)]
+                [act, call = std::make_shared<breeze::CallHandle>(), eng, &cx, input, gp, have_voice,
+                 chunk_frames, long_form, chunk_words,
+                 long_ref_frames, gap_ms, speed, stretching, raw_pcm, level_on, level_target_db,
+                 ref = std::move(ref)]
                 (size_t, httplib::DataSink & sink) mutable {
                     // Streaming WAV cannot know its length up front; 0xFFFFFFFF is
                     // the conventional placeholder here (unlike the buffered path,
@@ -980,37 +1084,30 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
                     std::atomic<bool> wd_stop{false};
                     std::thread wd([&] {
                         while (!wd_stop.load()) {
-                            if (sink.is_writable && !sink.is_writable()) { eng->request_cancel(); break; }
+                            if (sink.is_writable && !sink.is_writable()) { cancel_call(eng, *call); break; }
                             std::this_thread::sleep_for(50ms);
                         }
                     });
                     breeze::gen_result r;
                     bool ok;
-                    std::unique_ptr<qwen3_tts_audio::TimeStretch> ts;
-                    if (stretching) ts.reset(new qwen3_tts_audio::TimeStretch(speed, 24000));
-                    std::vector<float> sbuf;
                     auto write_pcm = [&](const float * pcm, size_t n) {
                         if (!n) return;
                         const std::string b = pcm_f32_to_s16le(pcm, n);
                         sink.write(b.data(), b.size());
                     };
+                    OutChain chain(level_on, level_target_db, stretching, speed, write_pcm);
                     {
-                        std::lock_guard<std::mutex> lk(cx.mtx);
-                        eng->clear_cancel();
+                        RenderLock<ENG> rl(eng, cx);
                         auto emit_raw = [&](const float * pcm, int n, bool) {
-                            if (n <= 0) return;
-                            if (!ts) { write_pcm(pcm, (size_t) n); return; }
-                            sbuf.clear();
-                            ts->push(pcm, (size_t) n, sbuf);
-                            write_pcm(sbuf.data(), sbuf.size());
+                            if (n > 0) chain.push(pcm, (size_t) n);
                         };
                         ok = long_form
-                           ? eng->synthesize_long(input, gp, have_voice ? &ref : nullptr, chunk_words,
-                                                  long_ref_frames, chunk_frames, gap_ms, emit_raw, r)
-                           : eng->synthesize_stream(input, gp, have_voice ? &ref : nullptr,
-                                                    chunk_frames, emit_raw, r);
+                           ? render_long(eng, *call, input, gp, have_voice ? &ref : nullptr, chunk_words,
+                                         long_ref_frames, chunk_frames, gap_ms, emit_raw, r)
+                           : render_stream(eng, *call, input, gp, have_voice ? &ref : nullptr,
+                                           chunk_frames, emit_raw, r);
                     }
-                    if (ts) { sbuf.clear(); ts->flush(sbuf); write_pcm(sbuf.data(), sbuf.size()); }
+                    chain.finish();
                     wd_stop.store(true);
                     if (wd.joinable()) wd.join();
                     // Truncation is only known once generation ends, which on a
@@ -1032,26 +1129,27 @@ static void install_routes(httplib::Server & srv, ENG * eng, ServerCtx & cx) {
         breeze::gen_result r;
         bool ok;
         {
-            std::lock_guard<std::mutex> lk(cx.mtx);
-            eng->clear_cancel();
+            breeze::CallHandle call;
+            RenderLock<ENG> rl(eng, cx);
             ok = long_form
-               ? eng->synthesize_long(input, gp, have_voice ? &ref : nullptr, chunk_words,
-                                     long_ref_frames, 0, gap_ms, nullptr, r)
-               : eng->synthesize(input, gp, have_voice ? &ref : nullptr, r);
+               ? render_long(eng, call, input, gp, have_voice ? &ref : nullptr, chunk_words,
+                             long_ref_frames, 0, gap_ms, nullptr, r)
+               : render_plain(eng, call, input, gp, have_voice ? &ref : nullptr, r);
         }
         if (!ok) return err_json(res, 500, eng->get_error());
         // A worker abort surfaces as an empty result, and an HTTP 200 with a
         // 44-byte WAV passes a status-code smoke test. Fail loudly instead.
         if (r.pcm.empty()) return err_json(res, 500, "engine produced no audio");
 
-        // Stretch before anything measures or encodes it, so the headers and the
-        // encoded body describe the same audio.
-        if (stretching) {
-            qwen3_tts_audio::TimeStretch st(speed, 24000);
+        // Level and stretch before anything measures or encodes it, so the
+        // headers and the encoded body describe the same audio.
+        if (level_on || stretching) {
             std::vector<float> out;
             out.reserve((size_t) ((double) r.pcm.size() / speed) + 4096);
-            st.push(r.pcm.data(), r.pcm.size(), out);
-            st.flush(out);
+            OutChain chain(level_on, level_target_db, stretching, speed,
+                           [&](const float * p, size_t n) { out.insert(out.end(), p, p + n); });
+            chain.push(r.pcm.data(), r.pcm.size());
+            chain.finish();
             r.pcm.swap(out);
         }
 

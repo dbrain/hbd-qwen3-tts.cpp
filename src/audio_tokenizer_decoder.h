@@ -406,6 +406,26 @@ private:
     int32_t n_past_ = 0;  // current KV / tail history length
     int32_t stream_max_n_past_hint_ = 0;  // synth-budget hint (0 = env cap)
 
+public:
+    // Everything a streaming decode carries between calls, as one movable
+    // unit. Two concurrent requests share the weights and the scheduler, and
+    // each swaps its own stream state in around its stream_decode() calls --
+    // O(1) pointer/container swaps, nothing is copied and the KV slab never
+    // leaves the device. A default-constructed slot is a fresh stream.
+    struct stream_slot {
+        bool streaming_mode = false;
+        int32_t n_past = 0, max_n_past_hint = 0;
+        std::map<std::string, std::vector<float>> tail_rings, conv_t_overlap_hosts;
+        std::vector<stream_tail> tails;
+        std::vector<stream_conv_t> conv_ts;
+        std::vector<std::string> tail_names;
+        dec_streaming_kv_cache kv;
+    };
+    void swap_stream(stream_slot & s);
+    // Frees a slot's KV slab (it is not the one swapped in).
+    void free_stream_slot(stream_slot & s);
+private:
+
     // Create a causal-conv tail input tensor, concat it with x along dim 0,
     // register the input in tail_names_, and (in streaming mode) also emit
     // the trailing L frames as a named output so the driver can roll it
