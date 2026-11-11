@@ -26,7 +26,7 @@ void TextEncoder::free_state() {
     layers_.clear();
 }
 
-bool TextEncoder::init(BreezeWeights * w) {
+bool TextEncoder::init(BreezeWeights * w, ggml_backend_t only_backend) {
     free_state();
     w_ = w;
     cfg_ = w->cfg().te;
@@ -67,8 +67,9 @@ bool TextEncoder::init(BreezeWeights * w) {
 
     std::vector<ggml_backend_t> backends = { w->backend() };
     if (w->backend_cpu()) backends.push_back(w->backend_cpu());
+    if (only_backend) backends = { only_backend };
     sched_ = ggml_backend_sched_new(backends.data(), nullptr, (int) backends.size(),
-                                    BZ_TE_MAX_NODES, false, true);
+                                    BZ_TE_MAX_NODES, false, only_backend == nullptr);
     if (!sched_) { error_msg_ = "text encoder: sched_new failed"; return false; }
     compute_meta_.resize(ggml_tensor_overhead() * BZ_TE_MAX_NODES +
                          ggml_graph_overhead_custom(BZ_TE_MAX_NODES, false));

@@ -1486,7 +1486,7 @@ struct ggml_cgraph * AudioTokenizerDecoder::build_graph(int32_t n_frames, int32_
      // every transpose-1d intermediate (wmma kernel keeps its accumulator
      // F32 internally so precision is preserved at gemm endpoints; only the
      // dst write rounds to F16). Cast back to F32 right before the final
-     // snake so final_conv + tanh + audio output stay bit-identical to the
+     // snake so final_conv + clamp + audio output stay bit-identical to the
      // F32 path. Default ON for non-CPU backends; QWEN3_TTS_VOCODER_FP16_CASCADE
      // overrides either way. CPU is opt-out by default because conv_1d_direct,
      // conv_transpose_1d, and snake on the CPU backend lack F16-input kernels
@@ -1546,7 +1546,10 @@ struct ggml_cgraph * AudioTokenizerDecoder::build_graph(int32_t n_frames, int32_
          ggml_set_name(cur, name);
      }
     
-    cur = ggml_tanh(ctx0, cur);
+    // The reference ends with wav.clamp(-1, 1). tanh here soft-clipped every
+    // loud peak (0.9 -> 0.72, 1.0 -> 0.76): audible crunch on emphatic lines,
+    // and a hard ceiling near 0.7 that the reference's output does not have.
+    cur = ggml_clamp(ctx0, cur, -1.0f, 1.0f);
     
     cur = ggml_reshape_1d(ctx0, cur, cur->ne[0]);
     
@@ -1714,6 +1717,24 @@ void AudioTokenizerDecoder::stream_reset(int32_t max_n_past_hint) {
                 state_.stream_kv.max_n_past, stream_max_n_past_hint_);
         free_stream_kv_cache();
     }
+}
+
+void AudioTokenizerDecoder::swap_stream(stream_slot & s) {
+    std::swap(streaming_mode_, s.streaming_mode);
+    std::swap(n_past_, s.n_past);
+    std::swap(stream_max_n_past_hint_, s.max_n_past_hint);
+    tail_rings_.swap(s.tail_rings);
+    conv_t_overlap_hosts_.swap(s.conv_t_overlap_hosts);
+    stream_tails_.swap(s.tails);
+    stream_conv_ts_.swap(s.conv_ts);
+    tail_names_.swap(s.tail_names);
+    std::swap(state_.stream_kv, s.kv);
+}
+
+void AudioTokenizerDecoder::free_stream_slot(stream_slot & s) {
+    swap_stream(s);
+    free_stream_kv_cache();
+    swap_stream(s);
 }
 
 void AudioTokenizerDecoder::capture_stream_state(stream_state_snapshot & out) const {

@@ -45,8 +45,16 @@ int sample_logits(std::vector<float> & lg, int V, float temp, int top_k, float t
     double sum = 0;
     for (auto & e : p) { e.first = std::exp(e.first - mx); sum += e.first; }
     for (auto & e : p) e.first = (float) (e.first / sum);
-    std::sort(p.begin(), p.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
     int keep = (top_k > 0 && top_k < V) ? top_k : V;
+    // Only the top `keep` are ever read: partition them out (O(V)) and sort
+    // just those, instead of sorting all ~2051 per codebook (16x a frame).
+    auto desc = [](const auto & a, const auto & b) { return a.first > b.first; };
+    if (keep < V) {
+        std::nth_element(p.begin(), p.begin() + keep - 1, p.end(), desc);
+        std::sort(p.begin(), p.begin() + keep, desc);
+    } else {
+        std::sort(p.begin(), p.end(), desc);
+    }
     if (top_p > 0.0f && top_p < 1.0f) {
         double c = 0; int i = 0;
         for (; i < keep; ++i) { c += p[i].first; if (c > top_p) { ++i; break; } }
@@ -68,6 +76,7 @@ bool BreezeTTS::load(const std::string & path, int n_ctx) {
     if (!bb_.init(&w_, n_ctx)) { error_msg_ = bb_.get_error(); return false; }
     n_ctx_ = n_ctx;
     cfg_ready_ = false;
+    dd_pair_ready_ = false;
     if (!dd_.init(&w_))        { error_msg_ = dd_.get_error(); return false; }
     // Same GGUF, opened again by the vocoder/encoder: they own their own ggml
     // context and backend (the decoder runs on a dedicated low-priority stream),
@@ -78,10 +87,17 @@ bool BreezeTTS::load(const std::string & path, int n_ctx) {
     return true;
 }
 
+bool BreezeTTS::ensure_dd_pair() {
+    if (dd_pair_ready_) return true;
+    if (!dd_neg_.init(&w_)) { error_msg_ = "depth pair: " + dd_neg_.get_error(); return false; }
+    dd_pair_ready_ = true;
+    return true;
+}
+
 bool BreezeTTS::ensure_cfg() {
     if (cfg_ready_) return true;
     if (!bb_neg_.init(&w_, n_ctx_, &bb_)) { error_msg_ = "cfg: " + bb_neg_.get_error(); return false; }
-    if (!dd_neg_.init(&w_))               { error_msg_ = "cfg: " + dd_neg_.get_error(); return false; }
+    if (!ensure_dd_pair()) return false;
     cfg_ready_ = true;
     return true;
 }
@@ -89,6 +105,7 @@ bool BreezeTTS::ensure_cfg() {
 void BreezeTTS::unload() {
     loaded_ = false;
     cfg_ready_ = false;
+    dd_pair_ready_ = false;
     cc_.unload_model();
     ce_.unload_model();
     w_.unload();
@@ -103,7 +120,7 @@ std::string BreezeTTS::speaker_tag(const std::string & spk) const {
 bool BreezeTTS::build_prompt(const std::string & text, const gen_params & gp,
                              const ref_voice * ref,
                              std::vector<int32_t> & ids, std::vector<float> & embeds,
-                             double & text_enc_ms) {
+                             double & text_enc_ms, const text_seg_fn * text_seg) {
     const auto & sp = w_.cfg().sp;
     const int n_embd = w_.cfg().bb.n_embd;
     const int NC = w_.cfg().bb.n_codebooks;
@@ -126,11 +143,18 @@ bool BreezeTTS::build_prompt(const std::string & text, const gen_params & gp,
 
     for (const auto & s : segs) {
         if (s.is_text) {
-            const std::vector<int32_t> tids = w_.tok().encode(s.text, /*add_special=*/true);
+            std::vector<int32_t> tids;
             std::vector<float> e;
-            auto t0 = clk::now();
-            if (!te_.encode(tids, e)) { error_msg_ = te_.get_error(); return false; }
-            text_enc_ms += ms_since(t0);
+            if (text_seg) {
+                double ms = 0;
+                if (!(*text_seg)(s.text, tids, e, ms)) { error_msg_ = "text segment not encoded"; return false; }
+                text_enc_ms += ms;
+            } else {
+                tids = w_.tok().encode(s.text, /*add_special=*/true);
+                auto t0 = clk::now();
+                if (!te_.encode(tids, e)) { error_msg_ = te_.get_error(); return false; }
+                text_enc_ms += ms_since(t0);
+            }
             if ((int) e.size() != (int) tids.size() * n_embd) {
                 error_msg_ = "prompt: text-encoder output size mismatch";
                 return false;
@@ -411,27 +435,56 @@ std::vector<std::string> BreezeTTS::chunk_text(const std::string & text, int chu
     // Split on sentence enders first so a seam never lands mid-clause; pack
     // sentences up to the word budget. An over-long single sentence ships whole
     // rather than being cut at an arbitrary word.
-    std::vector<std::string> sents;
+    // Each sentence carries whether a seam after it is a good one: never
+    // inside an open quotation -- '"Blah blah. Blah blah blah," Joe said.'
+    // split after the first sentence renders the rest of the line in a fresh
+    // generation that has not heard how the quote began -- and preferably at
+    // a paragraph break. A paragraph break closes any quote (fiction leaves a
+    // quote open across paragraphs of one speaker; that is a fine seam).
+    struct Sent { std::string s; bool in_quote; bool para; };
+    std::vector<Sent> sents;
+    auto push = [&](size_t from, size_t to, bool in_q, bool para) {
+        std::string sn = text.substr(from, to - from);
+        size_t a = sn.find_first_not_of(" \t\r\n");
+        if (a != std::string::npos) sents.push_back({sn.substr(a), in_q, para});
+    };
     size_t start = 0;
+    bool in_q = false;
     for (size_t i = 0; i < text.size(); ++i) {
         const char c = text[i];
+        if (c == '"') in_q = !in_q;
+        else if ((unsigned char) c == 0xE2 && i + 2 < text.size() && (unsigned char) text[i + 1] == 0x80) {
+            if ((unsigned char) text[i + 2] == 0x9C) in_q = true;        // left double quote
+            else if ((unsigned char) text[i + 2] == 0x9D) in_q = false;  // right double quote
+        }
         if (c == '.' || c == '!' || c == '?' || c == '\n') {
             size_t j = i + 1;
-            while (j < text.size() && (text[j] == '"' || text[j] == '\'' || text[j] == ')')) ++j;
-            if (j >= text.size() || text[j] == ' ' || text[j] == '\n') {
-                std::string sn = text.substr(start, j - start);
-                size_t a = sn.find_first_not_of(" \t\r\n");
-                if (a != std::string::npos) sents.push_back(sn.substr(a));
+            while (j < text.size()) {
+                const unsigned char d = (unsigned char) text[j];
+                if (d == '"') { in_q = !in_q; ++j; }
+                else if (d == '\'' || d == ')') ++j;
+                else if (d == 0xE2 && j + 2 < text.size() && (unsigned char) text[j + 1] == 0x80 &&
+                         ((unsigned char) text[j + 2] == 0x9D || (unsigned char) text[j + 2] == 0x99)) {
+                    if ((unsigned char) text[j + 2] == 0x9D) in_q = false;
+                    j += 3;
+                } else break;
+            }
+            // The closing marks just scanned (and their effect on in_q) are
+            // consumed here, not again by the outer loop.
+            const size_t i_next = j - 1;
+            if (j >= text.size() || text[j] == ' ' || text[j] == '\n' || text[j] == '\r') {
+                size_t k = j;
+                while (k < text.size() && (text[k] == ' ' || text[k] == '\r')) ++k;
+                const bool para = c == '\n' || k >= text.size() || text[k] == '\n';
+                if (para) in_q = false;
+                push(start, j, in_q, para);
                 start = j;
             }
+            i = i_next;
         }
     }
-    if (start < text.size()) {
-        std::string sn = text.substr(start);
-        size_t a = sn.find_first_not_of(" \t\r\n");
-        if (a != std::string::npos) sents.push_back(sn.substr(a));
-    }
-    if (sents.empty() && !text.empty()) sents.push_back(text);
+    if (start < text.size()) push(start, text.size(), false, true);
+    if (sents.empty() && !text.empty()) sents.push_back({text, false, true});
 
     auto words_in = [](const std::string & s) {
         int n = 0; bool in = false;
@@ -441,14 +494,33 @@ std::vector<std::string> BreezeTTS::chunk_text(const std::string & text, int chu
     };
     std::vector<std::string> out;
     std::string cur; int cur_w = 0;
-    for (const auto & sn : sents) {
-        const int w = words_in(sn);
-        if (cur_w > 0 && cur_w + w > budget) {
+    bool cur_safe = true;            // a seam after `cur` is outside any quote
+    for (size_t si = 0; si < sents.size(); ++si) {
+        const auto & sn = sents[si];
+        const int w = words_in(sn.s);
+        // Over budget: seam here unless it would split a quote, in which case
+        // run on (up to half a budget more) to the quote's end.
+        if (cur_w > 0 && cur_w + w > budget && (cur_safe || cur_w + w > budget + budget / 2)) {
             out.push_back(cur); cur.clear(); cur_w = 0;
             budget = std::min(budget * 2, chunk_words);
         }
         if (!cur.empty()) cur += " ";
-        cur += sn; cur_w += w;
+        cur += sn.s; cur_w += w;
+        cur_safe = !sn.in_quote;
+        // A paragraph end past half the budget is a better seam than a
+        // sentence end inside the next paragraph, when that paragraph will
+        // not fit whole.
+        int next_para_w = 0;
+        if (sn.para)
+            for (size_t k = si + 1; k < sents.size(); ++k) {
+                next_para_w += words_in(sents[k].s);
+                if (sents[k].para) break;
+            }
+        if (sn.para && cur_safe && si + 1 < sents.size() && cur_w * 2 >= budget &&
+            cur_w + next_para_w > budget) {
+            out.push_back(cur); cur.clear(); cur_w = 0;
+            budget = std::min(budget * 2, chunk_words);
+        }
     }
     if (!cur.empty()) out.push_back(cur);
     return out;
@@ -553,7 +625,7 @@ bool BreezeTTS::synthesize_long(const std::string & text, const gen_params & gp,
         // and there the untranscribed tail is still better than starting over
         // with a freshly sampled speaker.
         const int keep = std::min(r.T, ref_max_frames);
-        if (keep == r.T) {
+        if (keep == r.T && !(anchor_long_ref() && ref && ref->T > 0)) {
             hist.codes.assign(r.codes.end() - (size_t) keep * NC, r.codes.end());
             hist.T = keep;
             hist_text = chunks[ci];

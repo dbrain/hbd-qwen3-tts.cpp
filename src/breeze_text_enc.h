@@ -27,7 +27,11 @@ class TextEncoder {
 public:
     ~TextEncoder() { free_state(); }
 
-    bool init(BreezeWeights * w);
+    // only_backend: run every op on that one backend, never offloading to the
+    // device. A second, CPU-only encoder can then work on another thread while
+    // the device runs the decode loop (needs the weights in host RAM,
+    // BREEZE_TEXT_ENC_CPU=1).
+    bool init(BreezeWeights * w, ggml_backend_t only_backend = nullptr);
 
     // ids -> projected embeddings [n_embd_backbone * n], row-major per token.
     bool encode(const std::vector<int32_t> & ids, std::vector<float> & out_proj);

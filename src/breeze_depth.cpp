@@ -45,7 +45,9 @@ void DepthDecoder::drop_pair_slots() {
     drop_graph_slot(pair_pre_);
     for (auto & g : pair_step_) drop_graph_slot(g);
     pair_step_.clear();
-    pair_other_ = nullptr;
+    if (pair_kv_buf_) { ggml_backend_buffer_free(pair_kv_buf_); pair_kv_buf_ = nullptr; }
+    if (pair_kv_ctx_) { ggml_free(pair_kv_ctx_); pair_kv_ctx_ = nullptr; }
+    pk_.clear(); pv_.clear();
 }
 
 void DepthDecoder::free_state() {
@@ -365,8 +367,16 @@ int sample_from(std::vector<float> & lg, int V, float temp, int top_k, float top
     double sum = 0;
     for (auto & e : p) { e.first = std::exp(e.first - mx); sum += e.first; }
     for (auto & e : p) e.first = (float) (e.first / sum);
-    std::sort(p.begin(), p.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
     int keep = (top_k > 0 && top_k < V) ? top_k : V;
+    // Only the top `keep` are ever read: partition them out (O(V)) and sort
+    // just those, instead of sorting all ~2051 per codebook (16x a frame).
+    auto desc = [](const auto & a, const auto & b) { return a.first > b.first; };
+    if (keep < V) {
+        std::nth_element(p.begin(), p.begin() + keep - 1, p.end(), desc);
+        std::sort(p.begin(), p.begin() + keep, desc);
+    } else {
+        std::sort(p.begin(), p.end(), desc);
+    }
     if (top_p > 0.0f && top_p < 1.0f) {
         double c = 0; int i = 0;
         for (; i < keep; ++i) { c += p[i].first; if (c > top_p) { ++i; break; } }
@@ -408,40 +418,51 @@ bool DepthDecoder::run_frame(const float * backbone_hidden, int32_t * codes,
     return true;
 }
 
-// Columns [0, n_per) are this decoder's sequence, [n_per, 2*n_per) are
-// `other`'s. Both sequences sit at the same codebook positions and take the
-// same input codes; only position 0 of the prefill (the backbone hidden state)
-// differs. Each attends over its own KV slab.
+// Columns [0, n_per) are sequence A, [n_per, 2*n_per) sequence B (CFG: the
+// conditional and unconditional branch; concurrency: two requests). Both sit at
+// the same codebook positions, so the pair shares one position vector and one
+// mask, and their KV lives in ONE [hd, nkv, slots, 2] slab owned by this
+// decoder -- attention then runs once with a batch dimension of 2 instead of
+// once per sequence. The step is launch-bound (16 tiny graphs per frame), so
+// what a batch-2 step costs is mostly its kernel COUNT: one attention, and the
+// fused QKV / gate-up matmuls the single-sequence graph already uses.
 struct ggml_cgraph * DepthDecoder::build_pair_graph(struct ggml_context * c, int n_per,
                                                     int n_past, int head_idx,
-                                                    const DepthDecoder & other) {
+                                                    const DepthDecoder & /*other*/) {
     struct ggml_cgraph * gf = ggml_new_graph_custom(c, BZ_DD_MAX_NODES, false);
     const int hd = cfg_.head_dim, nh = cfg_.n_head, nkv = cfg_.n_kv_head;
     const int n_kv = kv_slots_;
     const int n = 2 * n_per;
     const float scale = 1.0f / std::sqrt((float) hd);
-    const DepthDecoder * seq[2] = { this, &other };
 
+    // `codes` holds both sequences' input ids, A's n_per then B's (CFG uploads
+    // the same ids twice).
     struct ggml_tensor * e;
     {
-        struct ggml_tensor * idx = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_per);
+        struct ggml_tensor * idx = ggml_new_tensor_1d(c, GGML_TYPE_I32, n);
         ggml_set_name(idx, "codes"); ggml_set_input(idx);
-        struct ggml_tensor * e1 = ggml_get_rows(c, tok_embd_, idx);   // [audio_embd, n_per]
+        struct ggml_tensor * e1 = ggml_get_rows(c, tok_embd_, idx);   // [audio_embd, n]
         if (n_past == 0) {
             struct ggml_tensor * bh = ggml_new_tensor_2d(c, GGML_TYPE_F32, cfg_.audio_embd_size, 2);
             ggml_set_name(bh, "backbone_hidden"); ggml_set_input(bh);
-            struct ggml_tensor * rest = ggml_cont(c, ggml_view_2d(c, e1, cfg_.audio_embd_size,
-                                                                  n_per - 1, e1->nb[1], e1->nb[1]));
-            struct ggml_tensor * b0 = ggml_view_2d(c, bh, cfg_.audio_embd_size, 1, bh->nb[1], 0);
-            struct ggml_tensor * b1 = ggml_view_2d(c, bh, cfg_.audio_embd_size, 1, bh->nb[1], bh->nb[1]);
-            e = ggml_concat(c, ggml_concat(c, b0, rest, 1),
-                               ggml_concat(c, b1, rest, 1), 1);
+            struct ggml_tensor * part[2];
+            for (int sq = 0; sq < 2; ++sq) {
+                struct ggml_tensor * rest = ggml_cont(c, ggml_view_2d(c, e1, cfg_.audio_embd_size,
+                                                      n_per - 1, e1->nb[1],
+                                                      (size_t) (sq * n_per + 1) * e1->nb[1]));
+                struct ggml_tensor * b = ggml_view_2d(c, bh, cfg_.audio_embd_size, 1, bh->nb[1],
+                                                      (size_t) sq * bh->nb[1]);
+                part[sq] = ggml_concat(c, b, rest, 1);
+            }
+            e = ggml_concat(c, part[0], part[1], 1);
         } else {
-            e = ggml_concat(c, e1, e1, 1);
+            e = e1;
         }
     }
     struct ggml_tensor * x = ggml_mul_mat(c, in_proj_, e);   // [n_embd, n]
 
+    // Positions per column (A's then B's, identical) for RoPE; row indices
+    // into the slab per sequence for the KV writes.
     struct ggml_tensor * pos = ggml_new_tensor_1d(c, GGML_TYPE_I32, n);
     ggml_set_name(pos, "pos"); ggml_set_input(pos);
     struct ggml_tensor * kvi = ggml_new_tensor_1d(c, GGML_TYPE_I32, n_per);
@@ -453,44 +474,53 @@ struct ggml_cgraph * DepthDecoder::build_pair_graph(struct ggml_context * c, int
         const layer & L = layers_[il];
         struct ggml_tensor * res = x;
         struct ggml_tensor * h = ggml_mul(c, ggml_rms_norm(c, x, cfg_.rms_eps), L.attn_norm);
-        struct ggml_tensor * q = ggml_reshape_3d(c, ggml_mul_mat(c, L.wq, h), hd, nh,  n);
-        struct ggml_tensor * k = ggml_reshape_3d(c, ggml_mul_mat(c, L.wk, h), hd, nkv, n);
-        struct ggml_tensor * v = ggml_reshape_3d(c, ggml_mul_mat(c, L.wv, h), hd, nkv, n);
+
+        struct ggml_tensor * q, * k, * v;   // v: [hd*nkv, n] rows, contiguous per row
+        if (L.wqkv) {
+            struct ggml_tensor * qkv = ggml_mul_mat(c, L.wqkv, h);
+            const size_t es = ggml_type_size(qkv->type);
+            const int64_t nq = hd * nh, nk = hd * nkv;
+            q = ggml_view_3d(c, qkv, hd, nh,  n, hd * es, qkv->nb[1], 0);
+            k = ggml_view_3d(c, qkv, hd, nkv, n, hd * es, qkv->nb[1], (size_t) nq * es);
+            v = ggml_view_3d(c, qkv, nk, n_per, 2, qkv->nb[1], qkv->nb[1] * n_per, (size_t) (nq + nk) * es);
+        } else {
+            q = ggml_reshape_3d(c, ggml_mul_mat(c, L.wq, h), hd, nh,  n);
+            k = ggml_reshape_3d(c, ggml_mul_mat(c, L.wk, h), hd, nkv, n);
+            v = ggml_reshape_3d(c, ggml_mul_mat(c, L.wv, h), hd * nkv, n_per, 2);
+        }
         q = ggml_rope_ext(c, q, pos, rope_ff_, hd, GGML_ROPE_TYPE_NEOX, 0,
                           cfg_.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
         k = ggml_rope_ext(c, k, pos, rope_ff_, hd, GGML_ROPE_TYPE_NEOX, 0,
                           cfg_.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
-        struct ggml_tensor * attn = nullptr;
-        for (int sq = 0; sq < 2; ++sq) {
-            struct ggml_tensor * ks = seq[sq]->k_cache_[il], * vs = seq[sq]->v_cache_[il];
-            const size_t off = (size_t) sq * n_per;
-            ggml_build_forward_expand(gf, ggml_set_rows(c,
-                ggml_view_2d(c, ks, hd * nkv, kv_slots_, ks->nb[2], 0),
-                ggml_view_2d(c, k,  hd * nkv, n_per, k->nb[2], off * k->nb[2]), kvi));
-            ggml_build_forward_expand(gf, ggml_set_rows(c,
-                ggml_view_2d(c, vs, hd * nkv, kv_slots_, vs->nb[2], 0),
-                ggml_view_2d(c, v,  hd * nkv, n_per, v->nb[2], off * v->nb[2]), kvi));
-            struct ggml_tensor * kview = ggml_view_3d(c, ks, hd, nkv, n_kv, ks->nb[1], ks->nb[2], 0);
-            struct ggml_tensor * vview = ggml_view_3d(c, vs, hd, nkv, n_kv, vs->nb[1], vs->nb[2], 0);
-            struct ggml_tensor * qs = ggml_view_3d(c, q, hd, nh, n_per, q->nb[1], q->nb[2], off * q->nb[2]);
-            struct ggml_tensor * Q = ggml_permute(c, qs, 0, 2, 1, 3);
-            struct ggml_tensor * K = ggml_permute(c, kview, 0, 2, 1, 3);
-            struct ggml_tensor * kq = ggml_mul_mat(c, K, Q);
-            kq = ggml_soft_max_ext(c, kq, mask, scale, 0.0f);
-            struct ggml_tensor * V = ggml_cont(c, ggml_permute(c, vview, 1, 2, 0, 3));
-            struct ggml_tensor * kqv = ggml_mul_mat(c, V, kq);
-            kqv = ggml_cont_2d(c, ggml_permute(c, kqv, 0, 2, 1, 3), nh * hd, n_per);
-            attn = attn ? ggml_concat(c, attn, kqv, 1) : kqv;
-        }
-        attn = ggml_mul_mat(c, L.wo, attn);
+        struct ggml_tensor * ks = pk_[il], * vs = pv_[il];   // [hd, nkv, slots, 2]
+        ggml_build_forward_expand(gf, ggml_set_rows(c,
+            ggml_reshape_3d(c, ks, hd * nkv, kv_slots_, 2),
+            ggml_reshape_3d(c, k, hd * nkv, n_per, 2), kvi));
+        ggml_build_forward_expand(gf, ggml_set_rows(c,
+            ggml_reshape_3d(c, vs, hd * nkv, kv_slots_, 2), v, kvi));
+
+        struct ggml_tensor * Q = ggml_permute(c, ggml_reshape_4d(c, q, hd, nh, n_per, 2), 0, 2, 1, 3);
+        struct ggml_tensor * K = ggml_permute(c, ks, 0, 2, 1, 3);       // [hd, slots, nkv, 2]
+        struct ggml_tensor * kq = ggml_mul_mat(c, K, Q);                 // [slots, n_per, nh, 2]
+        kq = ggml_soft_max_ext(c, kq, mask, scale, 0.0f);
+        struct ggml_tensor * V = ggml_cont(c, ggml_permute(c, vs, 1, 2, 0, 3));   // [slots, hd, nkv, 2]
+        struct ggml_tensor * kqv = ggml_mul_mat(c, V, kq);               // [hd, n_per, nh, 2]
+        kqv = ggml_cont_2d(c, ggml_permute(c, kqv, 0, 2, 1, 3), nh * hd, n);
+        struct ggml_tensor * attn = ggml_mul_mat(c, L.wo, kqv);
 
         x = ggml_add(c, res, attn);
         res = x;
         h = ggml_mul(c, ggml_rms_norm(c, x, cfg_.rms_eps), L.ffn_norm);
-        struct ggml_tensor * g = ggml_silu(c, ggml_mul_mat(c, L.ffn_gate, h));
-        struct ggml_tensor * u = ggml_mul_mat(c, L.ffn_up, h);
-        h = ggml_mul_mat(c, L.ffn_down, ggml_mul(c, g, u));
+        if (L.ffn_gate_up) {
+            struct ggml_tensor * gu = ggml_mul_mat(c, L.ffn_gate_up, h);
+            const int64_t F = L.ffn_gate->ne[1];
+            h = ggml_swiglu_split(c, ggml_view_2d(c, gu, F, n, gu->nb[1], 0),
+                                     ggml_view_2d(c, gu, F, n, gu->nb[1], (size_t) F * gu->nb[0]));
+        } else {
+            h = ggml_swiglu_split(c, ggml_mul_mat(c, L.ffn_gate, h), ggml_mul_mat(c, L.ffn_up, h));
+        }
+        h = ggml_mul_mat(c, L.ffn_down, h);
         x = ggml_add(c, res, h);
     }
 
@@ -507,13 +537,27 @@ struct ggml_cgraph * DepthDecoder::build_pair_graph(struct ggml_context * c, int
     return gf;
 }
 
+bool DepthDecoder::ensure_pair_kv() {
+    if (pair_kv_buf_) return true;
+    const int nl = cfg_.n_layers;
+    struct ggml_init_params p = { ggml_tensor_overhead() * (nl * 2 + 8), nullptr, true };
+    pair_kv_ctx_ = ggml_init(p);
+    pk_.resize(nl); pv_.resize(nl);
+    for (int i = 0; i < nl; ++i) {
+        pk_[i] = ggml_new_tensor_4d(pair_kv_ctx_, GGML_TYPE_F32, cfg_.head_dim, cfg_.n_kv_head, kv_slots_, 2);
+        ggml_format_name(pk_[i], "dd_pk_%d", i);
+        pv_[i] = ggml_new_tensor_4d(pair_kv_ctx_, GGML_TYPE_F32, cfg_.head_dim, cfg_.n_kv_head, kv_slots_, 2);
+        ggml_format_name(pv_[i], "dd_pv_%d", i);
+    }
+    pair_kv_buf_ = ggml_backend_alloc_ctx_tensors(pair_kv_ctx_, w_->backend());
+    if (!pair_kv_buf_) { error_msg_ = "depth: pair kv alloc failed"; return false; }
+    return true;
+}
+
 bool DepthDecoder::step_pair(DepthDecoder & other, int n_per, int n_past, int head_idx,
                              const float * hidden2, const int32_t * codes_in,
                              std::vector<float> & logits2) {
-    if (pair_other_ != &other) {
-        drop_pair_slots();
-        pair_other_ = &other;
-    }
+    if (!ensure_pair_kv()) return false;
     if (pair_step_.empty()) pair_step_.resize(cfg_.n_codebooks - 1);
     graph_slot & g = (n_past == 0) ? pair_pre_ : pair_step_[head_idx];
     if (!g.allocated) {
@@ -533,7 +577,7 @@ bool DepthDecoder::step_pair(DepthDecoder & other, int n_per, int n_past, int he
         g.allocated = true;
     }
     struct ggml_cgraph * gf = g.gf;
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "codes"), codes_in, 0, n_per * sizeof(int32_t));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "codes"), codes_in, 0, 2 * n_per * sizeof(int32_t));
     if (n_past == 0) {
         ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "backbone_hidden"), hidden2, 0,
                                 (size_t) 2 * cfg_.audio_embd_size * sizeof(float));
@@ -574,7 +618,9 @@ bool DepthDecoder::run_frame_cfg(DepthDecoder & neg, const float * h_cond, const
                 std::memcpy(h2.data(),     h_cond,   (size_t) E * sizeof(float));
                 std::memcpy(h2.data() + E, h_uncond, (size_t) E * sizeof(float));
             }
-            if (!step_pair(neg, n, n_past, head_idx, n_past == 0 ? h2.data() : nullptr, in, l2))
+            int32_t in2[4];
+            for (int i = 0; i < n; ++i) in2[i] = in2[n + i] = in[i];
+            if (!step_pair(neg, n, n_past, head_idx, n_past == 0 ? h2.data() : nullptr, in2, l2))
                 return false;
             lc.assign(l2.begin(), l2.begin() + V);
             lu.assign(l2.begin() + V, l2.begin() + 2 * V);
@@ -597,6 +643,34 @@ bool DepthDecoder::run_frame_cfg(DepthDecoder & neg, const float * h_cond, const
         if (cb == NC - 1) break;
         int32_t tok = codes[cb] + cb * V;
         if (!run(1, cb + 1, cb, &tok)) return false;
+    }
+    return true;
+}
+
+bool DepthDecoder::run_frame_pair(DepthDecoder & other, const float * h_a, const float * h_b,
+                                  int32_t * codes_a, int32_t * codes_b,
+                                  const sample_params & sa, const sample_params & sb,
+                                  uint32_t & rng_a, uint32_t & rng_b) {
+    const int NC = cfg_.n_codebooks;
+    const int V  = cfg_.vocab;
+    const int CB = w_->cfg().cc.codebook_size;
+    const int E  = cfg_.audio_embd_size;
+
+    std::vector<float> h2((size_t) 2 * E), l2, la(V), lb(V);
+    std::memcpy(h2.data(),     h_a, (size_t) E * sizeof(float));
+    std::memcpy(h2.data() + E, h_b, (size_t) E * sizeof(float));
+    int32_t pre[4] = { 0, codes_a[0], 0, codes_b[0] };
+    if (!step_pair(other, 2, 0, 0, h2.data(), pre, l2)) return false;
+    for (int cb = 1; cb < NC; ++cb) {
+        if ((int) l2.size() < 2 * V) { error_msg_ = "depth: short pair logits"; return false; }
+        std::memcpy(la.data(), l2.data(),     (size_t) V * sizeof(float));
+        std::memcpy(lb.data(), l2.data() + V, (size_t) V * sizeof(float));
+        for (int i = CB; i < V; ++i) la[i] = lb[i] = -INFINITY;
+        codes_a[cb] = sample_from(la, V, sa.temperature, sa.top_k, sa.top_p, rng_a);
+        codes_b[cb] = sample_from(lb, V, sb.temperature, sb.top_k, sb.top_p, rng_b);
+        if (cb == NC - 1) break;
+        int32_t tok[2] = { codes_a[cb] + cb * V, codes_b[cb] + cb * V };
+        if (!step_pair(other, 1, cb + 1, cb, nullptr, tok, l2)) return false;
     }
     return true;
 }

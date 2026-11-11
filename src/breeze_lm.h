@@ -36,12 +36,20 @@ public:
     bool decode_frame(const int32_t * codes,
                       std::vector<float> & hidden_last,
                       std::vector<float> & logits);
-    // CFG: append the SAME frame to this sequence and to `other` (separate KV,
+    // Append one frame to this sequence and one to `other` (separate KV,
     // separate positions) in one batch-2 graph, so the weights are read once
-    // for both. Equivalent to decode_frame() on each.
-    bool decode_frame_pair(Backbone & other, const int32_t * codes,
+    // for both. Equivalent to decode_frame() on each. CFG passes the same frame
+    // twice; two concurrent requests pass their own.
+    bool decode_frame_pair(Backbone & other, const int32_t * codes_self,
+                           const int32_t * codes_other,
                            std::vector<float> & hidden_self, std::vector<float> & logits_self,
                            std::vector<float> & hidden_other, std::vector<float> & logits_other);
+    bool decode_frame_pair(Backbone & other, const int32_t * codes,
+                           std::vector<float> & hidden_self, std::vector<float> & logits_self,
+                           std::vector<float> & hidden_other, std::vector<float> & logits_other) {
+        return decode_frame_pair(other, codes, codes, hidden_self, logits_self,
+                                 hidden_other, logits_other);
+    }
     // Prefill a run of frames (used to seed generated context; not on the hot path).
     bool prefill_frames(const int32_t * codes, int n_frames,
                         std::vector<float> & hidden_last,
