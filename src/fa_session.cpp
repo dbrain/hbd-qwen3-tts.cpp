@@ -8,6 +8,9 @@
 #include "fa_session.h"
 
 #include "qwen3_fa/qwen3_asr.h"
+#include "fusealign/fusealign.h"
+
+#include "gguf.h"
 
 #include <nlohmann/json.hpp>
 
@@ -16,6 +19,8 @@
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
+#include <memory>
+#include <thread>
 #include <vector>
 #include <fcntl.h>
 #include <poll.h>
@@ -472,6 +477,31 @@ static float partial_min_conf() {
     return v;
 }
 
+// The aligner GGUF picks the backend: a FuseAlign file (general.architecture
+// "fusealign") runs FuseAlign, anything else the qwen3 forced aligner. One knob,
+// BREEZE_FA_MODEL, so switching back is a path change.
+static bool is_fusealign_gguf(const std::string & path) {
+    gguf_init_params ip = { /*no_alloc=*/true, /*ctx=*/nullptr };
+    gguf_context * g = gguf_init_from_file(path.c_str(), ip);
+    if (!g) return false;
+    bool yes = false;
+    const int64_t k = gguf_find_key(g, "general.architecture");
+    if (k >= 0 && gguf_get_kv_type(g, k) == GGUF_TYPE_STRING) yes = std::strcmp(gguf_get_val_str(g, k), "fusealign") == 0;
+    gguf_free(g);
+    return yes;
+}
+
+// FuseAlign's CPU forward is compute-bound, and the breeze worker keeps one
+// core busy feeding the GPU. On a 6-core/12-thread 5600X, 22 read-along chunks
+// aligned during a live render took 73.7 s at 6 threads (a barrier stalls on
+// the contended core), 62.3 s at 5, 60.3 s at 10 and 59.4 s at 11; idle, 6 and
+// 12 are within 3%. So: every hardware thread but one.
+static int fusealign_threads() {
+    if (const char * e = std::getenv("FUSEALIGN_THREADS"); e && *e && std::atoi(e) > 0) return std::atoi(e);
+    const unsigned hc = std::thread::hardware_concurrency();
+    return hc >= 2 ? (int) (hc - 1) : 1;
+}
+
 int run_aligner_loop(int fd) {
     setvbuf(stderr, nullptr, _IONBF, 0);
     // No prctl(PR_SET_PDEATHSIG): the eager-spawn-from-a-thread pattern would
@@ -492,7 +522,9 @@ int run_aligner_loop(int fd) {
     }
 
     std::string         fa_model_path;
+    std::string         fa_device = "gpu";
     qwen3_asr_context * fa_ctx = nullptr;
+    std::unique_ptr<fusealign::Aligner> fuse;
     std::vector<float>  acc_pcm;
     int                 acc_pcm_sr = 0;
 
@@ -515,9 +547,25 @@ int run_aligner_loop(int fd) {
 
     auto ensure_fa_loaded = [&](std::string & err, int64_t & t_load_ms) {
         using clk = std::chrono::steady_clock;
-        if (fa_ctx) { t_load_ms = 0; return; }
+        if (fa_ctx || fuse) { t_load_ms = 0; return; }
         if (fa_model_path.empty()) { err = "aligner_model not configured"; return; }
         const auto t0 = clk::now();
+        if (is_fusealign_gguf(fa_model_path)) {
+            try {
+                fusealign::Options o;
+                o.model_path = fa_model_path;
+                o.device     = fa_device == "cpu" ? "cpu" : "cuda";
+                o.n_threads  = fusealign_threads();
+                fuse = std::make_unique<fusealign::Aligner>(o);
+            } catch (const std::exception & ex) {
+                err = std::string("fusealign load failed: ") + ex.what();
+                return;
+            }
+            t_load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(clk::now() - t0).count();
+            fprintf(stderr, "fa-aligner: fusealign loaded on %s (%d threads) in %lld ms\n",
+                    fa_device == "cpu" ? "cpu" : "cuda", fusealign_threads(), (long long) t_load_ms);
+            return;
+        }
         qwen3_asr_context_params p = qwen3_asr_context_default_params();
         fa_ctx = qwen3_asr_init_from_file(fa_model_path.c_str(), p);
         t_load_ms = std::chrono::duration_cast<std::chrono::milliseconds>(clk::now() - t0).count();
@@ -578,7 +626,7 @@ int run_aligner_loop(int fd) {
 
         if (err.empty() && !reused) ensure_fa_loaded(err, t_load_ms);
 
-        if (err.empty() && !reused) {
+        if (err.empty() && !reused && !fuse) {
             const auto t0 = clk::now();
             const int target_sr = 16000;
             if (acc_pcm_sr == target_sr) {
@@ -651,7 +699,34 @@ int run_aligner_loop(int fd) {
             t_resample_ms = std::chrono::duration_cast<std::chrono::milliseconds>(clk::now() - t0).count();
         }
 
-        if (err.empty() && !reused) {
+        if (err.empty() && !reused && fuse) {
+            out_t0.assign(words.size(), 0);
+            out_t1.assign(words.size(), 0);
+            out_conf.assign(words.size(), 0.0f);
+            const auto t0 = clk::now();
+            try {
+                const auto got = fuse->align(acc_pcm, acc_pcm_sr, words);
+                for (size_t i = 0; i < got.size() && i < words.size(); i++) {
+                    out_t0[i]   = (int64_t) std::llround(got[i].start * 1000.0);
+                    out_t1[i]   = (int64_t) std::llround(got[i].end * 1000.0);
+                    out_conf[i] = got[i].presence;
+                }
+                // FuseAlign predicts each word's edges independently, so a word
+                // can end a few ms after the next one starts (206 of 1131 on a
+                // read-along passage, max 12 ms). Clients binary-search for the
+                // active word and qwen3_fa never overlaps, so keep that contract.
+                for (size_t i = 1; i < words.size(); i++)
+                    if (out_t0[i] < out_t0[i - 1]) out_t0[i] = out_t0[i - 1];
+                for (size_t i = 0; i < words.size(); i++) {
+                    if (i + 1 < words.size() && out_t1[i] > out_t0[i + 1]) out_t1[i] = out_t0[i + 1];
+                    if (out_t1[i] < out_t0[i]) out_t1[i] = out_t0[i];
+                }
+                ok = true;
+            } catch (const std::exception & ex) {
+                err = std::string("fusealign align: ") + ex.what();
+            }
+            t_align_ms = std::chrono::duration_cast<std::chrono::milliseconds>(clk::now() - t0).count();
+        } else if (err.empty() && !reused) {
             out_t0.assign(words.size(), 0);
             out_t1.assign(words.size(), 0);
             out_conf.assign(words.size(), 0.0f);
@@ -774,6 +849,7 @@ int run_aligner_loop(int fd) {
                     // respawns rather than switching in place. Setting it here
                     // is therefore always before the load.
                     const std::string device = req.value("device", std::string("gpu"));
+                    fa_device = device;
                     if (device == "cpu") {
                         setenv("QWEN3_FA_CPU", "1", 1);
                         // Four threads is right when the audio tower is on the

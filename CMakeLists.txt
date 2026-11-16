@@ -45,6 +45,12 @@ endif()
 # PIC is needed for the shared library — set globally so GGML libs get it too
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# llamafile's tiled CPU GEMM. Standalone ggml defaults it OFF (llama.cpp turns it
+# on), which left every CPU matmul here — the aligner, the CPU text encoder — on
+# the per-row dot-product path. FuseAlign's CPU forward: 86 s -> 66 s over 22
+# read-along chunks from this alone. A -D on the command line still wins.
+set(GGML_LLAMAFILE ON CACHE BOOL "ggml: use llamafile SGEMM")
+
 # GGML as subdirectory — options like GGML_VULKAN, GGML_METAL pass through automatically
 set(GGML_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ggml")
 add_subdirectory(${GGML_DIR})
@@ -357,7 +363,24 @@ if(QWEN3_TTS_FORCED_ALIGNMENT)
     target_link_libraries(qwen3_fa PUBLIC
         ggml
         Threads::Threads
+        fusealign
     )
+
+    # FuseAlign (Zyphra, Apache-2.0), vendored from
+    # github.com/Zyphra/fusealign-multilingual fc17172 ggml/src (minus the CLI
+    # and WAV reader). Local change: fused attention in model.cpp. fa_session
+    # picks it over qwen3_fa when BREEZE_FA_MODEL is a FuseAlign GGUF.
+    add_library(fusealign STATIC
+        src/fusealign/fusealign.cpp
+        src/fusealign/model.cpp
+        src/fusealign/longform.cpp
+        src/fusealign/text.cpp
+        src/fusealign/resample.cpp
+        src/fusealign/vad.cpp
+    )
+    target_include_directories(fusealign PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src ${GGML_DIR}/include)
+    target_link_libraries(fusealign PUBLIC ggml)
+    target_compile_features(fusealign PUBLIC cxx_std_17)
 endif()
 
 # Qwen3 TTS library (full pipeline)
@@ -531,6 +554,13 @@ if(QWEN3_TTS_SERVER)
     endif()
 
     add_executable(breeze_synth tools/breeze_synth.cpp)
+
+# Read-along aligner bench: the real AlignerSession + child, one FINAL per chunk.
+if(QWEN3_TTS_FORCED_ALIGNMENT)
+    add_executable(fa_bench tools/fa_bench.cpp src/fa_session.cpp)
+    target_include_directories(fa_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(fa_bench PRIVATE qwen3_fa nlohmann_json::nlohmann_json)
+endif()
 
 # GGUF -> GGUF requantizer (K-quants). gguf-py cannot write them; this can.
 add_executable(gguf_quantize tools/gguf_quantize.cpp)
