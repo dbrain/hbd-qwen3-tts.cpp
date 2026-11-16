@@ -711,6 +711,16 @@ int run_aligner_loop(int fd) {
                     out_t1[i]   = (int64_t) std::llround(got[i].end * 1000.0);
                     out_conf[i] = got[i].presence;
                 }
+                // FuseAlign predicts each word's edges independently, so a word
+                // can end a few ms after the next one starts (206 of 1131 on a
+                // read-along passage, max 12 ms). Clients binary-search for the
+                // active word and qwen3_fa never overlaps, so keep that contract.
+                for (size_t i = 1; i < words.size(); i++)
+                    if (out_t0[i] < out_t0[i - 1]) out_t0[i] = out_t0[i - 1];
+                for (size_t i = 0; i < words.size(); i++) {
+                    if (i + 1 < words.size() && out_t1[i] > out_t0[i + 1]) out_t1[i] = out_t0[i + 1];
+                    if (out_t1[i] < out_t0[i]) out_t1[i] = out_t0[i];
+                }
                 ok = true;
             } catch (const std::exception & ex) {
                 err = std::string("fusealign align: ") + ex.what();
